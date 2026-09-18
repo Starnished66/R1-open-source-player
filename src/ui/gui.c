@@ -982,6 +982,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     poll_sd_format();
     poll_import_web_stop();
     poll_usb_mode_switch();
+    poll_artist_split_rebuild();
     poll_usb_storage_hotplug();
     poll_sd_card_hotplug();
     gui_library_poll_playlists();

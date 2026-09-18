@@ -15,6 +15,7 @@
 #include "screen_builders.h"
 #include "settings.h"
 #include "tagcache.h"
+#include "metadata_db.h"
 #include "assets.h"
 #include "metadata.h"
 #include "audio.h"
@@ -1590,20 +1591,58 @@ static bool artist_delim_enabled(char c) {
     return strchr(current_settings.artist_delimiters, c) != NULL;
 }
 
-/* Rebuilds the artist index in place. The raw ARTIST tag is what gets stored,
- * and splitting happens while the index is built, so a delimiter change costs
- * a rebuild rather than a rescan of the card. */
-static void artist_split_apply(void) {
-    settings_save(&current_settings);
-    tagcache_set_artist_delimiters(current_settings.artist_delimiters);
-    tagcache_rebuild_indexes_only();
+/* The rebuild runs on its own thread: it walks every entry three times and
+ * allocates per group, which would stall the UI on a large library, and it
+ * must take the metadata lock that every other tagcache reader holds. The raw
+ * ARTIST tag is what gets stored, so this re-files the index rather than
+ * rescanning the card. */
+static pthread_t artist_split_thread;
+static atomic_bool artist_split_done;
+static bool artist_split_active = false;
+static bool artist_split_ok = false;
+static char artist_split_pending[sizeof(((player_settings_t *) 0)->artist_delimiters)];
+
+static void * artist_split_thread_func(void * arg) {
+    (void) arg;
+    artist_split_ok = metadata_db_set_artist_delimiters(artist_split_pending);
+    atomic_store_explicit(&artist_split_done, true, memory_order_release);
+    return NULL;
+}
+
+/* Joins the finished rebuild and refreshes the library view. Polled from the
+ * UI tick so the rebuild never blocks it. */
+void poll_artist_split_rebuild(void) {
+    if (!artist_split_active || !atomic_load_explicit(&artist_split_done, memory_order_acquire)) return;
+    artist_split_active = false;
+    pthread_join(artist_split_thread, NULL);
+    if (!artist_split_ok) show_error_toast("Could not rebuild the artist index");
     gui_library_refresh_music_screen();
+}
+
+static void artist_split_apply(void) {
+    if (artist_split_active) return; /* one rebuild at a time */
+    settings_save(&current_settings);
+    snprintf(artist_split_pending, sizeof(artist_split_pending), "%s", current_settings.artist_delimiters);
+    atomic_store_explicit(&artist_split_done, false, memory_order_relaxed);
+    artist_split_active = true;
+    if (pthread_create(&artist_split_thread, NULL, artist_split_thread_func, NULL) != 0) {
+        artist_split_active = false;
+        show_error_toast("Could not rebuild the artist index");
+    }
 }
 
 static void artist_split_toggle_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     int idx = (int) (intptr_t) lv_event_get_user_data(e);
     if (idx < 0 || idx >= 3) return;
+    if (artist_split_active) { /* rebuild in flight: put the switch back */
+        for (int i = 0; i < 3; i++) {
+            if (!artist_split_toggles[i]) continue;
+            if (artist_delim_enabled(artist_split_chars[i])) lv_obj_add_state(artist_split_toggles[i], LV_STATE_CHECKED);
+            else lv_obj_clear_state(artist_split_toggles[i], LV_STATE_CHECKED);
+        }
+        return;
+    }
     char c = artist_split_chars[idx];
 
     char next[sizeof(current_settings.artist_delimiters)];

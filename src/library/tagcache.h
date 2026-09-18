@@ -112,6 +112,9 @@ const char * tagcache_get_artist_delimiters(void);
 /* Rebuilds the in-RAM indexes from the entries already loaded, without
  * touching the card. */
 bool tagcache_rebuild_indexes_only(void);
+/* Whether a raw ARTIST tag belongs to artist `name` under the current
+ * delimiters. Queries must use this instead of comparing the raw string. */
+bool tagcache_artist_matches(const char * raw_artist, const char * name);
 const char * tagcache_ascii_casestr(const char * hay, const char * needle);
 
 #endif /* TAGCACHE_H */

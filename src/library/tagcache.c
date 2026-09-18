@@ -752,6 +752,7 @@ static void group_node_free_table(group_node_t ** map, int buckets) {
 }
 
 static bool rebuild_indexes(void);
+static int artist_group_names_with(const char * delims, const char * artist, const char ** out, int max);
 
 /* Characters that separate several artists inside one ARTIST tag. Semicolon
  * and slash are genuine multi-value separators; comma is deliberately not a
@@ -777,16 +778,31 @@ bool tagcache_rebuild_indexes_only(void) {
     return rebuild_indexes();
 }
 
+/* Whether a raw ARTIST tag should be filed under `name`, splitting it exactly
+ * as the index build does. Queries have to ask this rather than comparing the
+ * raw string, or a track tagged "A;B" is listed under A yet matches nothing
+ * when A is selected. */
+bool tagcache_artist_matches(const char * raw_artist, const char * name) {
+    if (!name) name = "";
+    const char * names[TAGCACHE_ARTIST_SPLIT_MAX];
+    int n = artist_group_names_with(artist_delims, raw_artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
+    for (int i = 0; i < n; i++) {
+        if (tagcache_cmp_ascii(names[i], name) == 0) return true;
+    }
+    return false;
+}
+
 /* Interned names the artist index should file this track under. Splits on any
  * configured delimiter, trims surrounding whitespace, and drops empty pieces,
  * so "A / B" and "A // B" both yield A and B. Duplicates within one tag are
  * collapsed so a track cannot be listed twice under the same artist. Falls
  * back to the whole tag whenever splitting is off or produces nothing, which
  * keeps an artist whose name genuinely contains a delimiter from vanishing. */
-static int artist_group_names(const char * artist, const char ** out, int max) {
+static int artist_group_names_with(const char * delims, const char * artist, const char ** out, int max) {
     if (max <= 0) return 0;
     if (!artist) artist = "";
-    if (artist_delims[0] == '\0' || artist[0] == '\0') {
+    if (!delims) delims = "";
+    if (delims[0] == '\0' || artist[0] == '\0') {
         out[0] = intern_tag(artist);
         return 1;
     }
@@ -794,9 +810,9 @@ static int artist_group_names(const char * artist, const char ** out, int max) {
     int n = 0;
     const char * p = artist;
     while (*p && n < max) {
-        while (*p && strchr(artist_delims, *p)) p++; /* skip run of delimiters */
+        while (*p && strchr(delims, *p)) p++; /* skip run of delimiters */
         const char * start = p;
-        while (*p && !strchr(artist_delims, *p)) p++;
+        while (*p && !strchr(delims, *p)) p++;
         const char * end = p;
         while (end > start && (unsigned char) end[-1] <= ' ') end--; /* trailing space */
         while (start < end && (unsigned char) *start <= ' ') start++; /* leading space */
@@ -825,6 +841,11 @@ static int artist_group_names(const char * artist, const char ** out, int max) {
 
 static bool rebuild_indexes(void) {
     TC_TIME_START(rebuild);
+    /* Snapshot once. Both passes must split identically -- pass 1's counts size
+     * the arrays pass 2 fills -- so re-reading a delimiter set that changed
+     * underneath would overflow them. */
+    char delims_snapshot[TAGCACHE_ARTIST_DELIM_MAX];
+    snprintf(delims_snapshot, sizeof(delims_snapshot), "%s", artist_delims);
     int32_t new_live = 0;
     for (int32_t i = 0; i < ent_count; i++) {
         if (!(ents[i].flag & FLAG_DELETED)) new_live++;
@@ -932,7 +953,7 @@ static bool rebuild_indexes(void) {
             const char * b = "";
             int name_count = 1;
             if (kind == TAGCACHE_GROUP_ARTIST) {
-                name_count = artist_group_names(ents[i].artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
+                name_count = artist_group_names_with(delims_snapshot, ents[i].artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
             } else if (kind == TAGCACHE_GROUP_ALBUM_ARTIST) {
                 names[0] = ents[i].album_artist ? ents[i].album_artist : "";
             } else {
@@ -1013,7 +1034,7 @@ static bool rebuild_indexes(void) {
             const char * b = "";
             int name_count = 1;
             if (kind == TAGCACHE_GROUP_ARTIST) {
-                name_count = artist_group_names(ents[i].artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
+                name_count = artist_group_names_with(delims_snapshot, ents[i].artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
             } else if (kind == TAGCACHE_GROUP_ALBUM_ARTIST) {
                 names[0] = ents[i].album_artist ? ents[i].album_artist : "";
             } else {

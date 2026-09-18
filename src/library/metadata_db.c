@@ -172,7 +172,7 @@ static bool song_matches_filters(const tagcache_song_t * song, const char * quer
     if (query && query[0]) {
         if (!tagcache_ascii_casestr(song->title, query) && !tagcache_ascii_casestr(song->artist, query)) return false;
     }
-    if (artist_filter && artist_filter[0] && tagcache_cmp_ascii(song->artist, artist_filter) != 0) return false;
+    if (artist_filter && artist_filter[0] && !tagcache_artist_matches(song->artist, artist_filter)) return false;
     if (album_artist_filter && album_artist_filter[0] &&
         tagcache_cmp_ascii(song->album_artist, album_artist_filter) != 0)
         return false;
@@ -196,6 +196,18 @@ void metadata_db_open(void) {
 bool metadata_db_had_no_saved_database(void) {
     METADATA_DB_GUARD;
     return db_ready && tagcache_had_no_saved_database();
+}
+
+/* Re-files every track under a new delimiter set. Held under the same guard as
+ * every other tagcache access: the rebuild frees and replaces the published
+ * indexes, so a reader or a background scan running concurrently would be left
+ * holding freed memory. Blocking and allocation-heavy on a large library --
+ * call it off the UI thread. */
+bool metadata_db_set_artist_delimiters(const char * delims) {
+    METADATA_DB_GUARD;
+    tagcache_set_artist_delimiters(delims);
+    if (!db_ready) return true; /* nothing built yet; applied when the cache opens */
+    return tagcache_rebuild_indexes_only();
 }
 
 void metadata_db_close(void) {
@@ -597,7 +609,7 @@ int metadata_db_get_albums_page_filtered(const char * artist_or_album_artist_fil
         for (int32_t s = 0; s < slots; s++) {
             tagcache_song_t song;
             if (!tagcache_song_at_slot(s, &song)) continue;
-            if (tagcache_cmp_ascii(song.artist, artist_or_album_artist_filter) != 0 &&
+            if (!tagcache_artist_matches(song.artist, artist_or_album_artist_filter) &&
                 tagcache_cmp_ascii(song.album_artist, artist_or_album_artist_filter) != 0)
                 continue;
             pair_set_add(set, buckets, song.album, song.album_artist);
@@ -630,8 +642,12 @@ static pair_node_t ** build_group_album_set(metadata_db_group_kind_t kind, const
     for (int32_t s = 0; s < slots; s++) {
         tagcache_song_t song;
         if (!tagcache_song_at_slot(s, &song)) continue;
-        const char * col = kind == METADATA_DB_GROUP_ARTIST ? song.artist : song.album_artist;
-        if (tagcache_cmp_ascii(col, name) != 0) continue;
+        /* Artist groups match per split name, so a track tagged "A;B" shows
+         * its albums under both. Album artist is never split. */
+        bool match = kind == METADATA_DB_GROUP_ARTIST
+                         ? tagcache_artist_matches(song.artist, name)
+                         : tagcache_cmp_ascii(song.album_artist, name) == 0;
+        if (!match) continue;
         pair_set_add(set, buckets, song.album, song.album_artist);
     }
     return set;

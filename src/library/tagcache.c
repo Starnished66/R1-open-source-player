@@ -751,6 +751,78 @@ static void group_node_free_table(group_node_t ** map, int buckets) {
     free(map);
 }
 
+static bool rebuild_indexes(void);
+
+/* Characters that separate several artists inside one ARTIST tag. Semicolon
+ * and slash are genuine multi-value separators; comma is deliberately not a
+ * default, because it occurs inside ordinary artist names ("Crosby, Stills &
+ * Nash", "Beethoven, Ludwig van") and splitting on it would shatter them.
+ * Empty disables splitting entirely. Applied when the artist index is built,
+ * not when tags are read, so the raw tag stays stored and changing this only
+ * costs an index rebuild rather than a full rescan of the card. */
+static char artist_delims[TAGCACHE_ARTIST_DELIM_MAX] = ";/";
+
+void tagcache_set_artist_delimiters(const char * delims) {
+    snprintf(artist_delims, sizeof(artist_delims), "%s", delims ? delims : "");
+}
+
+const char * tagcache_get_artist_delimiters(void) {
+    return artist_delims;
+}
+
+/* Re-files every track under the current delimiter set. Cheap next to a scan:
+ * the entries and their raw tags are already in RAM, only the derived group
+ * lists are thrown away and rebuilt. */
+bool tagcache_rebuild_indexes_only(void) {
+    return rebuild_indexes();
+}
+
+/* Interned names the artist index should file this track under. Splits on any
+ * configured delimiter, trims surrounding whitespace, and drops empty pieces,
+ * so "A / B" and "A // B" both yield A and B. Duplicates within one tag are
+ * collapsed so a track cannot be listed twice under the same artist. Falls
+ * back to the whole tag whenever splitting is off or produces nothing, which
+ * keeps an artist whose name genuinely contains a delimiter from vanishing. */
+static int artist_group_names(const char * artist, const char ** out, int max) {
+    if (max <= 0) return 0;
+    if (!artist) artist = "";
+    if (artist_delims[0] == '\0' || artist[0] == '\0') {
+        out[0] = intern_tag(artist);
+        return 1;
+    }
+
+    int n = 0;
+    const char * p = artist;
+    while (*p && n < max) {
+        while (*p && strchr(artist_delims, *p)) p++; /* skip run of delimiters */
+        const char * start = p;
+        while (*p && !strchr(artist_delims, *p)) p++;
+        const char * end = p;
+        while (end > start && (unsigned char) end[-1] <= ' ') end--; /* trailing space */
+        while (start < end && (unsigned char) *start <= ' ') start++; /* leading space */
+        if (end <= start) continue;
+
+        char piece[TAGCACHE_TAG_MAX];
+        size_t len = (size_t) (end - start);
+        if (len >= sizeof(piece)) len = sizeof(piece) - 1;
+        memcpy(piece, start, len);
+        piece[len] = '\0';
+
+        const char * interned = intern_tag(piece);
+        bool seen = false;
+        for (int k = 0; k < n; k++) {
+            if (out[k] == interned) { seen = true; break; }
+        }
+        if (!seen) out[n++] = interned;
+    }
+
+    if (n == 0) {
+        out[0] = intern_tag(artist);
+        return 1;
+    }
+    return n;
+}
+
 static bool rebuild_indexes(void) {
     TC_TIME_START(rebuild);
     int32_t new_live = 0;
@@ -856,33 +928,40 @@ static bool rebuild_indexes(void) {
         /* Pass 1: Count exact membership and unique groups */
         for (int32_t i = 0; i < ent_count; i++) {
             if (ents[i].flag & FLAG_DELETED) continue;
-            const char * a = "";
+            const char * names[TAGCACHE_ARTIST_SPLIT_MAX];
             const char * b = "";
-            if (kind == TAGCACHE_GROUP_ARTIST) a = ents[i].artist ? ents[i].artist : "";
-            else if (kind == TAGCACHE_GROUP_ALBUM_ARTIST) a = ents[i].album_artist ? ents[i].album_artist : "";
-            else {
-                a = ents[i].album ? ents[i].album : "";
+            int name_count = 1;
+            if (kind == TAGCACHE_GROUP_ARTIST) {
+                name_count = artist_group_names(ents[i].artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
+            } else if (kind == TAGCACHE_GROUP_ALBUM_ARTIST) {
+                names[0] = ents[i].album_artist ? ents[i].album_artist : "";
+            } else {
+                names[0] = ents[i].album ? ents[i].album : "";
                 b = ents[i].album_artist ? ents[i].album_artist : "";
             }
-            uint32_t h = fnv1a(a, strlen(a)) ^ (fnv1a(b, strlen(b)) << 1);
-            int slot = (int) (h & (uint32_t) (buckets - 1));
-            group_node_t * it = map[slot];
-            while (it && (it->a != a || it->b != b)) it = it->next;
-            if (!it) {
-                it = calloc(1, sizeof(*it));
+            for (int ni = 0; ni < name_count; ni++) {
+                const char * a = names[ni];
+                uint32_t h = fnv1a(a, strlen(a)) ^ (fnv1a(b, strlen(b)) << 1);
+                int slot = (int) (h & (uint32_t) (buckets - 1));
+                group_node_t * it = map[slot];
+                while (it && (it->a != a || it->b != b)) it = it->next;
                 if (!it) {
-                    ok = false;
-                    break;
+                    it = calloc(1, sizeof(*it));
+                    if (!it) {
+                        ok = false;
+                        break;
+                    }
+                    it->a = a;
+                    it->b = b;
+                    it->first = i + 1;
+                    it->group_idx = unique++;
+                    it->next = map[slot];
+                    map[slot] = it;
                 }
-                it->a = a;
-                it->b = b;
-                it->first = i + 1;
-                it->group_idx = unique++;
-                it->next = map[slot];
-                map[slot] = it;
+                it->count++;
+                if (i + 1 < it->first) it->first = i + 1;
             }
-            it->count++;
-            if (i + 1 < it->first) it->first = i + 1;
+            if (!ok) break;
         }
         if (!ok) {
             group_node_free_table(map, buckets);
@@ -928,21 +1007,29 @@ static bool rebuild_indexes(void) {
         }
         for (int32_t i = 0; i < ent_count; i++) {
             if (ents[i].flag & FLAG_DELETED) continue;
-            const char * a = "";
+            /* Must split exactly as pass 1 did: the counts it produced sized
+             * these arrays, so any divergence overruns them. */
+            const char * names[TAGCACHE_ARTIST_SPLIT_MAX];
             const char * b = "";
-            if (kind == TAGCACHE_GROUP_ARTIST) a = ents[i].artist ? ents[i].artist : "";
-            else if (kind == TAGCACHE_GROUP_ALBUM_ARTIST) a = ents[i].album_artist ? ents[i].album_artist : "";
-            else {
-                a = ents[i].album ? ents[i].album : "";
+            int name_count = 1;
+            if (kind == TAGCACHE_GROUP_ARTIST) {
+                name_count = artist_group_names(ents[i].artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
+            } else if (kind == TAGCACHE_GROUP_ALBUM_ARTIST) {
+                names[0] = ents[i].album_artist ? ents[i].album_artist : "";
+            } else {
+                names[0] = ents[i].album ? ents[i].album : "";
                 b = ents[i].album_artist ? ents[i].album_artist : "";
             }
-            uint32_t h = fnv1a(a, strlen(a)) ^ (fnv1a(b, strlen(b)) << 1);
-            int slot = (int) (h & (uint32_t) (buckets - 1));
-            group_node_t * it = map[slot];
-            while (it && (it->a != a || it->b != b)) it = it->next;
-            if (it) {
-                int g = it->group_idx;
-                new_groups[kind][g].songs[write_pos[g]++] = i;
+            for (int ni = 0; ni < name_count; ni++) {
+                const char * a = names[ni];
+                uint32_t h = fnv1a(a, strlen(a)) ^ (fnv1a(b, strlen(b)) << 1);
+                int slot = (int) (h & (uint32_t) (buckets - 1));
+                group_node_t * it = map[slot];
+                while (it && (it->a != a || it->b != b)) it = it->next;
+                if (it) {
+                    int g = it->group_idx;
+                    new_groups[kind][g].songs[write_pos[g]++] = i;
+                }
             }
         }
         free(write_pos);

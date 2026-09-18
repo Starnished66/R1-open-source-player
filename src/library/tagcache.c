@@ -782,6 +782,15 @@ bool tagcache_rebuild_indexes_only(void) {
  * as the index build does. Queries have to ask this rather than comparing the
  * raw string, or a track tagged "A;B" is listed under A yet matches nothing
  * when A is selected. */
+/* First artist a tag is filed under, for callers that need one group name
+ * from a possibly-combined tag. Writes the whole tag when splitting is off. */
+void tagcache_artist_primary(const char * raw_artist, char * out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    const char * names[TAGCACHE_ARTIST_SPLIT_MAX];
+    int n = artist_group_names_with(artist_delims, raw_artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
+    snprintf(out, out_size, "%s", n > 0 ? names[0] : (raw_artist ? raw_artist : ""));
+}
+
 bool tagcache_artist_matches(const char * raw_artist, const char * name) {
     if (!name) name = "";
     const char * names[TAGCACHE_ARTIST_SPLIT_MAX];

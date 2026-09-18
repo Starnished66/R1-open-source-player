@@ -205,9 +205,18 @@ bool metadata_db_had_no_saved_database(void) {
  * call it off the UI thread. */
 bool metadata_db_set_artist_delimiters(const char * delims) {
     METADATA_DB_GUARD;
+    char previous[TAGCACHE_ARTIST_DELIM_MAX];
+    snprintf(previous, sizeof(previous), "%s", tagcache_get_artist_delimiters());
+
     tagcache_set_artist_delimiters(delims);
     if (!db_ready) return true; /* nothing built yet; applied when the cache opens */
-    return tagcache_rebuild_indexes_only();
+    if (tagcache_rebuild_indexes_only()) return true;
+
+    /* The rebuild failed and the previous index is still the published one, so
+     * the delimiters have to go back with it: leaving the new set active would
+     * make lookups split differently from the groups they are searching. */
+    tagcache_set_artist_delimiters(previous);
+    return false;
 }
 
 void metadata_db_close(void) {

@@ -1583,6 +1583,8 @@ static lv_obj_t * build_music_timers_screen(void) {
     return scr;
 }
 
+static void artist_split_sync_toggles(void);
+
 static lv_obj_t * artist_split_screen = NULL;
 static lv_obj_t * artist_split_toggles[3] = { NULL, NULL, NULL };
 static const char artist_split_chars[3] = { ';', '/', ',' };
@@ -1615,7 +1617,16 @@ void poll_artist_split_rebuild(void) {
     if (!artist_split_active || !atomic_load_explicit(&artist_split_done, memory_order_acquire)) return;
     artist_split_active = false;
     pthread_join(artist_split_thread, NULL);
-    if (!artist_split_ok) show_error_toast("Could not rebuild the artist index");
+    if (!artist_split_ok) {
+        /* The rebuild failed and metadata_db put the delimiters back with the
+         * index it kept, so the saved setting has to follow rather than claim
+         * a split that is not in effect. */
+        snprintf(current_settings.artist_delimiters, sizeof(current_settings.artist_delimiters),
+                 "%s", tagcache_get_artist_delimiters());
+        settings_save(&current_settings);
+        artist_split_sync_toggles();
+        show_error_toast("Could not rebuild the artist index");
+    }
     gui_library_refresh_music_screen();
 }
 
@@ -1627,7 +1638,19 @@ static void artist_split_apply(void) {
     artist_split_active = true;
     if (pthread_create(&artist_split_thread, NULL, artist_split_thread_func, NULL) != 0) {
         artist_split_active = false;
+        snprintf(current_settings.artist_delimiters, sizeof(current_settings.artist_delimiters),
+                 "%s", tagcache_get_artist_delimiters());
+        settings_save(&current_settings);
+        artist_split_sync_toggles();
         show_error_toast("Could not rebuild the artist index");
+    }
+}
+
+static void artist_split_sync_toggles(void) {
+    for (int i = 0; i < 3; i++) {
+        if (!artist_split_toggles[i]) continue;
+        if (artist_delim_enabled(artist_split_chars[i])) lv_obj_add_state(artist_split_toggles[i], LV_STATE_CHECKED);
+        else lv_obj_clear_state(artist_split_toggles[i], LV_STATE_CHECKED);
     }
 }
 
@@ -1636,11 +1659,7 @@ static void artist_split_toggle_cb(lv_event_t * e) {
     int idx = (int) (intptr_t) lv_event_get_user_data(e);
     if (idx < 0 || idx >= 3) return;
     if (artist_split_active) { /* rebuild in flight: put the switch back */
-        for (int i = 0; i < 3; i++) {
-            if (!artist_split_toggles[i]) continue;
-            if (artist_delim_enabled(artist_split_chars[i])) lv_obj_add_state(artist_split_toggles[i], LV_STATE_CHECKED);
-            else lv_obj_clear_state(artist_split_toggles[i], LV_STATE_CHECKED);
-        }
+        artist_split_sync_toggles();
         return;
     }
     char c = artist_split_chars[idx];
@@ -1675,11 +1694,7 @@ static lv_obj_t * build_artist_split_screen(void) {
 
 static void artist_split_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    for (int i = 0; i < 3; i++) {
-        if (!artist_split_toggles[i]) continue;
-        if (artist_delim_enabled(artist_split_chars[i])) lv_obj_add_state(artist_split_toggles[i], LV_STATE_CHECKED);
-        else lv_obj_clear_state(artist_split_toggles[i], LV_STATE_CHECKED);
-    }
+    artist_split_sync_toggles();
     nav_push(artist_split_screen);
 }
 

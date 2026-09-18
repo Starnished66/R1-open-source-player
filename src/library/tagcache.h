@@ -1,6 +1,7 @@
 #ifndef TAGCACHE_H
 #define TAGCACHE_H
 
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -115,6 +116,8 @@ bool tagcache_rebuild_indexes_only(void);
 /* Whether a raw ARTIST tag belongs to artist `name` under the current
  * delimiters. Queries must use this instead of comparing the raw string. */
 bool tagcache_artist_matches(const char * raw_artist, const char * name);
+/* First artist name a raw ARTIST tag is filed under. */
+void tagcache_artist_primary(const char * raw_artist, char * out, size_t out_size);
 const char * tagcache_ascii_casestr(const char * hay, const char * needle);
 
 #endif /* TAGCACHE_H */

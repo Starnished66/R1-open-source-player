@@ -1634,14 +1634,13 @@ static void bt_codec_settings_row_cb(lv_event_t * e);
 static pthread_t bt_rate_apply_thread;
 static bool bt_rate_apply_active = false;
 static atomic_bool bt_rate_apply_done_flag = false;
-static bool bt_rate_apply_result = false;
 /* Captured at launch so a status refresh cannot change what is being applied
  * half way through. */
 static unsigned int bt_rate_apply_target = 0;
 
 static void * bt_rate_apply_thread_func(void * arg) {
     (void) arg;
-    bt_rate_apply_result = bt_control_reconnect_for_rate_change(bt_rate_apply_target);
+    (void) bt_control_reconnect_for_rate_change(bt_rate_apply_target);
     atomic_store_explicit(&bt_rate_apply_done_flag, true, memory_order_release); /* written last */
     return NULL;
 }
@@ -1650,9 +1649,9 @@ void poll_bt_rate_apply(void) {
     if (!bt_rate_apply_active || !atomic_load_explicit(&bt_rate_apply_done_flag, memory_order_acquire)) return;
     bt_rate_apply_active = false;
     pthread_join(bt_rate_apply_thread, NULL);
-    show_info_toast(bt_rate_apply_result ? "Sample rate applied" : "Could not apply this sample rate");
-    /* The accessory reconnected, so its rates and the selected row are worth
-     * re-reading rather than leaving whatever was on screen before. */
+    /* No outcome toast: the accessory may still need reconnecting by hand,
+     * so "applied" or "failed" here would contradict what the user is about
+     * to do. The redrawn list shows the rate that actually took. */
     if (gui_navigation_is_top(bt_rate_screen)) populate_bt_rate_screen();
 }
 

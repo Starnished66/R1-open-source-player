@@ -1210,6 +1210,8 @@ static bool bt_name_is_mac_placeholder(const bt_device_t * dev) {
  * little breathing room, not a full second LIST_ROW_HEIGHT line. */
 #define BT_DEVICE_ROW_CODEC_EXTRA_HEIGHT BOARD_SCALE_PX(40)
 
+static void format_rate(char * out, size_t size, unsigned int rate);
+
 static void add_bt_device_row(lv_obj_t * parent, int index) {
     bt_device_t * dev = &bt_scan_results[index];
 
@@ -1253,7 +1255,19 @@ static void add_bt_device_row(lv_obj_t * parent, int index) {
 
     if (show_codec) {
         lv_obj_t * codec_label = lv_label_create(row);
-        lv_label_set_text(codec_label, bt_connected_codec_cached);
+        /* Codec and rate together: the negotiated link is not necessarily the
+         * codec preference in Settings, and the frequency is the other half of
+         * what tells you which link you actually got. Rate is omitted rather
+         * than guessed when bluealsa does not report one. */
+        char codec_text[96]; /* codec (32) + separator + formatted rate */
+        if (bt_connected_rate_cached) {
+            char rate[32];
+            format_rate(rate, sizeof(rate), bt_connected_rate_cached);
+            snprintf(codec_text, sizeof(codec_text), "%s · %s", bt_connected_codec_cached, rate);
+        } else {
+            snprintf(codec_text, sizeof(codec_text), "%s", bt_connected_codec_cached);
+        }
+        lv_label_set_text(codec_label, codec_text);
         lv_obj_add_style(codec_label, &style_theme_text_muted, 0);
         lv_obj_set_style_text_font(codec_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
         lv_obj_align(codec_label, LV_ALIGN_BOTTOM_LEFT, LIST_ROW_LABEL_INSET, BOARD_SCALE_PX(-12));

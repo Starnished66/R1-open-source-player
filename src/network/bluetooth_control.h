@@ -120,6 +120,11 @@ bool bt_control_get_connected_device_mac(char * out, size_t out_size);
  * untouched) if nothing's connected. */
 bool bt_control_get_connected_device_codec(char * out, size_t out_size);
 
+/* As above, and also the negotiated sampling frequency in Hz -- the codec is
+ * only half of what tells you which link you actually got. Pass NULL for
+ * out_sample_rate to skip it. Same subprocess cost; call off the UI thread. */
+bool bt_control_get_connected_device_stream(char * out, size_t out_size, unsigned int * out_sample_rate);
+
 /* Blocking: scans for `seconds` (bluetoothctl's own --timeout), then reads
  * back the combined paired+discovered device list via `info` on each one
  * for Paired/Connected state. Call off the UI thread. Returns how many

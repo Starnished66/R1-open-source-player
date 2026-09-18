@@ -475,6 +475,8 @@ void refresh_clock_label(void);
 extern bool bt_is_powered_cached;
 extern char bt_connected_mac_cached[18];
 extern char bt_connected_codec_cached[32];
+/* Negotiated sampling frequency of the same A2DP link, 0 when unknown. */
+extern unsigned int bt_connected_rate_cached;
 extern gui_busy_handle_t import_web_stop_token;
 void quick_drawer_wifi_event_cb(lv_event_t * e);
 void quick_drawer_bt_event_cb(lv_event_t * e);

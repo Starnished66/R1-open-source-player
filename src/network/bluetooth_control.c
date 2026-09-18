@@ -1469,6 +1469,14 @@ bool bt_control_get_connected_device_mac(char * out, size_t out_size) {
 }
 
 bool bt_control_get_connected_device_codec(char * out, size_t out_size) {
+    return bt_control_get_connected_device_stream(out, out_size, NULL);
+}
+
+/* One `bluealsactl info` for both the codec and the rate: the same call
+ * already reported the sampling frequency, it was just being discarded.
+ * out_sample_rate may be NULL when only the codec is wanted, and is left
+ * untouched when the output reports no frequency. */
+bool bt_control_get_connected_device_stream(char * out, size_t out_size, unsigned int * out_sample_rate) {
     char path[256];
     if (!find_source_pcm_path(path, sizeof(path))) return false;
 
@@ -1482,6 +1490,14 @@ bool bt_control_get_connected_device_codec(char * out, size_t out_size) {
      * actually in use right now). */
     char codec[32];
     if (!bluealsa_parse_selected_codec(info_out, codec, sizeof(codec))) return false;
+
+    if (out_sample_rate) {
+        /* Same two spellings the sink-side parse accepts. */
+        const char * sampling = strstr(info_out, "Sampling:");
+        if (!sampling) sampling = strstr(info_out, "Rate:");
+        const char * value = sampling ? strchr(sampling, ':') : NULL;
+        if (value) (void) sscanf(value + 1, "%u", out_sample_rate);
+    }
 
     snprintf(out, out_size, "%s", codec);
     return true;

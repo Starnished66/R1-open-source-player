@@ -1354,6 +1354,7 @@ bool bt_is_powered_cached = false;
  * and what to print on its second line. Empty when nothing's A2DP-connected. */
 char bt_connected_mac_cached[18] = "";
 char bt_connected_codec_cached[32] = "";
+unsigned int bt_connected_rate_cached = 0;
 
 /* /usr/bin/bt_init's last line creates /tmp/bt_init_ok once chip firmware
  * flash and initialization complete. Because /tmp is tmpfs, this flag is
@@ -1412,6 +1413,7 @@ static bool refresh_bt_icon_result_connected = false;
 static bool refresh_bt_icon_result_a2dp_connected = false;
 static char refresh_bt_icon_result_mac[18] = "";
 static char refresh_bt_icon_result_codec[32] = "";
+static unsigned int refresh_bt_icon_result_rate = 0;
 
 /* UI-thread owned Bluetooth audio state and disconnect generation latch */
 static bool bt_is_a2dp_connected_ui = false;
@@ -1476,6 +1478,7 @@ void gui_shell_notify_bt_audio_disconnected(void) {
     bt_is_a2dp_connected_ui = false;
     bt_connected_mac_cached[0] = '\0';
     bt_connected_codec_cached[0] = '\0';
+    bt_connected_rate_cached = 0;
     clear_bt_audio_route_now();
     if (a2dp_status_icon) lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
     if (bt_codec_status_icon) lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
@@ -1508,9 +1511,12 @@ static void * refresh_bt_icon_thread_func(void * arg) {
      * leftover codec line for a device that just disconnected. */
     refresh_bt_icon_result_mac[0] = '\0';
     refresh_bt_icon_result_codec[0] = '\0';
+    refresh_bt_icon_result_rate = 0;
     if (refresh_bt_icon_result_a2dp_connected) {
         bt_control_get_connected_device_mac(refresh_bt_icon_result_mac, sizeof(refresh_bt_icon_result_mac));
-        bt_control_get_connected_device_codec(refresh_bt_icon_result_codec, sizeof(refresh_bt_icon_result_codec));
+        refresh_bt_icon_result_rate = 0;
+        bt_control_get_connected_device_stream(refresh_bt_icon_result_codec, sizeof(refresh_bt_icon_result_codec),
+                                              &refresh_bt_icon_result_rate);
     }
 
     if (powered) {
@@ -1765,6 +1771,7 @@ static void poll_refresh_bt_icon(void) {
 
     snprintf(bt_connected_mac_cached, sizeof(bt_connected_mac_cached), "%s", a2dp_connected ? refresh_bt_icon_result_mac : "");
     snprintf(bt_connected_codec_cached, sizeof(bt_connected_codec_cached), "%s", a2dp_connected ? refresh_bt_icon_result_codec : "");
+    bt_connected_rate_cached = a2dp_connected ? refresh_bt_icon_result_rate : 0;
     if (quick_drawer_bt_icon) {
         lv_image_set_src(quick_drawer_bt_icon, quick_drawer_toggle_src(QD_TOGGLE_BT, display_powered));
         quick_drawer_mark_snapshot_dirty();

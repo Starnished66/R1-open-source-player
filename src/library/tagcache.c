@@ -795,6 +795,7 @@ bool tagcache_artist_matches(const char * raw_artist, const char * name) {
     if (!name) name = "";
     const char * names[TAGCACHE_ARTIST_SPLIT_MAX];
     int n = artist_group_names_with(artist_delims, raw_artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
+    if (n < 0) return tagcache_cmp_ascii(raw_artist ? raw_artist : "", name) == 0; /* pre-split behaviour */
     for (int i = 0; i < n; i++) {
         if (tagcache_cmp_ascii(names[i], name) == 0) return true;
     }
@@ -806,7 +807,9 @@ bool tagcache_artist_matches(const char * raw_artist, const char * name) {
  * so "A / B" and "A // B" both yield A and B. Duplicates within one tag are
  * collapsed so a track cannot be listed twice under the same artist. Falls
  * back to the whole tag whenever splitting is off or produces nothing, which
- * keeps an artist whose name genuinely contains a delimiter from vanishing. */
+ * keeps an artist whose name genuinely contains a delimiter from vanishing.
+ * Returns -1 if a name could not be interned, so the caller can fail the
+ * rebuild rather than publish a silently wrong index. */
 static int artist_group_names_with(const char * delims, const char * artist, const char ** out, int max) {
     if (max <= 0) return 0;
     if (!artist) artist = "";
@@ -834,6 +837,12 @@ static int artist_group_names_with(const char * delims, const char * artist, con
         piece[len] = '\0';
 
         const char * interned = intern_tag(piece);
+        /* intern_len() yields "" when the table allocation fails, which is
+         * indistinguishable from a genuinely empty tag. A non-empty piece
+         * landing on "" therefore means interning failed, and accepting it
+         * would file unrelated artists together under one empty group instead
+         * of failing the rebuild. */
+        if (interned[0] == '\0') return -1;
         bool seen = false;
         for (int k = 0; k < n; k++) {
             if (out[k] == interned) { seen = true; break; }
@@ -963,6 +972,10 @@ static bool rebuild_indexes(void) {
             int name_count = 1;
             if (kind == TAGCACHE_GROUP_ARTIST) {
                 name_count = artist_group_names_with(delims_snapshot, ents[i].artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
+                if (name_count < 0) { /* interning failed: fail the rebuild, do not publish a wrong index */
+                    ok = false;
+                    break;
+                }
             } else if (kind == TAGCACHE_GROUP_ALBUM_ARTIST) {
                 names[0] = ents[i].album_artist ? ents[i].album_artist : "";
             } else {
@@ -1044,6 +1057,10 @@ static bool rebuild_indexes(void) {
             int name_count = 1;
             if (kind == TAGCACHE_GROUP_ARTIST) {
                 name_count = artist_group_names_with(delims_snapshot, ents[i].artist, names, TAGCACHE_ARTIST_SPLIT_MAX);
+                if (name_count < 0) { /* interning failed: fail the rebuild, do not publish a wrong index */
+                    ok = false;
+                    break;
+                }
             } else if (kind == TAGCACHE_GROUP_ALBUM_ARTIST) {
                 names[0] = ents[i].album_artist ? ents[i].album_artist : "";
             } else {
@@ -1063,6 +1080,14 @@ static bool rebuild_indexes(void) {
             }
         }
         free(write_pos);
+        /* A pass-2 abort leaves the song arrays partly filled, and their
+         * unwritten slots are uninitialised, so bail before sorting them
+         * rather than reading that memory. The rejection path below frees
+         * everything and keeps the previously published index. */
+        if (!ok) {
+            group_node_free_table(map, buckets);
+            break;
+        }
 
         /* Sort per-group song arrays and overall group array */
         for (int g = 0; g < unique; g++) {

@@ -58,6 +58,40 @@ fi
 install -m 0755 "$player" "$work/root/usr/bin/open_hiby_player"
 install -m 0755 "$bootloader" "$work/root/usr/bin/open_hiby_bootloader"
 
+# The stock boot scripts start the A2DP source daemon without the encoder
+# arguments the player's default "auto" codec preference expects, so the
+# player would have to restart the daemon on every boot to correct them --
+# tearing down any accessory that connected first. Patched here rather than
+# shipped under firmware/overlay/ because these are HiBy's scripts, not ours
+# to redistribute. Idempotent, so a base image that already carries the
+# argument is left alone.
+for bt_script in bt_init bt_resume; do
+    bt_script_path="$work/root/usr/bin/$bt_script"
+    [[ -f "$bt_script_path" ]] || {
+        echo "Base OTA is missing /usr/bin/$bt_script" >&2
+        exit 1
+    }
+    grep -q 'bluealsad -p a2dp-source' "$bt_script_path" || {
+        echo "Base OTA /usr/bin/$bt_script does not start bluealsad as an A2DP source" >&2
+        exit 1
+    }
+    sed -i '/--all-codecs/!s|bluealsad -p a2dp-source|bluealsad -p a2dp-source --all-codecs|g' \
+        "$bt_script_path"
+    # Negotiate 44.1 kHz rather than BlueALSA's default pick of the highest
+    # rate up to 48 kHz: resampling only happens when a track's rate differs
+    # from the transport's, and CD-derived 44.1 kHz material is the bulk of a
+    # typical music library.
+    sed -i '/--a2dp-force-audio-cd/!s|bluealsad -p a2dp-source|bluealsad -p a2dp-source --a2dp-force-audio-cd|g' \
+        "$bt_script_path"
+    for bt_arg in --all-codecs --a2dp-force-audio-cd; do
+        grep -q -- "$bt_arg" "$bt_script_path" || {
+            echo "Failed to add $bt_arg to /usr/bin/$bt_script" >&2
+            exit 1
+        }
+    done
+    sh -n "$bt_script_path"
+done
+
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 
 # UI assets and fonts we own, kept under assets/ in the tree the device itself

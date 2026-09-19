@@ -1,4 +1,4 @@
-plugin.define({ id = "example.sound_profiles", name = "Sound Profiles", version = "1.0", api_min = 1 })
+plugin.define({ id = "example.sound_profiles", name = "Sound Profiles", version = "1.1", api_min = 1 })
 
 -- Sound profile switcher, adds a "Sound Profile" row to Settings -> Music
 -- Settings -> Audio.
@@ -29,6 +29,28 @@ local PROFILES = {
     { key = "bass_boost",   name = "Bass Boost",   gains = { [1] = 6, [2] = 4, [3] = 2 } },
     { key = "vocal",        name = "Vocal",         gains = { [1] = -2, [6] = 3, [7] = 4, [8] = 3 } },
     { key = "treble_boost", name = "Treble Boost", gains = { [8] = 3, [9] = 4, [10] = 5 } },
+
+    -- Harman In-Ear 2017 (IE) approximation from the supplied target graph.
+    -- The original IE curve has a strong bass shelf, a deep lower-mid dip,
+    -- a pronounced 2-4 kHz rise, and a treble fall above ~8-10 kHz.
+    -- This 10-band EQ approximates that shape with the plugin's fixed bands.
+    -- 16 kHz is kept at 0 dB because the very steep end-of-graph fall is
+    -- strongly affected by the measurement/coupler limit and cannot be
+    -- represented cleanly by the 0.2-Q high shelf.
+    { key = "harman_ie_2017", name = "Harman IE 2017", gains = {
+        [1] = 8, [2] = 6, [3] = 2, [4] = -2, [5] = -1,
+        [6] = 0, [7] = 6, [8] = 9, [9] = 6, [10] = 0
+    } },
+
+    -- V-shaped: elevated bass and upper treble with a recessed midrange.
+    { key = "v_shape", name = "V Shape", gains = {
+        [1] = 4, [2] = 3, [3] = 1, [6] = -2, [7] = -2, [8] = 2, [9] = 3, [10] = 3
+    } },
+
+    -- U-shaped: milder V-shape with less midrange recession.
+    { key = "u_shape", name = "U Shape", gains = {
+        [1] = 3, [2] = 2, [3] = 1, [6] = -1, [7] = -1, [8] = 1, [9] = 2, [10] = 2
+    } },
 }
 
 local function profile_path(key)

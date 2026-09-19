@@ -54,12 +54,15 @@ bool file_browser_build_playlist_for_path(const char * path, char *** out_playli
  * buffer per active directory, independent of library size. */
 typedef bool (*file_browser_song_visit_cb_t)(const char * path, void * user);
 
-/* Database-oriented variant which prunes one immediate child directory of
+/* Database-oriented variant which excludes one immediate child directory of
  * root, case-insensitively. Descendants with the same name elsewhere are
- * not skipped. */
+ * not skipped.
+ * False means the scan is void; a non-zero *out_skipped means it was
+ * incomplete. */
 bool file_browser_walk_all_songs_excluding_top_level(const char * root, const char * excluded_dir,
                                                      file_browser_song_visit_cb_t cb, void * user,
-                                                     int * out_count, atomic_int * progress);
+                                                     int * out_count, atomic_int * progress,
+                                                     int * out_skipped);
 
 /* Snapshot of the directory + on-screen row a file/playlist was last
  * tapped from -- for the player's "List" option to reopen the folder a

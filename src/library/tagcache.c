@@ -2419,14 +2419,19 @@ void tagcache_upsert(const char * path, int32_t mtime, int32_t size, const char 
     path_hash_insert(idx);
 }
 
-bool tagcache_end_update(bool prune) {
+bool tagcache_end_update(void) {
     if (!db_open) return false;
     tagcache_flush_numeric();
-    if (prune) {
-        for (int32_t i = 0; i < ent_count; i++) {
-            if (ents[i].flag & FLAG_DELETED) continue;
-            if (!(ents[i].flag & FLAG_SEEN)) ents[i].flag |= FLAG_DELETED;
-        }
+    /* Rows not seen during the pass are removed only when stat() reports
+     * ENOENT. Any other stat error, or a path that does not resolve, keeps
+     * the row. */
+    for (int32_t i = 0; i < ent_count; i++) {
+        if (ents[i].flag & (FLAG_DELETED | FLAG_SEEN)) continue;
+        const char * path = entry_path_str(&ents[i]);
+        if (!path || !path[0]) continue;
+        struct stat st;
+        if (stat(path, &st) == 0) continue;
+        if (errno == ENOENT) ents[i].flag |= FLAG_DELETED;
     }
     for (int32_t i = 0; i < ent_count; i++) ents[i].flag &= ~FLAG_SEEN;
     drop_derived_indexes_before_rebuild();

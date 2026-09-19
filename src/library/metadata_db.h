@@ -45,7 +45,7 @@ bool metadata_db_try_artist_row(const char * raw_artist, int64_t * out_offset);
 
 /* Starts a scan pass against the SD-resident tagcache. Unchanged files
  * are marked seen; new/changed files are upserted. metadata_db_end_update()
- * deletes unseen rows after a complete pass. */
+ * removes rows whose file is confirmed missing. */
 void metadata_db_begin_update(void);
 
 /* Looks up `path`, marking it as seen for this pass either way. Returns
@@ -57,10 +57,9 @@ bool metadata_db_get(const char * path, int64_t mtime, int64_t size, cached_tags
 /* Inserts or replaces the cached row for `path`. */
 void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cached_tags_t * tags);
 
-/* Ends a successful scan pass: deletes rows whose scan generation was not
- * refreshed by this pass (files removed/renamed), then commits. Returns
- * false if the on-disk write failed; the last committed generation remains
- * loadable. */
+/* Ends a successful scan pass: removes only rows whose file is confirmed
+ * missing, then commits. Returns false if the on-disk write failed; the
+ * last committed generation remains loadable. */
 bool metadata_db_end_update(void);
 
 /* Ends an interrupted scan without committing. Reloads the last committed

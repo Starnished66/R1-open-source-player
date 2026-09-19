@@ -3993,6 +3993,12 @@ static atomic_bool library_rescan_done_flag = false;
 char g_scan_last_path[PATH_MAX] = "";
 /* Published to the UI by library_rescan_done_flag's release/acquire pair. */
 static bool library_rescan_succeeded;
+/* Set when the walk could not read part of the tree, so the toast does not
+ * claim a full update. Rows whose file is missing are still removed. */
+static bool library_rescan_incomplete;
+/* Set when the card is not mounted, so the toast does not claim a full
+ * update and nothing was deleted this pass. */
+static bool library_rescan_not_mounted;
 
 static void * library_rescan_thread_func(void * arg) {
     (void) arg;
@@ -4202,11 +4208,14 @@ void poll_library_rescan(void) {
     if (!library_rescan_succeeded) {
         gui_busy_hide(library_rescan_token);
         nav_reset_to_home();
-        show_error_toast("Library update failed");
+        if (library_rescan_not_mounted) show_error_toast("No SD card");
+        else show_error_toast("Library update failed");
         return;
     }
     start_album_thumbnail_generation();
-    gui_busy_hide(library_rescan_token); show_info_toast("Library updated");
+    gui_busy_hide(library_rescan_token);
+    show_info_toast(library_rescan_incomplete ? "Library updated, some folders could not be read"
+                                              : "Library updated");
     library_rescan_success_pending = true;
     library_rescan_success_since_tick = lv_tick_get();
 }
@@ -5650,6 +5659,7 @@ typedef struct {
     atomic_bool done;
     bool ok;
     int count;
+    int skipped; /* entries the walk could not read and stepped over */
     atomic_int progress;
 } scan_walk_work_t;
 
@@ -5678,7 +5688,8 @@ static void * scan_walk_worker(void * arg) {
         return NULL;
     }
     w->ok = file_browser_walk_all_songs_excluding_top_level(
-        w->root, AUDIOBOOKS_LIBRARY_DIR_NAME, scan_spool_visit_cb, spool, &w->count, &w->progress);
+        w->root, AUDIOBOOKS_LIBRARY_DIR_NAME, scan_spool_visit_cb, spool, &w->count, &w->progress,
+        &w->skipped);
     if (fclose(spool) != 0) w->ok = false;
     atomic_store_explicit(&w->done, true, memory_order_release);
     return NULL;
@@ -5686,7 +5697,7 @@ static void * scan_walk_worker(void * arg) {
 
 #define SCAN_WALK_THREAD_STACK_SIZE (1024 * 1024)
 static bool scan_all_songs_with_timeout(const char * root, char * out_spool_path, size_t out_spool_size,
-                                        int * out_count) {
+                                        int * out_count, int * out_skipped) {
     scan_walk_work_t * w = calloc(1, sizeof(*w));
     if (!w) return false;
     snprintf(w->root, sizeof(w->root), "%s", root);
@@ -5716,6 +5727,7 @@ static bool scan_all_songs_with_timeout(const char * root, char * out_spool_path
             if (ok) {
                 snprintf(out_spool_path, out_spool_size, "%s", w->spool_path);
                 *out_count = w->count;
+                if (out_skipped) *out_skipped = w->skipped;
             } else {
                 remove(w->spool_path);
             }
@@ -5859,6 +5871,8 @@ static void rescan_playlists(void) {
 
 void library_scan_once(void) {
     library_rescan_succeeded = false;
+    library_rescan_incomplete = false;
+    library_rescan_not_mounted = false;
     bool db_logging = db_log_enabled();
     uint64_t scan_started_ms = db_logging ? db_log_now_ms() : 0;
     uint64_t phase_started_ms = scan_started_ms;
@@ -5879,16 +5893,26 @@ void library_scan_once(void) {
     DB_LOG("DB", "playlists_scan_end elapsed_ms=%llu rss_kb=%ld",
            (unsigned long long) (db_log_now_ms() - phase_started_ms), db_log_rss_kb());
 
+    /* An unmounted card leaves the mount point readable and empty, which walks
+     * cleanly to zero files. */
+    if (!sd_card_root_is_mounted()) {
+        DB_LOG("DB", "discover_skipped reason=not_mounted rss_kb=%ld", db_log_rss_kb());
+        library_rescan_not_mounted = true;
+        return;
+    }
+
     char spool_path[PATH_MAX] = {0};
     int discovered_count = 0;
+    int skipped_count = 0;
     phase_started_ms = db_logging ? db_log_now_ms() : 0;
-    if (!scan_all_songs_with_timeout(MUSIC_ROOT_DIR, spool_path, sizeof(spool_path), &discovered_count)) {
+    if (!scan_all_songs_with_timeout(MUSIC_ROOT_DIR, spool_path, sizeof(spool_path), &discovered_count,
+                                     &skipped_count)) {
         DB_LOG("DB", "discover_failed elapsed_ms=%llu rss_kb=%ld",
                (unsigned long long) (db_log_now_ms() - phase_started_ms), db_log_rss_kb());
         return; /* preserve the last known-good in-memory + on-disk library */
     }
-    DB_LOG("DB", "discover_end files=%d elapsed_ms=%llu spool=%s rss_kb=%ld",
-           discovered_count, (unsigned long long) (db_log_now_ms() - phase_started_ms),
+    DB_LOG("DB", "discover_end files=%d skipped=%d elapsed_ms=%llu spool=%s rss_kb=%ld",
+           discovered_count, skipped_count, (unsigned long long) (db_log_now_ms() - phase_started_ms),
            spool_path, db_log_rss_kb());
 
     library_scan_progress_total = discovered_count;
@@ -5958,8 +5982,10 @@ void library_scan_once(void) {
         return;
     }
 
+    DB_LOG("DB", "update_end skipped=%d", skipped_count);
     bool committed = metadata_db_end_update();
     library_rescan_succeeded = committed;
+    library_rescan_incomplete = committed && skipped_count > 0;
     if (!committed)
         fprintf(stderr, "Warning: music database commit failed -- keeping last on-disk library\n");
     DB_LOG("DB", "commit_end ok=%d files=%d elapsed_ms=%llu songs=%lld rss_kb=%ld", committed,

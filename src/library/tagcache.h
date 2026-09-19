@@ -71,9 +71,11 @@ bool tagcache_lookup(const char * path, int32_t mtime, int32_t size, tagcache_so
 void tagcache_upsert(const char * path, int32_t mtime, int32_t size, const char * title, const char * artist,
                      const char * album, const char * album_artist, const char * genre,
                      int32_t track_number, int32_t disc_number);
-/* prune unseen rows, rebuild indexes, persist. Returns false if the
- * on-disk write failed -- RAM is reloaded from the last committed files. */
-bool tagcache_end_update(bool prune);
+/* Commits the pass: rebuilds indexes and persists. A row not seen during the
+ * pass is removed only when stat() reports ENOENT, any other stat error keeps
+ * it. Returns false if the on-disk write failed, in which case RAM is
+ * reloaded from the last committed files. */
+bool tagcache_end_update(void);
 /* Discard in-RAM scan mutations and reload the last committed files. */
 void tagcache_abort_update(void);
 

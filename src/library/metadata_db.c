@@ -273,7 +273,7 @@ void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cache
 bool metadata_db_end_update(void) {
     METADATA_DB_GUARD;
     if (!db_ready) return false;
-    return tagcache_end_update(true);
+    return tagcache_end_update();
 }
 
 void metadata_db_abort_update(void) {

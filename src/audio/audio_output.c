@@ -182,7 +182,13 @@ static bool open_device(unsigned int channels, unsigned int sample_rate, bool lo
         active_format = format;
         pthread_mutex_unlock(&state_mutex);
     } else if (target == OUTPUT_TARGET_BT) {
-        if (!spawn_aplay(bt_control_get_playback_pcm(), channels, sample_rate, PCM_FORMAT_S16_LE, &bt_aplay_pid, &bt_aplay_fd)) return false;
+        /* Prefer the rate-pinned PCM so ALSA converts this track to whatever
+         * the transport negotiated. Opening BlueALSA at the track's own rate
+         * makes it recreate the A2DP transport, dropping the accessory. */
+        char bt_pcm[64];
+        const char * bt_device = bt_control_prepare_playback_pcm(bt_pcm, sizeof(bt_pcm))
+            ? bt_pcm : bt_control_get_playback_pcm();
+        if (!spawn_aplay(bt_device, channels, sample_rate, PCM_FORMAT_S16_LE, &bt_aplay_pid, &bt_aplay_fd)) return false;
         pthread_mutex_lock(&state_mutex);
         active_target = OUTPUT_TARGET_BT;
         active_format = PCM_FORMAT_S16_LE;

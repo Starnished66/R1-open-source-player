@@ -526,6 +526,13 @@ void sync_player_topbar_visibility(lv_obj_t * screen) {
      * approach, not by this function. */
     bool hide = (current_settings.hide_player_topbar && (screen == gui_player_get_screen() || screen == gui_lyrics_get_screen())) ||
                 screen == gui_lock_screen_get_screen();
+    /* The quick drawer wins while it is open. It deliberately keeps the
+     * status bar above itself (see open_quick_drawer()), which does nothing
+     * when the Player has hidden it outright -- the drawer would slide down
+     * over an immersive Player with no clock or battery on it at all. Any
+     * path that re-syncs while the drawer is open gets the same answer, so
+     * navigating away from a drawer long-press cannot leave it stuck on. */
+    if (quick_drawer_open && screen != gui_lock_screen_get_screen()) hide = false;
     if (status_bar_band) {
         gui_shell_set_status_bar_screen_context(screen);
         if (hide) lv_obj_add_flag(status_bar_band, LV_OBJ_FLAG_HIDDEN);
@@ -1354,6 +1361,7 @@ bool bt_is_powered_cached = false;
  * and what to print on its second line. Empty when nothing's A2DP-connected. */
 char bt_connected_mac_cached[18] = "";
 char bt_connected_codec_cached[32] = "";
+unsigned int bt_connected_rate_cached = 0;
 
 /* /usr/bin/bt_init's last line creates /tmp/bt_init_ok once chip firmware
  * flash and initialization complete. Because /tmp is tmpfs, this flag is
@@ -1412,6 +1420,7 @@ static bool refresh_bt_icon_result_connected = false;
 static bool refresh_bt_icon_result_a2dp_connected = false;
 static char refresh_bt_icon_result_mac[18] = "";
 static char refresh_bt_icon_result_codec[32] = "";
+static unsigned int refresh_bt_icon_result_rate = 0;
 
 /* UI-thread owned Bluetooth audio state and disconnect generation latch */
 static bool bt_is_a2dp_connected_ui = false;
@@ -1476,6 +1485,7 @@ void gui_shell_notify_bt_audio_disconnected(void) {
     bt_is_a2dp_connected_ui = false;
     bt_connected_mac_cached[0] = '\0';
     bt_connected_codec_cached[0] = '\0';
+    bt_connected_rate_cached = 0;
     clear_bt_audio_route_now();
     if (a2dp_status_icon) lv_obj_add_flag(a2dp_status_icon, LV_OBJ_FLAG_HIDDEN);
     if (bt_codec_status_icon) lv_obj_add_flag(bt_codec_status_icon, LV_OBJ_FLAG_HIDDEN);
@@ -1508,9 +1518,12 @@ static void * refresh_bt_icon_thread_func(void * arg) {
      * leftover codec line for a device that just disconnected. */
     refresh_bt_icon_result_mac[0] = '\0';
     refresh_bt_icon_result_codec[0] = '\0';
+    refresh_bt_icon_result_rate = 0;
     if (refresh_bt_icon_result_a2dp_connected) {
         bt_control_get_connected_device_mac(refresh_bt_icon_result_mac, sizeof(refresh_bt_icon_result_mac));
-        bt_control_get_connected_device_codec(refresh_bt_icon_result_codec, sizeof(refresh_bt_icon_result_codec));
+        refresh_bt_icon_result_rate = 0;
+        bt_control_get_connected_device_stream(refresh_bt_icon_result_codec, sizeof(refresh_bt_icon_result_codec),
+                                              &refresh_bt_icon_result_rate);
     }
 
     if (powered) {
@@ -1763,8 +1776,20 @@ static void poll_refresh_bt_icon(void) {
     bt_is_a2dp_connected_ui = a2dp_connected;
     bt_power_status_generation++;
 
+    char previous_mac[sizeof(bt_connected_mac_cached)];
+    snprintf(previous_mac, sizeof(previous_mac), "%s", bt_connected_mac_cached);
     snprintf(bt_connected_mac_cached, sizeof(bt_connected_mac_cached), "%s", a2dp_connected ? refresh_bt_icon_result_mac : "");
+    if (strcmp(previous_mac, bt_connected_mac_cached) != 0) {
+        /* The right transport rate belongs to the accessory, so the effective
+         * one follows whatever is connected: 44.1 kHz headphones and a 96 kHz
+         * LDAC speaker each keep their own. Only on a real change, so a
+         * rate being applied right now is not overwritten by a routine
+         * refresh that happens to see the link mid-cycle. */
+        bt_control_set_sample_rate(settings_bt_rate_for(&current_settings, bt_connected_mac_cached));
+        gui_network_notify_bt_device_changed();
+    }
     snprintf(bt_connected_codec_cached, sizeof(bt_connected_codec_cached), "%s", a2dp_connected ? refresh_bt_icon_result_codec : "");
+    bt_connected_rate_cached = a2dp_connected ? refresh_bt_icon_result_rate : 0;
     if (quick_drawer_bt_icon) {
         lv_image_set_src(quick_drawer_bt_icon, quick_drawer_toggle_src(QD_TOGGLE_BT, display_powered));
         quick_drawer_mark_snapshot_dirty();
@@ -2226,6 +2251,10 @@ void open_quick_drawer(void) {
      * directly off the asset), so the status bar ends up sitting on that as
      * a backdrop rather than on anything from the screen underneath. */
     lv_obj_move_foreground(status_bar_band);
+    /* Moving it forward is not enough on an immersive Player, where it is
+     * flagged hidden; re-syncing now that quick_drawer_open is set reveals
+     * it for as long as the drawer is down. */
+    sync_player_topbar_visibility(lv_screen_active());
     /* Cancel any prior animation on this exact (var, exec_cb) pair before
      * starting a new one to prevent concurrent animations from fighting. */
     lv_anim_delete(quick_drawer, quick_drawer_anim_y_cb);
@@ -2243,6 +2272,9 @@ void open_quick_drawer(void) {
 void close_quick_drawer(void) {
     if (!quick_drawer_open) return;
     quick_drawer_open = false;
+    /* Hidden again on the way out, so it leaves with the drawer rather than
+     * popping out once the slide finishes. */
+    sync_player_topbar_visibility(lv_screen_active());
     int32_t h = lv_display_get_vertical_resolution(lv_display_get_default());
     lv_anim_delete(quick_drawer, quick_drawer_anim_y_cb); /* see open_quick_drawer()'s own comment on why */
     lv_anim_t a;
@@ -3630,9 +3662,9 @@ static void poll_bt_toggle(void) {
     start_refresh_bt_icon(); /* re-reads the real state -- updates the status bar/drawer icons and (once done) the Bluetooth screen's toggle row */
 }
 
-/* Reapplies persisted bt_dac_mode_enabled configuration asynchronously
- * at startup, launching the necessary bluealsa and bt-agent processes without
- * blocking the UI thread. */
+/* Applies bt_dac_mode_enabled configuration asynchronously during the
+ * startup window, launching the necessary bluealsa and bt-agent processes
+ * without blocking the UI thread. */
 static pthread_t bt_dac_startup_reapply_thread;
 static bool bt_dac_startup_reapply_active = false;
 static bool bt_dac_startup_reapply_started = false;
@@ -3648,9 +3680,10 @@ static void * bt_dac_startup_reapply_thread_func(void * arg) {
     return NULL;
 }
 
-/* Called once from gui_init(), only if bt_dac_mode_enabled was already true
- * at load time (a fresh toggle-on tap already goes through
- * bt_dac_toggle_cb() directly and doesn't need this). */
+/* Runs at most once, and only if DAC mode was switched on before the
+ * Bluetooth startup gate opened. bt_dac_mode_enabled is not persisted, so
+ * this never fires on a normal boot; a toggle-on tap after that gate goes
+ * through bt_dac_toggle_cb() directly and doesn't need this. */
 static void start_bt_dac_startup_reapply_if_needed(void) {
     if (!current_settings.bt_dac_mode_enabled || bt_dac_startup_reapply_started ||
         !refresh_bt_startup_readiness()) return;
@@ -3704,11 +3737,16 @@ static void start_bt_source_codec_reconcile_if_needed(void) {
     /* The first attempt is allowed to query the authoritative state even if
      * the cached status is still false. After a transient failure, wait for a
      * newer completed status refresh before retrying; this avoids a retry
-     * storm while still recovering when Bluetooth becomes ready later. */
+     * storm while still recovering when Bluetooth becomes ready later. A
+     * deferred reconcile is different: while the cached A2DP link remains
+     * up, retrying every newer status generation would just repeat the
+     * connected-accessory guard. Wait for the cached link to go away before
+     * trying again, so the next attempt can actually restart the daemon. */
     if (bt_source_codec_reconcile_started &&
         (!bt_source_codec_reconcile_retry_pending ||
          bt_source_codec_reconcile_failed_generation == bt_power_status_generation ||
-         !bt_is_powered_cached)) return;
+         !bt_is_powered_cached ||
+         gui_shell_is_bt_audio_connected())) return;
     bt_source_codec_reconcile_started = true;
     bt_source_codec_reconcile_active = true;
     atomic_store_explicit(&bt_source_codec_reconcile_done_flag, false, memory_order_relaxed);
@@ -4599,7 +4637,7 @@ void gui_shell_update_topbar(bool screen_just_woke) {
     /* Cheap startup-only marker check.  This runs every 500ms so the first
      * authoritative Bluetooth refresh begins promptly when bt_init finishes,
      * without delaying the rest of the UI or polling BlueZ prematurely.  It
-     * also releases a persisted Bluetooth-DAC reapply behind the same gate. */
+     * also releases a pending Bluetooth-DAC apply behind the same gate. */
     if (!bt_startup_ready) {
         start_bt_dac_startup_reapply_if_needed();
         start_refresh_bt_icon();

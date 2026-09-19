@@ -18,7 +18,7 @@ copy_libraries() {
         cp -a "$stage/usr/lib/$stem".so* "$overlay/usr/lib/"
     done
 }
-copy_libraries "$base/audio/stage" libasound libatopology libsbc
+copy_libraries "$base/audio/stage" libasound libatopology libsbc libspeexdsp
 copy_libraries "$base/zlib/current" libz
 copy_libraries "$base/expat/current" libexpat
 copy_libraries "$base/bluez-library/stage" libbluetooth
@@ -36,6 +36,12 @@ done
 cp "$base/dbus/stage/usr/libexec/dbus-daemon-launch-helper" "$overlay/usr/libexec/"
 chmod --reference="$stock/usr/libexec/dbus-daemon-launch-helper" "$overlay/usr/libexec/dbus-daemon-launch-helper"
 cp "$base/bluealsa/stage/usr/lib/alsa-lib/"*.so "$overlay/usr/lib/alsa-lib/"
+# Speex rate converter for Bluetooth output. An A2DP transport's rate is
+# fixed at connect time, so tracks at any other rate are converted rather
+# than renegotiated; without this alsa-lib uses its built-in linear
+# converter. cp -a keeps the quality-variant symlinks.
+cp -a "$base/audio/stage/usr/lib/alsa-lib/libasound_module_rate_speexrate"*.so \
+    "$overlay/usr/lib/alsa-lib/"
 cp "$base/bluealsa/stage/usr/share/alsa/alsa.conf.d/20-bluealsa.conf" "$overlay/usr/share/alsa/alsa.conf.d/"
 ln -s /usr/share/alsa/alsa.conf.d/20-bluealsa.conf "$overlay/etc/alsa/conf.d/20-bluealsa.conf"
 cp "$base/bluealsa/stage/etc/dbus-1/system.d/org.bluealsa.conf" "$overlay/etc/dbus-1/system.d/"

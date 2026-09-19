@@ -26,6 +26,8 @@ extern const int SLEEP_TIMER_STEPS[];
 #define SLEEP_TIMER_STEP_COUNT 10
 #define SETTINGS_SUBSONIC_SAVED_MAX 16
 
+#define BT_DEVICE_RATE_MAX 8
+
 typedef struct {
     float volume;              /* 0.0 - 1.0 */
     char last_track[512];      /* absolute path, empty if none */
@@ -115,15 +117,39 @@ typedef struct {
     /* Bluetooth output settings -- see bluetooth_control.h for the BlueALSA
      * 5 service behavior. */
     bool bt_volume_sync_enabled; /* Mirror hardware volume changes to the paired device. */
-    bool bt_dac_mode_enabled;    /* a2dp-sink profile: lets another device stream audio TO this one */
+    /* a2dp-sink profile: lets another device stream audio TO this one.
+     * Runtime-only, never persisted: the single-profile daemon cannot serve
+     * a2dp-source at the same time, so restoring this at boot would leave
+     * headphones unable to connect with no DAC overlay on screen to exit
+     * from. Leaving the overlay already clears it, so a stored "true" only
+     * ever came from powering off while the overlay was open. */
+    bool bt_dac_mode_enabled;
     char bt_codec[16];           /* "auto"/"ldac_hq"/"ldac_sq"/"aptx"/"aac"/"sbc"/"sbc_xq" */
-
-    /* Characters treated as separators inside one ARTIST tag, so a track
-     * tagged "A;B" is filed under both artists. Semicolon and slash are on by
-     * default; comma is offered but off, because it appears inside ordinary
-     * names ("Crosby, Stills & Nash") that splitting would break. Empty
-     * disables splitting. Album artist is never split. */
-    char artist_delimiters[8];
+    /* Resample Bluetooth output with the speex converter instead of
+     * alsa-lib's built-in linear one. A track whose rate differs from the
+     * A2DP transport's has to be converted either way, and speex measured
+     * about a point of CPU more than linear on an R1 while sounding better,
+     * so it is on by default and exposed under Bluetooth > Advanced only so
+     * it can be turned off. Quality 5 costs far more; quality 10 cannot keep
+     * up at all. */
+    bool bt_speexrate_enabled;
+    /* A2DP transport rate in Hz, or 0 for automatic. Automatic is the
+     * default and means 44.1 kHz: resampling only happens when a track's
+     * rate differs from the transport's, and CD-derived 44.1 kHz material is
+     * the bulk of a typical music library. 44.1 is negotiated directly via a
+     * daemon argument; any other rate needs the accessory's link
+     * re-established, because A2DP fixes the rate when the configuration is
+     * negotiated. */
+    unsigned int bt_sample_rate;
+    /* Per-accessory overrides of the rate above, because the right rate is a
+     * property of the accessory: 44.1 kHz suits headphones fed CD-derived
+     * music, while an LDAC device may be worth 96 kHz. Keyed by MAC, oldest
+     * entry reused once full. */
+    struct {
+        char mac[18];
+        unsigned int rate;
+    } bt_device_rates[BT_DEVICE_RATE_MAX];
+    int bt_device_rate_count;
     char bt_last_output_mac[18]; /* verified A2DP source MAC, empty when none is remembered */
     /* When true, BLE devices without a broadcast name are hidden from the
      * "Available Devices" list (shown as raw MAC addresses otherwise).
@@ -340,6 +366,11 @@ bool settings_load(player_settings_t * out);
  * temporary file and renames it into place, so a crash or power loss
  * mid-write can't corrupt the settings file. */
 void settings_save(const player_settings_t * settings);
+
+/* Bluetooth transport rate remembered per accessory; falls back to
+ * bt_sample_rate when that accessory has no entry of its own. */
+unsigned int settings_bt_rate_for(const player_settings_t * settings, const char * mac);
+void settings_bt_set_rate_for(player_settings_t * settings, const char * mac, unsigned int rate);
 
 /* Queue a durable save without blocking the caller on filesystem syncs.
  * Rapid requests are coalesced to the newest complete snapshot. */

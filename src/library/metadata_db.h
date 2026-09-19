@@ -37,6 +37,12 @@ void metadata_db_close(void);
  * checked that call), same as every other query against an unready DB. */
 bool metadata_db_had_no_saved_database(void);
 
+/* Resolves the Artists row a track belongs to in one lock scope. Returns false
+ * without waiting when the database is busy (a split rebuild holds the lock for
+ * its whole run), leaving the caller to skip a cosmetic highlight rather than
+ * stall the UI. */
+bool metadata_db_try_artist_row(const char * raw_artist, int64_t * out_offset);
+
 /* Starts a scan pass against the SD-resident tagcache. Unchanged files
  * are marked seen; new/changed files are upserted. metadata_db_end_update()
  * deletes unseen rows after a complete pass. */

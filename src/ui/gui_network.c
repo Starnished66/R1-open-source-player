@@ -54,6 +54,8 @@ static lv_obj_t * bt_dac_screen;
 static lv_obj_t * bt_dac_overlay_screen;
 static lv_obj_t * bt_dac_stream_label;
 static lv_obj_t * bt_codec_screen;
+static lv_obj_t * bt_advanced_screen;
+static lv_obj_t * bt_rate_screen;
 static lv_obj_t * usb_mode_screen;
 static lv_obj_t * usb_dac_overlay_screen;
 /* See the mode-switch success path for why this exists rather than reading
@@ -1210,6 +1212,8 @@ static bool bt_name_is_mac_placeholder(const bt_device_t * dev) {
  * little breathing room, not a full second LIST_ROW_HEIGHT line. */
 #define BT_DEVICE_ROW_CODEC_EXTRA_HEIGHT BOARD_SCALE_PX(40)
 
+static void format_rate(char * out, size_t size, unsigned int rate);
+
 static void add_bt_device_row(lv_obj_t * parent, int index) {
     bt_device_t * dev = &bt_scan_results[index];
 
@@ -1253,7 +1257,19 @@ static void add_bt_device_row(lv_obj_t * parent, int index) {
 
     if (show_codec) {
         lv_obj_t * codec_label = lv_label_create(row);
-        lv_label_set_text(codec_label, bt_connected_codec_cached);
+        /* Codec and rate together: the negotiated link is not necessarily the
+         * codec preference in Settings, and the frequency is the other half of
+         * what tells you which link you actually got. Rate is omitted rather
+         * than guessed when bluealsa does not report one. */
+        char codec_text[96]; /* codec (32) + separator + formatted rate */
+        if (bt_connected_rate_cached) {
+            char rate[32];
+            format_rate(rate, sizeof(rate), bt_connected_rate_cached);
+            snprintf(codec_text, sizeof(codec_text), "%s · %s", bt_connected_codec_cached, rate);
+        } else {
+            snprintf(codec_text, sizeof(codec_text), "%s", bt_connected_codec_cached);
+        }
+        lv_label_set_text(codec_label, codec_text);
         lv_obj_add_style(codec_label, &style_theme_text_muted, 0);
         lv_obj_set_style_text_font(codec_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
         lv_obj_align(codec_label, LV_ALIGN_BOTTOM_LEFT, LIST_ROW_LABEL_INSET, BOARD_SCALE_PX(-12));
@@ -1269,16 +1285,25 @@ static atomic_bool bt_scan_done_flag = false;
 static bt_device_t bt_scan_pending_results[BT_MAX_RESULTS];
 static int bt_scan_pending_result_count = 0;
 
+/* Set before the thread starts, so the write happens-before the read. */
+static bool bt_scan_want_inquiry = true;
+
 static void * bt_scan_thread_func(void * arg) {
     (void) arg;
-    bt_scan_pending_result_count = bt_control_scan(6, bt_scan_pending_results, BT_MAX_RESULTS);
+    bt_scan_pending_result_count = bt_scan_want_inquiry
+        ? bt_control_scan(6, bt_scan_pending_results, BT_MAX_RESULTS)
+        : bt_control_list_devices(bt_scan_pending_results, BT_MAX_RESULTS);
     atomic_store_explicit(&bt_scan_done_flag, true, memory_order_release); /* written last -- poll_bt_scan only checks this flag */
     return NULL;
 }
 
-/* Runs Bluetooth scan in a background thread without navigation or busy screen. */
-static void start_bt_scan(void) {
+/* Runs Bluetooth scan in a background thread without navigation or busy screen.
+ * With inquiry false it only re-reads the devices BlueZ already knows, which
+ * leaves an active A2DP stream alone. */
+static void start_bt_scan_ex(bool inquiry) {
     if (bt_scan_active) return;
+
+    bt_scan_want_inquiry = inquiry;
 
     atomic_store_explicit(&bt_scan_done_flag, false, memory_order_relaxed);
     bt_scan_active = true;
@@ -1289,6 +1314,8 @@ static void start_bt_scan(void) {
         set_bt_rescan_active(false);
     }
 }
+
+static void start_bt_scan(void) { start_bt_scan_ex(true); }
 
 void poll_bt_scan(void) {
     if (!bt_scan_active || !atomic_load_explicit(&bt_scan_done_flag, memory_order_acquire)) return;
@@ -1543,6 +1570,220 @@ static void bt_codec_option_row_cb(lv_event_t * e) {
     settings_save_async(&current_settings);
     populate_bt_codec_screen();
     if (codec_changed) show_info_toast("Turn Bluetooth off and on to apply");
+}
+
+/* ---- Bluetooth > Advanced ---------------------------------------------
+ * Settings that are set once and rarely revisited, kept off the Bluetooth
+ * screen so the device list stays the focus there. ---- */
+static lv_obj_t * bt_advanced_list;
+static lv_obj_t * bt_rate_list;
+
+static void bt_rate_option_row_cb(lv_event_t * e);
+
+/* Rates offered by the connected accessory for the codec in use. Queried
+ * when the screen opens, because the set depends on both the accessory and
+ * the negotiated codec. */
+#define BT_RATE_MAX_OPTIONS 12
+static unsigned int bt_rate_options[BT_RATE_MAX_OPTIONS];
+static int bt_rate_option_count;
+/* True while the background query is in flight, so the list can say so. */
+static bool bt_rate_query_active = false;
+
+static void bt_rate_format(char * out, size_t out_size, unsigned int rate) {
+    if (rate % 1000 == 0) snprintf(out, out_size, "%u kHz", rate / 1000);
+    else snprintf(out, out_size, "%u.%u kHz", rate / 1000, (rate % 1000) / 100);
+}
+
+/* Rate shown and edited is the connected accessory's own, falling back to the
+ * global default when nothing is connected. */
+static unsigned int bt_rate_selected(void) {
+    return settings_bt_rate_for(&current_settings, bt_connected_mac_cached);
+}
+
+static void populate_bt_rate_screen(void) {
+    lv_obj_clean(bt_rate_list);
+    add_pill_option_row(bt_rate_list, "Automatic (44.1 kHz)", bt_rate_selected() == 0,
+                        bt_rate_option_row_cb, (void *) (intptr_t) 0);
+
+    /* Nothing connected means nothing to query, and only 44.1 can be applied
+     * without an accessory present to negotiate with. */
+    if (bt_rate_option_count == 0) {
+        add_pill_option_row(bt_rate_list, "44.1 kHz", bt_rate_selected() == 44100,
+                            bt_rate_option_row_cb, (void *) (intptr_t) 44100);
+        add_section_header(bt_rate_list, bt_rate_query_active ? "Reading supported rates..."
+                                                              : "Connect a device to see its supported rates");
+        return;
+    }
+    for (int i = 0; i < bt_rate_option_count; i++) {
+        char label[32];
+        bt_rate_format(label, sizeof(label), bt_rate_options[i]);
+        add_pill_option_row(bt_rate_list, label, bt_rate_selected() == bt_rate_options[i],
+                            bt_rate_option_row_cb, (void *) (intptr_t) bt_rate_options[i]);
+    }
+}
+
+static void populate_bt_advanced_screen(void);
+/* Defined with the Bluetooth screen further down; the Advanced screen owns
+ * the rows now but the callbacks stay next to the state they touch. */
+static void bt_volume_sync_toggle_cb(lv_event_t * e);
+static void bt_hide_unnamed_toggle_cb(lv_event_t * e);
+static void bt_codec_settings_row_cb(lv_event_t * e);
+
+/* Cycling the accessory's link blocks for seconds, so it runs on a worker
+ * while the screen stays live. */
+static pthread_t bt_rate_apply_thread;
+static bool bt_rate_apply_active = false;
+static atomic_bool bt_rate_apply_done_flag = false;
+/* Captured at launch so a status refresh cannot change what is being applied
+ * half way through. */
+static unsigned int bt_rate_apply_target = 0;
+
+static void * bt_rate_apply_thread_func(void * arg) {
+    (void) arg;
+    (void) bt_control_reconnect_for_rate_change(bt_rate_apply_target);
+    atomic_store_explicit(&bt_rate_apply_done_flag, true, memory_order_release); /* written last */
+    return NULL;
+}
+
+void poll_bt_rate_apply(void) {
+    if (!bt_rate_apply_active || !atomic_load_explicit(&bt_rate_apply_done_flag, memory_order_acquire)) return;
+    bt_rate_apply_active = false;
+    pthread_join(bt_rate_apply_thread, NULL);
+    /* No outcome toast: the accessory may still need reconnecting by hand,
+     * so "applied" or "failed" here would contradict what the user is about
+     * to do. The redrawn list shows the rate that actually took. */
+    if (gui_navigation_is_top(bt_rate_screen)) populate_bt_rate_screen();
+}
+
+static void bt_rate_option_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    unsigned int rate = (unsigned int) (intptr_t) lv_event_get_user_data(e);
+    bool changed = bt_rate_selected() != rate;
+    /* Remembered against the accessory when one is connected, so each keeps
+     * its own; with nothing connected this sets the default for accessories
+     * that have no entry yet. */
+    if (bt_connected_mac_cached[0]) settings_bt_set_rate_for(&current_settings, bt_connected_mac_cached, rate);
+    else current_settings.bt_sample_rate = rate;
+    settings_save_async(&current_settings);
+    bt_control_set_sample_rate(rate);
+    populate_bt_rate_screen();
+    if (!changed) return;
+
+    /* The rate is fixed when the A2DP configuration is negotiated, and these
+     * accessories refuse to renegotiate a live transport, so the link has to
+     * be re-established for the choice to take effect. Only the link cycles;
+     * the radio stays on. With nothing connected there is nothing to cycle
+     * and the choice simply applies on the next connection. */
+    if (!gui_shell_is_bt_audio_connected()) return;
+    if (bt_rate_apply_active) {
+        /* Silently dropping this would leave the setting saying one thing and
+         * the transport doing another. */
+        show_info_toast("Still applying the previous choice");
+        return;
+    }
+    atomic_store_explicit(&bt_rate_apply_done_flag, false, memory_order_relaxed);
+    bt_rate_apply_target = rate;
+    bt_rate_apply_active = true;
+    if (pthread_create(&bt_rate_apply_thread, NULL, bt_rate_apply_thread_func, NULL) != 0) {
+        bt_rate_apply_active = false;
+        show_info_toast("Turn Bluetooth off and on to apply");
+        return;
+    }
+    show_info_toast("Headset may disconnect, manual reconnection might be required");
+}
+
+static lv_obj_t * build_bt_rate_screen(void) {
+    lv_obj_t * title_label;
+    return build_subsonic_list_screen("Sample Rate", &title_label, &bt_rate_list);
+}
+
+/* The query forks bluealsactl, which must never happen on the UI thread:
+ * this screen would otherwise freeze for as long as the call takes, the same
+ * stall populate_bt_screen() documents for bt_control_is_powered(). The
+ * screen opens with what is already known and fills in when the worker
+ * finishes. */
+static pthread_t bt_rate_query_thread;
+static atomic_bool bt_rate_query_done_flag = false;
+static unsigned int bt_rate_query_results[BT_RATE_MAX_OPTIONS];
+static int bt_rate_query_result_count;
+
+static void * bt_rate_query_thread_func(void * arg) {
+    (void) arg;
+    bt_rate_query_result_count = bt_control_get_available_rates(bt_rate_query_results, BT_RATE_MAX_OPTIONS);
+    atomic_store_explicit(&bt_rate_query_done_flag, true, memory_order_release); /* written last */
+    return NULL;
+}
+
+/* The screen shows one accessory's rates and edits that accessory's entry,
+ * so a device changing underneath it has to redraw or it would edit the
+ * wrong one. */
+void gui_network_notify_bt_device_changed(void) {
+    if (!bt_rate_screen || !gui_navigation_is_top(bt_rate_screen)) return;
+    bt_rate_option_count = 0;
+    populate_bt_rate_screen();
+}
+
+void poll_bt_rate_query(void) {
+    if (!bt_rate_query_active || !atomic_load_explicit(&bt_rate_query_done_flag, memory_order_acquire)) return;
+    bt_rate_query_active = false;
+    pthread_join(bt_rate_query_thread, NULL);
+    if (bt_rate_query_result_count > 0) {
+        memcpy(bt_rate_options, bt_rate_query_results, sizeof(bt_rate_options));
+        bt_rate_option_count = bt_rate_query_result_count;
+    }
+    /* Repainted even when the query found nothing, so the "reading" note is
+     * replaced rather than left up until the screen is reopened. */
+    if (gui_navigation_is_top(bt_rate_screen)) populate_bt_rate_screen();
+}
+
+static void bt_rate_settings_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    bt_rate_option_count = 0;
+    populate_bt_rate_screen();
+    nav_push(bt_rate_screen);
+    if (gui_shell_is_bt_audio_connected() && !bt_rate_query_active) {
+        atomic_store_explicit(&bt_rate_query_done_flag, false, memory_order_relaxed);
+        bt_rate_query_active = true;
+        if (pthread_create(&bt_rate_query_thread, NULL, bt_rate_query_thread_func, NULL) != 0)
+            bt_rate_query_active = false;
+    }
+}
+
+static void bt_speexrate_toggle_cb(lv_event_t * e) {
+    /* add_pill_toggle_row() makes the switch itself non-clickable and fires
+     * CLICKED on the row, so the state is flipped here rather than read back
+     * off the widget. */
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    current_settings.bt_speexrate_enabled = !current_settings.bt_speexrate_enabled;
+    settings_save_async(&current_settings);
+    bt_control_set_speexrate_enabled(current_settings.bt_speexrate_enabled);
+    populate_bt_advanced_screen();
+}
+
+static void populate_bt_advanced_screen(void) {
+    lv_obj_clean(bt_advanced_list);
+    add_pill_toggle_row(bt_advanced_list, "Bluetooth Volume Sync",
+                        current_settings.bt_volume_sync_enabled, bt_volume_sync_toggle_cb);
+    add_pill_chevron_row(bt_advanced_list, "Codec", bt_codec_settings_row_cb);
+    add_pill_chevron_row(bt_advanced_list, "Sample Rate", bt_rate_settings_row_cb);
+    /* Only does anything for a track whose rate differs from the negotiated
+     * transport rate; with Sample Rate at 44.1 kHz most tracks never reach
+     * the resampler at all. */
+    add_pill_toggle_row(bt_advanced_list, "Speex Resampling",
+                        current_settings.bt_speexrate_enabled, bt_speexrate_toggle_cb);
+    add_pill_toggle_row(bt_advanced_list, "Hide Unnamed Devices",
+                        current_settings.bt_hide_unnamed_devices, bt_hide_unnamed_toggle_cb);
+}
+
+static lv_obj_t * build_bt_advanced_screen(void) {
+    lv_obj_t * title_label;
+    return build_subsonic_list_screen("Advanced", &title_label, &bt_advanced_list);
+}
+
+static void bt_advanced_settings_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    populate_bt_advanced_screen();
+    nav_push(bt_advanced_screen);
 }
 
 static lv_obj_t * build_bt_codec_screen(void) {
@@ -2318,7 +2559,7 @@ static void bt_volume_sync_toggle_cb(lv_event_t * e) {
     current_settings.bt_volume_sync_enabled = !current_settings.bt_volume_sync_enabled;
     settings_save(&current_settings);
     start_bt_apply_output_settings(current_settings.bt_dac_mode_enabled, current_settings.bt_volume_sync_enabled);
-    populate_bt_screen();
+    populate_bt_advanced_screen(); /* the row lives on Advanced now */
 }
 
 /* Display filter toggle to hide unnamed Bluetooth devices (e.g. BLE beacons)
@@ -2327,7 +2568,8 @@ static void bt_hide_unnamed_toggle_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     current_settings.bt_hide_unnamed_devices = !current_settings.bt_hide_unnamed_devices;
     settings_save(&current_settings);
-    populate_bt_screen();
+    populate_bt_advanced_screen(); /* moves the switch the user just tapped */
+    populate_bt_screen();          /* and the device list it filters, for the way back */
 }
 
 /* ---- Master rebuild for the Bluetooth screen's one dynamic list: toggle
@@ -2367,12 +2609,8 @@ void populate_bt_screen(void) {
         return;
     }
 
-    add_pill_toggle_row(bt_list, "Bluetooth Volume Sync", current_settings.bt_volume_sync_enabled,
-                        bt_volume_sync_toggle_cb);
     add_pill_chevron_row(bt_list, "Bluetooth DAC", bt_dac_settings_row_cb);
-    add_pill_chevron_row(bt_list, "Codec", bt_codec_settings_row_cb);
-    add_pill_toggle_row(bt_list, "Hide Unnamed Devices", current_settings.bt_hide_unnamed_devices,
-                        bt_hide_unnamed_toggle_cb);
+    add_pill_chevron_row(bt_list, "Advanced", bt_advanced_settings_row_cb);
 
     add_section_header(bt_list, "Paired Devices");
     int paired_shown = 0;
@@ -2424,7 +2662,13 @@ static lv_obj_t * build_bluetooth_screen(void) {
 void open_bluetooth_screen(void) {
     populate_bt_screen();
     nav_push(bt_screen);
-    if (bt_is_powered_cached) start_bt_scan(); /* auto-refresh -- matches the old always-scan-on-open behavior, but only when there's a radio to scan with -- cached, not a fresh bt_control_is_powered() call, same reasoning as populate_bt_screen() */
+    /* Auto-refresh on open -- cached power state, not a fresh
+     * bt_control_is_powered() call, same reasoning as populate_bt_screen().
+     * An inquiry is skipped while an accessory is connected: discovery makes
+     * the controller interleave with the A2DP link and the music audibly
+     * stutters for the whole scan window. The known-device list still
+     * refreshes, and Rescan is there when discovery is actually wanted. */
+    if (bt_is_powered_cached) start_bt_scan_ex(!gui_shell_is_bt_audio_connected());
 }
 
 static void bt_tile_cb(lv_event_t * e) {
@@ -3464,6 +3708,8 @@ void gui_network_init(void) {
     bt_dac_screen = build_bt_dac_screen();
     bt_dac_overlay_screen = build_bt_dac_overlay_screen();
     bt_codec_screen = build_bt_codec_screen();
+    bt_advanced_screen = build_bt_advanced_screen();
+    bt_rate_screen = build_bt_rate_screen();
     font_size_screen = build_font_size_screen();
     replaygain_mode_screen = build_replaygain_mode_screen();
     resume_mode_screen = build_resume_mode_screen();
@@ -3510,6 +3756,8 @@ void gui_network_teardown(void) {
     if (bt_dac_screen) { lv_obj_delete(bt_dac_screen); bt_dac_screen = NULL; }
     if (bt_dac_overlay_screen) { lv_obj_delete(bt_dac_overlay_screen); bt_dac_overlay_screen = NULL; }
     if (bt_codec_screen) { lv_obj_delete(bt_codec_screen); bt_codec_screen = NULL; }
+    if (bt_advanced_screen) { lv_obj_delete(bt_advanced_screen); bt_advanced_screen = NULL; }
+    if (bt_rate_screen) { lv_obj_delete(bt_rate_screen); bt_rate_screen = NULL; }
     if (font_size_screen) { lv_obj_delete(font_size_screen); font_size_screen = NULL; }
     if (replaygain_mode_screen) { lv_obj_delete(replaygain_mode_screen); replaygain_mode_screen = NULL; }
     if (resume_mode_screen) { lv_obj_delete(resume_mode_screen); resume_mode_screen = NULL; }
@@ -3571,6 +3819,14 @@ void gui_network_cancel_background_work(void) {
     if (bt_forget_active) {
         pthread_join(bt_forget_thread, NULL);
         bt_forget_active = false;
+    }
+    if (bt_rate_query_active) {
+        pthread_join(bt_rate_query_thread, NULL);
+        bt_rate_query_active = false;
+    }
+    if (bt_rate_apply_active) {
+        pthread_join(bt_rate_apply_thread, NULL);
+        bt_rate_apply_active = false;
     }
     if (bt_scan_active) {
         pthread_join(bt_scan_thread, NULL);

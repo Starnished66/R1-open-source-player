@@ -44,6 +44,11 @@ void build_bt_dac_leave_popup(void);
 
 void open_wifi_screen(void);
 void open_bluetooth_screen(void);
+
+/* The Sample Rate screen shows one accessory's rates and edits that
+ * accessory's stored entry, so it must redraw when the connected device
+ * changes underneath it. No-op unless that screen is on top. */
+void gui_network_notify_bt_device_changed(void);
 void populate_bt_screen(void);
 void gui_network_show_wifi_toggle_pending(bool enabled);
 void gui_network_wifi_toggle_completed(bool enabled);

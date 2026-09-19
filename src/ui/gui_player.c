@@ -1084,6 +1084,10 @@ void poll_cover_decode(void) {
             }
         }
 
+        /* The drawer shows this same frosted copy, so it can only be
+         * refreshed once the new one has replaced the previous track's. */
+        gui_shell_refresh_quick_drawer_cover();
+
         /* Refresh lyrics screen backdrop now that current_cover_bytes has
          * been updated with new cover art. */
         gui_lyrics_on_cover_changed(playlist_index);
@@ -1489,17 +1493,6 @@ static const char * info_path_hint(const char * path) {
     return dot ? dot + 1 : NULL;
 }
 
-static void player_set_secondary_metadata(const char * artist, const char * album) {
-    if (!song_album_label) return;
-    char text[768];
-    artist = artist ? artist : "";
-    album = album ? album : "";
-    if (*artist && *album) snprintf(text, sizeof(text), "%s · %s", artist, album);
-    else snprintf(text, sizeof(text), "%s", *artist ? artist : album);
-    if (strcmp(lv_label_get_text(song_album_label), text) != 0)
-        lv_label_set_text(song_album_label, text);
-}
-
 void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     /* Resolved once -- this is playlist_index's first real touch on every
      * track-start (play_track_at_from()/on_track_auto_advanced() both call
@@ -1619,9 +1612,9 @@ void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     const char * album_text = out_meta->has_album ? out_meta->album : "";
 
     lv_label_set_text(song_title_label, title_text);
+    if (song_album_label) lv_label_set_text(song_album_label, album_text);
     lv_label_set_text(song_folder_label, folder_text);
-    player_set_secondary_metadata(folder_text, album_text);
-    gui_shell_update_quick_drawer_track(title_text, folder_text);
+    gui_shell_update_quick_drawer_track(title_text, folder_text, album_text);
     refresh_format_badge();
     if (is_remote_track && remote_meta.artwork_url[0]) {
         launch_cover_decode_from_url(index, remote_meta.artwork_url, remote_meta.verify_tls);
@@ -1870,11 +1863,12 @@ typedef struct {
     int32_t compact_x, compact_y, compact_w, compact_h;
     int32_t height_style;
     int32_t normal_pad_left;
+    int32_t centered_text_inset;
 } player_lyrics_geometry_t;
 
 static bool player_lyrics_open;
 static bool player_lyrics_animating;
-#define PLAYER_LYRICS_MORPH_OBJECT_COUNT 3
+#define PLAYER_LYRICS_MORPH_OBJECT_COUNT 4
 static player_lyrics_geometry_t player_lyrics_geometry[PLAYER_LYRICS_MORPH_OBJECT_COUNT];
 static lv_obj_t * player_lyrics_hidden[32];
 static unsigned player_lyrics_hidden_count;
@@ -1893,6 +1887,13 @@ static void player_lyrics_morph(void * unused, int32_t progress) {
                               player_lyrics_lerp(g->y, g->compact_y, progress));
         lv_obj_set_size(g->obj, player_lyrics_lerp(g->w, g->compact_w, progress),
                                player_lyrics_lerp(g->h, g->compact_h, progress));
+        if (i) {
+            /* Move the visible text, not just its label box. Keeping LEFT
+             * alignment throughout the morph avoids the old end-of-exit
+             * snap from the box's left edge to its centered text position. */
+            lv_obj_set_style_pad_left(g->obj, g->normal_pad_left +
+                player_lyrics_lerp(g->centered_text_inset, 0, progress), 0);
+        }
     }
     /* The decoded image stays the same: only its scale and card bounds move.
      * Cache the image header once per transition, not on each animation tick. */
@@ -1918,7 +1919,7 @@ static void player_lyrics_restore_controls(void) {
         lv_obj_set_style_pad_left(player_lyrics_geometry[i].obj,
                                  player_lyrics_geometry[i].normal_pad_left, 0);
         lv_obj_set_height(player_lyrics_geometry[i].obj, player_lyrics_geometry[i].height_style);
-        lv_obj_set_style_text_align(player_lyrics_geometry[i].obj, LV_TEXT_ALIGN_LEFT, 0);
+        lv_obj_set_style_text_align(player_lyrics_geometry[i].obj, LV_TEXT_ALIGN_CENTER, 0);
     }
 }
 
@@ -1948,7 +1949,7 @@ static void player_lyrics_set_open(bool open, bool animate) {
     lv_anim_delete(player_screen, player_lyrics_morph);
     if (open) {
         lv_obj_update_layout(player_screen);
-        lv_obj_t * objects[] = { cover_card, song_title_label, song_album_label };
+        lv_obj_t * objects[] = { cover_card, song_title_label, song_folder_label, song_album_label };
         int32_t cover_size = player_s(112);
         int32_t left = player_x(24), top = player_y(48);
         int32_t text_x = left + cover_size + player_x(16);
@@ -1982,12 +1983,18 @@ static void player_lyrics_set_open(bool open, bool animate) {
     } else {
         gui_lyrics_hide_embedded();
     }
-    /* Both endpoint layouts are left aligned. Move their boxes directly;
-     * interpolating an obsolete centered-text inset caused a sideways jump
-     * on entry and another snap when exit restored the normal padding. */
+    /* Measure once per direction, since a new track may have been selected
+     * while lyrics were open. Do not measure fonts on animation frames. */
     for (unsigned i = 1; i < PLAYER_LYRICS_MORPH_OBJECT_COUNT; ++i) {
         player_lyrics_geometry_t * g = &player_lyrics_geometry[i];
-        lv_obj_set_style_pad_left(g->obj, g->normal_pad_left, 0);
+        lv_point_t text_size;
+        lv_text_get_size(&text_size, lv_label_get_text(g->obj),
+                        lv_obj_get_style_text_font(g->obj, 0),
+                        lv_obj_get_style_text_letter_space(g->obj, 0),
+                        lv_obj_get_style_text_line_space(g->obj, 0),
+                        LV_COORD_MAX, LV_TEXT_FLAG_EXPAND);
+        int32_t available = g->w - g->normal_pad_left - lv_obj_get_style_pad_right(g->obj, 0);
+        g->centered_text_inset = text_size.x < available ? (available - text_size.x) / 2 : 0;
         lv_obj_set_style_text_align(g->obj, LV_TEXT_ALIGN_LEFT, 0);
     }
     player_lyrics_open = open;
@@ -2263,6 +2270,37 @@ static void player_secondary_label_enable_marquee(lv_obj_t * label) {
     row_label_enable_marquee(label);
 }
 
+/* Fixed three-line metadata block above the cover: title, artist, album.
+ * Each row is one line of its own font, stacked with a uniform gap. The
+ * fonts are fixed per board, so this resolves to one layout per board. */
+static void player_layout_metadata_stack(void) {
+    if (!song_title_label || !song_album_label || !song_folder_label) return;
+
+    const lv_font_t * title_font = lv_obj_get_style_text_font(song_title_label, 0);
+    const lv_font_t * artist_font = lv_obj_get_style_text_font(song_folder_label, 0);
+    const lv_font_t * album_font = lv_obj_get_style_text_font(song_album_label, 0);
+    int32_t title_h = title_font ? lv_font_get_line_height(title_font) : player_y(32);
+    int32_t artist_h = artist_font ? lv_font_get_line_height(artist_font) : player_y(26);
+    int32_t album_h = album_font ? lv_font_get_line_height(album_font) : player_y(26);
+
+    const int32_t title_y = player_y(36);
+    /* Close the gaps rather than let the block reach the cover. */
+    int32_t gap = player_y(6);
+    int32_t room = player_y(152) - title_y - title_h - artist_h - album_h;
+    if (2 * gap > room) gap = room > 0 ? room / 2 : 0;
+    const int32_t artist_y = title_y + title_h + gap;
+    const int32_t album_y = artist_y + artist_h + gap;
+
+    lv_obj_set_y(song_title_label, title_y);
+    lv_obj_set_height(song_title_label, title_h);
+    lv_obj_set_y(song_folder_label, artist_y);
+    lv_obj_set_height(song_folder_label, artist_h);
+    lv_obj_set_y(song_album_label, album_y);
+    lv_obj_set_height(song_album_label, album_h);
+
+    player_transition_mark_dirty();
+}
+
 static void progress_slider_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t * slider = lv_event_get_target(e);
@@ -2343,38 +2381,42 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
      * existing compact typography on shorter panels so the three metadata
      * lines do not collide with the cover there. */
     const bool reference_player = BOARD_SCREEN_HEIGHT >= 800;
-    const lv_font_t * player_title_font = reference_player ? &app_font_22 : &app_font_16;
-    const lv_font_t * player_meta_font = &app_font_16;
+    const lv_font_t * player_title_font = &app_font_player_title;
+    const lv_font_t * player_meta_font = &app_font_player_meta;
 
-    /* Two fixed-height, left-aligned metadata lines remain usable at the
-     * BlindMF tier: title first, then the combined Artist · Album line. */
     song_title_label = lv_label_create(scr);
     lv_label_set_text(song_title_label, "No track loaded");
     lv_obj_add_style(song_title_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(song_title_label, player_title_font, 0);
-    lv_obj_set_style_text_align(song_title_label, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_set_pos(song_title_label, player_x(22), player_y(44));
-    lv_obj_set_size(song_title_label, BOARD_SCREEN_WIDTH - 2 * player_x(22),
-                    reference_player ? lv_font_get_line_height(player_title_font) : player_y(32));
+    lv_obj_set_style_text_align(song_title_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_x(song_title_label, player_x(22));
+    lv_obj_set_width(song_title_label, BOARD_SCREEN_WIDTH - 2 * player_x(22));
     player_label_enable_marquee(song_title_label);
 
     song_album_label = lv_label_create(scr);
     lv_label_set_text(song_album_label, "");
     lv_obj_add_style(song_album_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(song_album_label, player_meta_font, 0);
-    lv_obj_set_style_text_align(song_album_label, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_set_pos(song_album_label, player_x(22), player_y(44) +
-                   lv_font_get_line_height(player_title_font) + player_y(4));
-    lv_obj_set_size(song_album_label, BOARD_SCREEN_WIDTH - 2 * player_x(22),
-                    lv_font_get_line_height(player_meta_font));
+    lv_obj_set_style_text_align(song_album_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_x(song_album_label, player_x(22));
+    /* Content height so circular marquee does not fall back to vertical scrolling. */
+    lv_obj_set_width(song_album_label, BOARD_SCREEN_WIDTH - 2 * player_x(22));
+    lv_obj_set_height(song_album_label, LV_SIZE_CONTENT);
     player_secondary_label_enable_marquee(song_album_label);
 
     song_folder_label = lv_label_create(scr); /* holds ARTIST text, keep this name */
     lv_label_set_text(song_folder_label, "");
     lv_obj_add_style(song_folder_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(song_folder_label, player_meta_font, 0);
-    lv_obj_set_style_text_align(song_folder_label, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_add_flag(song_folder_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_text_align(song_folder_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_x(song_folder_label, player_x(22));
+    /* Circular marquee falls back to vertical scrolling when text exceeds
+     * a fixed height. Fit the actual font metrics (including loaded fallback
+     * fonts) while retaining the fixed width for horizontal overflow. */
+    lv_obj_set_width(song_folder_label, BOARD_SCREEN_WIDTH - 2 * player_x(22));
+    lv_obj_set_height(song_folder_label, LV_SIZE_CONTENT);
+    player_secondary_label_enable_marquee(song_folder_label);
+    player_layout_metadata_stack();
 
     /* Back/dismiss button. build_header_back_button()'s shared 64x64 default
      * (TITLE_ROW_HEIGHT, used by every other screen's header) would reach
@@ -2642,6 +2684,7 @@ void show_volume_popup(int32_t percent) {
 void refresh_format_badge(void) {
     if (playlist_index < 0) {
         if (format_badge_label) lv_label_set_text(format_badge_label, "");
+        gui_shell_update_quick_drawer_format("");
         return;
     }
 
@@ -2679,7 +2722,7 @@ void refresh_format_badge(void) {
         sample_rate = fmt_info.source_sample_rate;
         bit_depth = fmt_info.source_bit_depth;
     }
-    if (format_badge_label) {
+    {
         char text[96];
         if (sample_rate > 0 && bit_depth > 0) {
             snprintf(text, sizeof(text), "%s %u-bit / %.1fkHz", ext, bit_depth, sample_rate / 1000.0);
@@ -2691,8 +2734,9 @@ void refresh_format_badge(void) {
             snprintf(text, sizeof(text), "%s", ext);
         }
         /* Polling unchanged text must not restart its marquee every tick. */
-        if (strcmp(lv_label_get_text(format_badge_label), text) != 0)
+        if (format_badge_label && strcmp(lv_label_get_text(format_badge_label), text) != 0)
             lv_label_set_text(format_badge_label, text);
+        gui_shell_update_quick_drawer_format(text);
     }
 }
 
@@ -4938,6 +4982,10 @@ lv_obj_t * gui_player_get_cover_img(void) {
     return cover_img;
 }
 
+const lv_image_dsc_t * gui_player_get_current_reflection_dsc(void) {
+    return current_reflection_bytes ? &current_reflection_dsc : NULL;
+}
+
 bool gui_player_copy_cover_rgb565(int for_index, uint8_t * out, size_t out_size) {
     const size_t required = (size_t) COVER_ART_WIDTH * COVER_ART_HEIGHT * 2;
     if (!out || out_size < required || !current_cover_bytes || current_cover_for_index != for_index)
@@ -5113,16 +5161,7 @@ void gui_player_sync_topbar_visibility(lv_obj_t * screen) {
 }
 
 void gui_player_refresh_font_geometry(void) {
-    if (!song_title_label || !song_album_label) return;
-    const bool reference_player = BOARD_SCREEN_HEIGHT >= 800;
-    const lv_font_t * title_font = reference_player ? &app_font_22 : &app_font_16;
-    const lv_font_t * meta_font = &app_font_16;
-    int32_t title_h = lv_font_get_line_height(title_font);
-    lv_obj_set_height(song_title_label, title_h);
-    lv_obj_set_y(song_title_label, player_y(44));
-    lv_obj_set_height(song_album_label, lv_font_get_line_height(meta_font));
-    lv_obj_set_y(song_album_label, player_y(44) + title_h + player_y(4));
-    player_transition_mark_dirty();
+    player_layout_metadata_stack();
 }
 
 

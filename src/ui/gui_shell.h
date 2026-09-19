@@ -12,7 +12,10 @@ void gui_shell_refresh_home(void);
  * .c definition). Read-only -- exposes no way to drive the toggle itself. */
 bool gui_shell_wifi_effective_enabled(void);
 
-void gui_shell_update_quick_drawer_track(const char * title, const char * artist);
+void gui_shell_update_quick_drawer_track(const char * title, const char * artist,
+                                         const char * album);
+/* Mirrors the Player's format badge text into the quick drawer. */
+void gui_shell_update_quick_drawer_format(const char * text);
 /* Refreshes the drawer's own small cover thumbnail from whatever
  * gui_player_get_current_cover_dsc() currently returns (or the default
  * placeholder if NULL) -- call whenever that changes, not just on a title/

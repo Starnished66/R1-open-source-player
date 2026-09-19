@@ -79,6 +79,9 @@ lv_obj_t * gui_player_get_cover_img(void);
  * Keeping ownership inside gui_player avoids exposing a mutable buffer that
  * is freed and replaced on track changes. */
 bool gui_player_copy_cover_rgb565(int for_index, uint8_t * out, size_t out_size);
+/* The frosted (blurred, darkened) copy of the current cover, or NULL when
+ * none has been produced -- flat layout mode, or no cover decoded yet. */
+const lv_image_dsc_t * gui_player_get_current_reflection_dsc(void);
 bool gui_player_is_seeking(void);
 bool gui_player_volume_control_hit_test(lv_point_t point);
 

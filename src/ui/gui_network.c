@@ -1957,24 +1957,14 @@ static void font_size_apply_timer_cb(lv_timer_t * timer) {
     current_settings.font_size_tier = target;
     settings_save(&current_settings);
     lv_obj_report_style_change(NULL);
-    screen_builders_refresh_font_geometry(NULL);
+    /* Every live screen, not only the Font Size nav stack. Music Settings
+     * and the other unused Settings submenus keep the previous tier's
+     * USER_3 label boxes unless they are in this walk. */
+    screen_builders_refresh_all_font_geometry();
     gui_settings_refresh_font_geometry();
     gui_player_refresh_font_geometry();
     compact_list_refresh_all();
     quick_drawer_mark_snapshot_dirty();
-    /* Every screen still on the nav stack right now (Home -> Settings ->
-     * ... -> this Font Size screen) was built under the tier that was just
-     * replaced -- its bounded scrolling row labels (tagged by
-     * row_label_apply_bounded_height()) won't get rebuilt just because
-     * nav_reset_to_home() is about to run, since none of them go through
-     * lv_obj_clean()+repopulate on a plain pop. Bounded by
-     * gui_navigation_get_depth() (<=NAV_STACK_MAX), one-shot, no
-     * allocation. */
-    int font_geom_nav_depth = gui_navigation_get_depth();
-    for (int i = 0; i < font_geom_nav_depth; i++) {
-        lv_obj_t * nav_screen = gui_navigation_get_screen_at(i);
-        if (nav_screen) screen_builders_refresh_font_geometry(nav_screen);
-    }
     nav_reset_to_home();
     screen_builders_refresh_font_geometry(lv_screen_active());
     lv_obj_invalidate(lv_screen_active());

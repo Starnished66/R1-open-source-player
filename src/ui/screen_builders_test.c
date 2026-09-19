@@ -221,6 +221,49 @@ static void check_compact_home_glow(int display_height) {
     lv_obj_delete(screen);
 }
 
+static lv_obj_t * pill_list_first_label(lv_obj_t * screen) {
+    lv_obj_t * list = lv_obj_get_child(screen, 2);
+    lv_obj_t * row = list ? lv_obj_get_child(list, 0) : NULL;
+    return row ? lv_obj_get_child(row, 0) : NULL;
+}
+
+static void check_unvisited_font_geometry(void) {
+    fonts_reset();
+    pill_list_item_t items[] = {
+        { .label = "Audio", .accessory = PILL_ACCESSORY_CHEVRON },
+    };
+    lv_obj_t * visited = build_pill_list_screen("Display", noop, items, 1,
+                                               gui_theme_accent_style(), GUI_ROW_GAP, 100);
+    lv_obj_t * unvisited = build_pill_list_screen("Music Settings", noop, items, 1,
+                                                 gui_theme_accent_style(), GUI_ROW_GAP, 100);
+    lv_screen_load(visited);
+    lv_obj_update_layout(visited);
+    lv_obj_update_layout(unvisited);
+    lv_obj_t * visited_label = pill_list_first_label(visited);
+    lv_obj_t * unvisited_label = pill_list_first_label(unvisited);
+    assert(visited_label && unvisited_label);
+    int32_t old_h = lv_obj_get_height(unvisited_label);
+    app_font_20.line_height = 48;
+    int32_t want = row_label_bounded_height(&app_font_20);
+    assert(want > old_h);
+
+    /* Per-root refresh is still single-screen: the unvisited Music Settings
+     * analogue must not move until the all-screens walk runs. */
+    screen_builders_refresh_font_geometry(NULL);
+    screen_builders_refresh_font_geometry(visited);
+    lv_obj_update_layout(unvisited);
+    assert(lv_obj_get_height(unvisited_label) == old_h);
+
+    screen_builders_refresh_all_font_geometry();
+    lv_obj_update_layout(visited);
+    lv_obj_update_layout(unvisited);
+    assert(lv_obj_get_height(visited_label) == want);
+    assert(lv_obj_get_height(unvisited_label) == want);
+    fonts_reset();
+    lv_obj_delete(unvisited);
+    lv_obj_delete(visited);
+}
+
 static lv_obj_t * find_row(lv_obj_t * list, const char * title) {
     for (uint32_t i = 0; i < lv_obj_get_child_count(list); ++i) {
         lv_obj_t * row = lv_obj_get_child(list, i);
@@ -581,6 +624,7 @@ static void check_layout(int display_height) {
     lv_obj_delete(category_screen);
     assert(category_asset_closes == 4);
 
+    check_unvisited_font_geometry();
     check_plugin_menu_rows();
     check_compact_home_glow(display_height);
     check_translucent_snapshot();

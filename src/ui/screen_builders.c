@@ -4,6 +4,7 @@
 #include "gui_navigation.h"
 #include "assets.h"
 #include "debug_log.h"
+#include "lvgl/src/display/lv_display_private.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -263,6 +264,21 @@ void screen_builders_refresh_font_geometry(lv_obj_t * root) {
     lv_obj_update_layout(root);
     refresh_icon_caption_geometry_recursive(root);
     lv_obj_update_layout(root);
+}
+
+void screen_builders_refresh_all_font_geometry(void) {
+    /* Shared styles first so native_row_min_style's new min_height is in
+     * place before any screen's rows are remeasured. */
+    screen_builders_refresh_font_geometry(NULL);
+    lv_display_t * disp = lv_display_get_default();
+    if (!disp) return;
+    /* Every lv_obj_create(NULL) screen lives in this array for as long as
+     * it exists -- Music Settings, Power, Playback, and the other Font Size
+     * misses that are neither on the nav stack nor in the snapshot cache.
+     * One walk, no per-module screen list to keep in sync. */
+    for (uint32_t i = 0; i < disp->screen_cnt; i++) {
+        if (disp->screens[i]) screen_builders_refresh_font_geometry(disp->screens[i]);
+    }
 }
 
 void row_label_enable_marquee(lv_obj_t * label) {

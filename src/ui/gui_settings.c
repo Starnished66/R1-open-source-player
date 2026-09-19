@@ -590,20 +590,14 @@ static void custom_font_apply_timer_cb(lv_timer_t * timer) {
              index < 0 ? "" : target);
     settings_save(&current_settings);
     lv_obj_report_style_change(NULL);
-    screen_builders_refresh_font_geometry(NULL);
+    /* Same full-display walk as font_size_apply_timer_cb() -- Custom Font
+     * also rewrites app_font_* metrics in place, so unvisited Settings
+     * submenus need their USER_3 label boxes recomputed too. */
+    screen_builders_refresh_all_font_geometry();
     gui_settings_refresh_font_geometry();
     compact_list_refresh_all();
     gui_lyrics_refresh_layout();
     quick_drawer_mark_snapshot_dirty();
-    /* Same reasoning as font_size_apply_timer_cb's own matching sweep
-     * (gui_network.c) -- every screen still on the nav stack was built
-     * under the font just replaced, and none of them get torn down just
-     * because nav_reset_to_home() is about to run. */
-    int font_geom_nav_depth = gui_navigation_get_depth();
-    for (int i = 0; i < font_geom_nav_depth; i++) {
-        lv_obj_t * nav_screen = gui_navigation_get_screen_at(i);
-        if (nav_screen) screen_builders_refresh_font_geometry(nav_screen);
-    }
     nav_reset_to_home();
     screen_builders_refresh_font_geometry(lv_screen_active());
     lv_obj_invalidate(lv_screen_active());

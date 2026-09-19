@@ -568,10 +568,17 @@ void compact_list_refresh_all(void);
 /* Recomputes the shared list padding, any icon-caption coordinates, and
  * every bounded scrolling row label's box height (see row_label_apply_
  * bounded_height()'s own comment) under root after the stable app_font_*
- * descriptors change metrics. A tier-change caller with more than one
- * still-live screen to fix (e.g. the whole current navigation stack) calls
- * this once per screen root -- it does not walk beyond the root passed in. */
+ * descriptors change metrics. A NULL root updates only the shared styles
+ * (native_row_min_style, list_row_style). It does not walk beyond the
+ * root passed in -- use screen_builders_refresh_all_font_geometry() when
+ * every live screen must move, not just the nav stack. */
 void screen_builders_refresh_font_geometry(lv_obj_t * root);
+/* Font Size / Custom Font live apply: shared styles, then every screen the
+ * display still owns. Settings submenus that were never on the nav stack
+ * (Music Settings, Power, Playback, ...) keep USER_3 label boxes from the
+ * previous tier unless this runs; LV_LABEL_LONG_SCROLL_CIRCULAR then rolls
+ * those titles vertically when the submenu is first opened. */
+void screen_builders_refresh_all_font_geometry(void);
 /* Re-runs label/accessory decoration for one currently visible logical row.
  * A row that has already scrolled out is intentionally ignored. */
 void compact_list_refresh_item(lv_obj_t * list, int logical_index);

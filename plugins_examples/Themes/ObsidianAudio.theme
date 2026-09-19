@@ -1,0 +1,85 @@
+# Modern audiophile theme for HiBy R1
+#
+# Obsidian Audio: compact, modern, high-contrast dark UI designed around
+# the R1's small screen and touch-first form factor.
+#
+# Design goals:
+# - Near-black OLED-style background to keep the UI calm and reduce clutter.
+# - Cool graphite cards with a restrained cyan accent for audio/network items.
+# - Compact rounded list rows so more controls fit on the small display.
+# - Stock icons retained for maximum compatibility.
+# - Music/DAC are visually emphasized without making every item brightly colored.
+#
+name=Obsidian Audio
+screen=0x080B10
+card=0x111722
+list_row=0x151D2A
+text_primary=0xE8F0F7
+text_muted=0x8291A3
+icon_root=theme2
+drawer_root=theme2
+
+home_mode=list
+home_row_gap=7
+home_order=music,stream_media,wireless,books,dac,settings
+submenu_mode=list
+
+tile.music.bg_color=0x142631
+tile.music.text_color=0x73E0E8
+tile.music.radius=18
+tile.music.height=86
+tile.music.width=448
+tile.music.align=left
+tile.music.accessory=true
+tile.music.text_size=medium
+tile.music.icon=true
+
+tile.stream_media.bg_color=0x151D2A
+tile.stream_media.text_color=0xB8C7D6
+tile.stream_media.radius=18
+tile.stream_media.height=86
+tile.stream_media.width=448
+tile.stream_media.align=left
+tile.stream_media.accessory=true
+tile.stream_media.text_size=medium
+tile.stream_media.icon=true
+
+tile.wireless.bg_color=0x151D2A
+tile.wireless.text_color=0x9BC8D0
+tile.wireless.radius=18
+tile.wireless.height=86
+tile.wireless.width=448
+tile.wireless.align=left
+tile.wireless.accessory=true
+tile.wireless.text_size=medium
+tile.wireless.icon=true
+
+tile.books.bg_color=0x171D28
+tile.books.text_color=0xB8C0CC
+tile.books.radius=18
+tile.books.height=86
+tile.books.width=448
+tile.books.align=left
+tile.books.accessory=true
+tile.books.text_size=medium
+tile.books.icon=true
+
+tile.dac.bg_color=0x1B2934
+tile.dac.text_color=0x8BEAF0
+tile.dac.radius=18
+tile.dac.height=86
+tile.dac.width=448
+tile.dac.align=left
+tile.dac.accessory=true
+tile.dac.text_size=medium
+tile.dac.icon=true
+
+tile.settings.bg_color=0x151D2A
+tile.settings.text_color=0xAEBBC8
+tile.settings.radius=18
+tile.settings.height=86
+tile.settings.width=448
+tile.settings.align=left
+tile.settings.accessory=true
+tile.settings.text_size=medium
+tile.settings.icon=true

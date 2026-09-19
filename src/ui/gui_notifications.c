@@ -29,26 +29,41 @@ static void error_toast_hide_timer_cb(lv_timer_t * timer) {
     if (error_toast_hide_timer) lv_timer_pause(error_toast_hide_timer);
 }
 
-static void build_error_toast(void) {
-    lv_obj_t * top = lv_layer_top();
+/* Shared by both toasts, which differ only in colours, width, placement and
+ * how long they linger. Height follows the message in both directions, so a
+ * wrapped message grows and a short one stays compact. A message long enough
+ * to reach the screen-bounded maximum is clipped, since the toast does not
+ * scroll. */
+static lv_obj_t * build_toast(lv_obj_t ** out_label, int32_t width, int32_t y_offset) {
+    lv_obj_t * toast = lv_obj_create(lv_layer_top());
+    lv_obj_set_width(toast, width);
+    lv_obj_set_height(toast, LV_SIZE_CONTENT);
+    lv_obj_set_style_min_height(toast, BOARD_SCALE_PX(56), 0);
+    lv_obj_set_style_max_height(toast,
+        lv_display_get_vertical_resolution(lv_display_get_default()) - 2 * STATUS_BAR_CLEARANCE, 0);
+    lv_obj_set_style_pad_all(toast, BOARD_SCALE_PX(16), 0);
+    lv_obj_set_flex_flow(toast, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(toast, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_align(toast, LV_ALIGN_CENTER, 0, y_offset);
+    lv_obj_set_style_radius(toast, 16, 0);
+    lv_obj_set_style_border_width(toast, 0, 0);
+    lv_obj_remove_flag(toast, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(toast, LV_OBJ_FLAG_HIDDEN);
 
-    error_toast = lv_obj_create(top);
-    lv_obj_set_size(error_toast, BOARD_SCALE_PX(400), BOARD_SCALE_PX(70));
-    lv_obj_align(error_toast, LV_ALIGN_CENTER, 0, -BOARD_SCALE_PX(180));
-    lv_obj_set_style_radius(error_toast, 16, 0);
+    lv_obj_t * label = lv_label_create(toast);
+    lv_obj_set_width(label, lv_pct(100)); /* the toast's own padding is the inset */
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    *out_label = label;
+    return toast;
+}
+
+static void build_error_toast(void) {
+    error_toast = build_toast(&error_toast_label, BOARD_SCALE_PX(400), -BOARD_SCALE_PX(180));
     lv_obj_set_style_bg_color(error_toast, lv_color_make(40, 20, 20), 0);
     lv_obj_set_style_bg_opa(error_toast, LV_OPA_80, 0);
-    lv_obj_set_style_border_width(error_toast, 0, 0);
-    lv_obj_remove_flag(error_toast, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(error_toast, LV_OBJ_FLAG_HIDDEN);
-
-    error_toast_label = lv_label_create(error_toast);
-    lv_obj_set_width(error_toast_label, lv_pct(90));
-    lv_label_set_long_mode(error_toast_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(error_toast_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(error_toast_label, lv_color_make(255, 200, 200), 0);
-    lv_obj_set_style_text_font(error_toast_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_center(error_toast_label);
 
     error_toast_hide_timer = lv_timer_create(error_toast_hide_timer_cb, 2500, NULL);
     lv_timer_pause(error_toast_hide_timer);
@@ -70,25 +85,10 @@ static void info_toast_hide_timer_cb(lv_timer_t * timer) {
 }
 
 static void build_info_toast(void) {
-    lv_obj_t * top = lv_layer_top();
-
-    info_toast = lv_obj_create(top);
-    lv_obj_set_size(info_toast, BOARD_SCALE_PX(420), BOARD_SCALE_PX(140));
-    lv_obj_align(info_toast, LV_ALIGN_CENTER, 0, -BOARD_SCALE_PX(160));
-    lv_obj_set_style_radius(info_toast, 16, 0);
+    info_toast = build_toast(&info_toast_label, BOARD_SCALE_PX(420), -BOARD_SCALE_PX(160));
     lv_obj_add_style(info_toast, &style_theme_card_bg, 0);
     lv_obj_set_style_bg_opa(info_toast, LV_OPA_80, 0);
-    lv_obj_set_style_border_width(info_toast, 0, 0);
-    lv_obj_remove_flag(info_toast, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(info_toast, LV_OBJ_FLAG_HIDDEN);
-
-    info_toast_label = lv_label_create(info_toast);
-    lv_obj_set_width(info_toast_label, lv_pct(90));
-    lv_label_set_long_mode(info_toast_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(info_toast_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(info_toast_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(info_toast_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_center(info_toast_label);
 
     info_toast_hide_timer = lv_timer_create(info_toast_hide_timer_cb, 5000, NULL);
     lv_timer_pause(info_toast_hide_timer);

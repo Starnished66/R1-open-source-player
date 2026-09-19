@@ -22,6 +22,21 @@ lv_font_t app_font_20;
 lv_font_t app_font_22;
 lv_font_t app_font_28;
 lv_font_t app_font_lyrics;
+/* The Player's title/artist/album rows render at one fixed size per board and
+ * are not affected by the Font Size tier. */
+#if BOARD_SCREEN_HEIGHT >= 800
+  #define PLAYER_TITLE_FONT_PX 32
+  #define PLAYER_META_FONT_PX  22
+#elif BOARD_SCREEN_HEIGHT >= 720
+  #define PLAYER_TITLE_FONT_PX 24
+  #define PLAYER_META_FONT_PX  18
+#else
+  #define PLAYER_TITLE_FONT_PX 16
+  #define PLAYER_META_FONT_PX  16
+#endif
+
+lv_font_t app_font_player_title;
+lv_font_t app_font_player_meta;
 
 #ifdef HOST_BUILD
   #define FALLBACK_FONT_ROOT "assets/fonts/"
@@ -94,8 +109,10 @@ typedef struct {
     lv_font_t * font;
 } loaded_face_entry_t;
 
-/* roughly 5 distinct pixel sizes (four general UI sizes + one independent Lyrics size) x (1 custom + 4 fallback faces) = 25 entries */
-#define MAX_LOADED_FACES 32
+/* Distinct pixel sizes (four general UI sizes, one independent Lyrics size,
+ * and the two fixed Player sizes) x (1 custom + 4 fallback faces). Sizes
+ * coincide across tiers, so the live count is 30 at the Small tier. */
+#define MAX_LOADED_FACES 48
 static loaded_face_entry_t s_loaded_faces[MAX_LOADED_FACES];
 static int s_loaded_face_count = 0;
 
@@ -453,14 +470,18 @@ bool fallback_font_apply_size_tier(int tier) {
 
     face_table_t candidate = {0};
     int lyrics_px = s_lyrics_font_size_tier == 1 ? 32 : 40;
+    int size_player_title = PLAYER_TITLE_FONT_PX;
+    int size_player_meta = PLAYER_META_FONT_PX;
     /* A general slot can legitimately equal the independent lyrics slot
      * (Medium title = 32px, BlindMF title = 40px).  Seed the candidate with
      * that already-active chain and copy app_font_lyrics below instead of
      * loading a duplicate set.  This keeps post-switch TTF RAM identical to
      * startup and is safe because the chain is not rewired. */
     for (int i = 0; i < s_loaded_face_count; i++) {
-        if (s_loaded_faces[i].pixel_size == lyrics_px)
+        int px = s_loaded_faces[i].pixel_size;
+        if (px == lyrics_px || px == size_player_title || px == size_player_meta) {
             candidate.entries[candidate.count++] = s_loaded_faces[i];
+        }
     }
     /* Custom font content is unchanged by a tier switch -- this reuses the
      * already-committed in-memory buffer at zero I/O cost in the common
@@ -476,6 +497,8 @@ bool fallback_font_apply_size_tier(int tier) {
 #define BUILD_TIER_SLOT(out, px) \
     do { \
         if ((px) == lyrics_px) (out) = app_font_lyrics; \
+        else if ((px) == size_player_title) (out) = app_font_player_title; \
+        else if ((px) == size_player_meta) (out) = app_font_player_meta; \
         else if (!build_new_tier_slot(&candidate, &(out), (px), s_fallback_loaded)) ok = false; \
     } while (0)
     BUILD_TIER_SLOT(cand_16, size_16);
@@ -495,7 +518,8 @@ bool fallback_font_apply_size_tier(int tier) {
      * tiny-TTF objects backing its descriptor while replacing the general
      * slots, even when its pixel size overlaps a newly built UI slot. */
     for (int i = 0; i < s_loaded_face_count; i++) {
-        if (s_loaded_faces[i].pixel_size == lyrics_px &&
+        int px = s_loaded_faces[i].pixel_size;
+        if ((px == lyrics_px || px == size_player_title || px == size_player_meta) &&
             !face_table_contains_font(&candidate, s_loaded_faces[i].font)) {
             if (candidate.count >= MAX_LOADED_FACES) {
                 destroy_new_candidate_faces(&candidate);
@@ -535,6 +559,8 @@ bool fallback_font_apply_lyrics_size_tier(int tier) {
     int size_16, size_20, size_22, size_28;
     tier_pixel_sizes(s_font_size_tier, &size_16, &size_20, &size_22, &size_28);
     int size_lyrics = (tier == 1) ? 32 : 40;
+    int size_player_title = PLAYER_TITLE_FONT_PX;
+    int size_player_meta = PLAYER_META_FONT_PX;
 
     if (s_custom_staged_valid && !build_custom_font_data_candidate(s_custom_font_generation)) {
         DBG_LOG("fallback_font: lyrics tier %d build failed (custom font data); keeping tier %d\n",
@@ -543,7 +569,7 @@ bool fallback_font_apply_lyrics_size_tier(int tier) {
     }
 
     face_table_t candidate_table = {0};
-    lv_font_t cand_16, cand_20, cand_22, cand_28, cand_lyrics;
+    lv_font_t cand_16, cand_20, cand_22, cand_28, cand_lyrics, cand_player_title, cand_player_meta;
 
     bool ok = true;
     ok = ok && build_candidate_slot(&candidate_table, &cand_16, size_16, s_custom_staged_valid, s_custom_font_generation, s_fallback_loaded);
@@ -551,6 +577,8 @@ bool fallback_font_apply_lyrics_size_tier(int tier) {
     ok = ok && build_candidate_slot(&candidate_table, &cand_22, size_22, s_custom_staged_valid, s_custom_font_generation, s_fallback_loaded);
     ok = ok && build_candidate_slot(&candidate_table, &cand_28, size_28, s_custom_staged_valid, s_custom_font_generation, s_fallback_loaded);
     ok = ok && build_candidate_slot(&candidate_table, &cand_lyrics, size_lyrics, s_custom_staged_valid, s_custom_font_generation, s_fallback_loaded);
+    ok = ok && build_candidate_slot(&candidate_table, &cand_player_title, size_player_title, s_custom_staged_valid, s_custom_font_generation, s_fallback_loaded);
+    ok = ok && build_candidate_slot(&candidate_table, &cand_player_meta, size_player_meta, s_custom_staged_valid, s_custom_font_generation, s_fallback_loaded);
 
     if (!ok) {
         DBG_LOG("fallback_font: lyrics tier %d build failed; keeping tier %d\n", tier, s_lyrics_font_size_tier);
@@ -584,6 +612,8 @@ bool fallback_font_apply_lyrics_size_tier(int tier) {
     app_font_22 = cand_22;
     app_font_28 = cand_28;
     app_font_lyrics = cand_lyrics;
+    app_font_player_title = cand_player_title;
+    app_font_player_meta = cand_player_meta;
 
     s_loaded_face_count = candidate_table.count;
     for (int i = 0; i < candidate_table.count; i++) {
@@ -902,10 +932,12 @@ bool fallback_font_apply_custom(const char * custom_filename) {
     int size_16, size_20, size_22, size_28;
     tier_pixel_sizes(s_font_size_tier, &size_16, &size_20, &size_22, &size_28);
     int size_lyrics = (s_lyrics_font_size_tier == 1) ? 32 : 40;
+    int size_player_title = PLAYER_TITLE_FONT_PX;
+    int size_player_meta = PLAYER_META_FONT_PX;
 
     /* Build candidate faces in separate table to ensure 100% transactional safety */
     face_table_t candidate_table = {0};
-    lv_font_t cand_16, cand_20, cand_22, cand_28, cand_lyrics;
+    lv_font_t cand_16, cand_20, cand_22, cand_28, cand_lyrics, cand_player_title, cand_player_meta;
 
     bool ok = true;
     ok = ok && build_candidate_slot(&candidate_table, &cand_16, size_16, candidate_staged_valid, target_gen, s_fallback_loaded);
@@ -913,6 +945,8 @@ bool fallback_font_apply_custom(const char * custom_filename) {
     ok = ok && build_candidate_slot(&candidate_table, &cand_22, size_22, candidate_staged_valid, target_gen, s_fallback_loaded);
     ok = ok && build_candidate_slot(&candidate_table, &cand_28, size_28, candidate_staged_valid, target_gen, s_fallback_loaded);
     ok = ok && build_candidate_slot(&candidate_table, &cand_lyrics, size_lyrics, candidate_staged_valid, target_gen, s_fallback_loaded);
+    ok = ok && build_candidate_slot(&candidate_table, &cand_player_title, size_player_title, candidate_staged_valid, target_gen, s_fallback_loaded);
+    ok = ok && build_candidate_slot(&candidate_table, &cand_player_meta, size_player_meta, candidate_staged_valid, target_gen, s_fallback_loaded);
 
     if (!ok) {
         DBG_LOG("fallback_font: candidate build failed; rolling back without touching active font stack\n");
@@ -949,6 +983,8 @@ bool fallback_font_apply_custom(const char * custom_filename) {
     app_font_22 = cand_22;
     app_font_28 = cand_28;
     app_font_lyrics = cand_lyrics;
+    app_font_player_title = cand_player_title;
+    app_font_player_meta = cand_player_meta;
 
     s_loaded_face_count = candidate_table.count;
     for (int i = 0; i < candidate_table.count; i++) {
@@ -1009,6 +1045,8 @@ void fallback_font_init_early(int font_size_tier, int lyrics_font_size_tier) {
     int size_16, size_20, size_22, size_28;
     tier_pixel_sizes(font_size_tier, &size_16, &size_20, &size_22, &size_28);
     int size_lyrics = (lyrics_font_size_tier == 1) ? 32 : 40;
+    int size_player_title = PLAYER_TITLE_FONT_PX;
+    int size_player_meta = PLAYER_META_FONT_PX;
 
     face_table_t init_table = {0};
     build_candidate_slot(&init_table, &app_font_16, size_16, s_custom_staged_valid, s_custom_font_generation, false);
@@ -1016,6 +1054,8 @@ void fallback_font_init_early(int font_size_tier, int lyrics_font_size_tier) {
     build_candidate_slot(&init_table, &app_font_22, size_22, s_custom_staged_valid, s_custom_font_generation, false);
     build_candidate_slot(&init_table, &app_font_28, size_28, s_custom_staged_valid, s_custom_font_generation, false);
     build_candidate_slot(&init_table, &app_font_lyrics, size_lyrics, s_custom_staged_valid, s_custom_font_generation, false);
+    build_candidate_slot(&init_table, &app_font_player_title, size_player_title, s_custom_staged_valid, s_custom_font_generation, false);
+    build_candidate_slot(&init_table, &app_font_player_meta, size_player_meta, s_custom_staged_valid, s_custom_font_generation, false);
 
     s_loaded_face_count = init_table.count;
     for (int i = 0; i < init_table.count; i++) {
@@ -1041,15 +1081,19 @@ void fallback_font_load_now(void) {
     int size_16, size_20, size_22, size_28;
     tier_pixel_sizes(s_font_size_tier, &size_16, &size_20, &size_22, &size_28);
     int size_lyrics = (s_lyrics_font_size_tier == 1) ? 32 : 40;
+    int size_player_title = PLAYER_TITLE_FONT_PX;
+    int size_player_meta = PLAYER_META_FONT_PX;
 
     face_table_t table = {0};
-    lv_font_t cand_16, cand_20, cand_22, cand_28, cand_lyrics;
+    lv_font_t cand_16, cand_20, cand_22, cand_28, cand_lyrics, cand_player_title, cand_player_meta;
 
     build_candidate_slot(&table, &cand_16, size_16, s_custom_staged_valid, s_custom_font_generation, true);
     build_candidate_slot(&table, &cand_20, size_20, s_custom_staged_valid, s_custom_font_generation, true);
     build_candidate_slot(&table, &cand_22, size_22, s_custom_staged_valid, s_custom_font_generation, true);
     build_candidate_slot(&table, &cand_28, size_28, s_custom_staged_valid, s_custom_font_generation, true);
     build_candidate_slot(&table, &cand_lyrics, size_lyrics, s_custom_staged_valid, s_custom_font_generation, true);
+    build_candidate_slot(&table, &cand_player_title, size_player_title, s_custom_staged_valid, s_custom_font_generation, true);
+    build_candidate_slot(&table, &cand_player_meta, size_player_meta, s_custom_staged_valid, s_custom_font_generation, true);
 
     /* Atomic swap */
     app_font_16 = cand_16;
@@ -1057,6 +1101,8 @@ void fallback_font_load_now(void) {
     app_font_22 = cand_22;
     app_font_28 = cand_28;
     app_font_lyrics = cand_lyrics;
+    app_font_player_title = cand_player_title;
+    app_font_player_meta = cand_player_meta;
 
     s_loaded_face_count = table.count;
     for (int i = 0; i < table.count; i++) {

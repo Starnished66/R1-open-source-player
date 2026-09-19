@@ -16,6 +16,10 @@ extern lv_font_t app_font_22;
 extern lv_font_t app_font_28;
 extern lv_font_t app_font_lyrics;
 
+/* Player metadata rows' fixed sizes, unaffected by the Font Size tier */
+extern lv_font_t app_font_player_title;
+extern lv_font_t app_font_player_meta;
+
 /* Initializes the font stack metrics early at startup (before screens are built) */
 void fallback_font_init_early(int font_size_tier, int lyrics_font_size_tier);
 

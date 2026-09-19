@@ -56,7 +56,9 @@ typedef bool (*file_browser_song_visit_cb_t)(const char * path, void * user);
 
 /* Database-oriented variant which excludes one immediate child directory of
  * root, case-insensitively. Descendants with the same name elsewhere are
- * not skipped.
+ * not skipped. A directory containing database.ignore excludes itself and its
+ * subtree from the results, database.unignore re-includes one, and a directory
+ * containing both or neither inherits from its parent.
  * False means the scan is void; a non-zero *out_skipped means it was
  * incomplete. */
 bool file_browser_walk_all_songs_excluding_top_level(const char * root, const char * excluded_dir,

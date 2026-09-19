@@ -2,8 +2,11 @@
 #include "debug_log.h"
 #include "input_device_utils.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/input.h>
+#include <string.h>
+#include <sys/ioctl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -88,7 +91,14 @@ static void handle_key_event(unsigned short code, int value) {
                 DBG_LOG("hw_buttons: KEY_POWER down at t=%u\n", now);
                 break;
             }
-            case KEY_PLAYPAUSE:      play_pause_press_count++; break;
+            /* Accessory remotes do not all speak the same code for the same
+             * button: HID consumer-page transport controls arrive as any of
+             * these depending on the cable's descriptor. */
+            case KEY_PLAYPAUSE:
+            case KEY_PLAY:
+            case KEY_PLAYCD:
+            case KEY_PAUSECD:        play_pause_press_count++; break;
+            case KEY_FASTFORWARD:
             case KEY_NEXTSONG: {
                 uint32_t now = monotonic_ms();
                 next_held = true;
@@ -96,6 +106,7 @@ static void handle_key_event(unsigned short code, int value) {
                 next_seek_due_ms = now + NEXT_SEEK_LONG_PRESS_MS;
                 break;
             }
+            case KEY_REWIND:
             case KEY_PREVIOUSSONG:   prev_requested = true; break;
             case KEY_VOLUMEUP:
                 volume_delta += VOLUME_STEP_PERCENT;
@@ -124,6 +135,7 @@ static void handle_key_event(unsigned short code, int value) {
                 break;
             case KEY_VOLUMEUP:   volume_up_held = false; break;
             case KEY_VOLUMEDOWN: volume_down_held = false; break;
+            case KEY_FASTFORWARD:
             case KEY_NEXTSONG:
                 /* Same suppression as KEY_POWER above: only a release that
                  * never crossed the seek threshold counts as a short press. */
@@ -187,6 +199,61 @@ static void apply_due_next_seek(void) {
     pthread_mutex_unlock(&state_mutex);
 }
 
+/* Media keys are what an accessory remote sends: a USB DSP cable or dongle
+ * carries its own transport buttons, and its device name is the vendor's, so
+ * these are found by what they can send rather than by what they are called. */
+static bool device_sends_media_keys(int fd) {
+    unsigned long bits[KEY_MAX / (8 * sizeof(unsigned long)) + 1];
+    memset(bits, 0, sizeof(bits));
+    if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(bits)), bits) < 0) return false;
+#define HW_BUTTONS_HAS_KEY(code) \
+    ((bits[(code) / (8 * sizeof(unsigned long))] >> ((code) % (8 * sizeof(unsigned long)))) & 1UL)
+    return HW_BUTTONS_HAS_KEY(KEY_PLAYPAUSE) || HW_BUTTONS_HAS_KEY(KEY_NEXTSONG) ||
+           HW_BUTTONS_HAS_KEY(KEY_PREVIOUSSONG) || HW_BUTTONS_HAS_KEY(KEY_PLAY) ||
+           HW_BUTTONS_HAS_KEY(KEY_PLAYCD) || HW_BUTTONS_HAS_KEY(KEY_PAUSECD) ||
+           HW_BUTTONS_HAS_KEY(KEY_FASTFORWARD) || HW_BUTTONS_HAS_KEY(KEY_REWIND);
+#undef HW_BUTTONS_HAS_KEY
+}
+
+#define HW_BUTTONS_MAX_FDS 12
+/* Cheap: a readdir plus one ioctl per unopened event node, and only when no
+ * key was pressed in that window. */
+#define MEDIA_KEY_RESCAN_INTERVAL_MS 2000
+
+/* Adds any event device with transport keys that is not already open. Called
+ * again on a cadence because an accessory can be plugged in long after boot,
+ * which the original one-shot enumeration could never see. */
+static int scan_media_key_devices(struct pollfd * fds, int nfds, char paths[][64]) {
+    DIR * dir = opendir("/dev/input");
+    if (!dir) return nfds;
+
+    struct dirent * entry;
+    while ((entry = readdir(dir)) != NULL && nfds < HW_BUTTONS_MAX_FDS) {
+        if (strncmp(entry->d_name, "event", 5) != 0) continue;
+        char path[64];
+        snprintf(path, sizeof(path), "/dev/input/%s", entry->d_name);
+
+        bool already_open = false;
+        for (int i = 0; i < nfds; i++)
+            if (strcmp(paths[i], path) == 0) { already_open = true; break; }
+        if (already_open) continue;
+
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+        if (!device_sends_media_keys(fd)) {
+            close(fd);
+            continue;
+        }
+        fds[nfds].fd = fd;
+        fds[nfds].events = POLLIN;
+        snprintf(paths[nfds], 64, "%s", path);
+        DBG_LOG("hw_buttons: media-key device %s opened at fd_index=%d\n", path, nfds);
+        nfds++;
+    }
+    closedir(dir);
+    return nfds;
+}
+
 static void * hw_buttons_thread_func(void * arg) {
     (void) arg;
 
@@ -199,7 +266,8 @@ static void * hw_buttons_thread_func(void * arg) {
 
     /* O_NONBLOCK prevents empty read queues on one device from blocking poll
      * and starving inputs from the other button devices. */
-    struct pollfd fds[3];
+    struct pollfd fds[HW_BUTTONS_MAX_FDS];
+    char paths[HW_BUTTONS_MAX_FDS][64];
     int nfds = 0;
     int found = 0;
     for (size_t i = 0; i < sizeof(BUTTON_DEVICES) / sizeof(BUTTON_DEVICES[0]); i++) {
@@ -213,11 +281,16 @@ static void * hw_buttons_thread_func(void * arg) {
         }
         fds[nfds].fd = fd;
         fds[nfds].events = POLLIN;
+        snprintf(paths[nfds], sizeof(paths[nfds]), "%s", path);
         DBG_LOG("hw_buttons: fd_index=%d -> %s (%s)\n", nfds, path, BUTTON_DEVICES[i].label);
         nfds++;
     }
 
-    if (found == 0) {
+    /* The built-in keys are named and known; an accessory's remote is not, so
+     * it is picked up by capability here and on every rescan below. */
+    nfds = scan_media_key_devices(fds, nfds, paths);
+
+    if (found == 0 && nfds == 0) {
         fprintf(stderr, "hw_buttons: no physical button input devices found, hardware keys disabled\n");
         return NULL;
     }
@@ -236,17 +309,37 @@ static void * hw_buttons_thread_func(void * arg) {
         /* Blocks indefinitely except while a volume key, power button, or
          * Next button is held and awaiting a timed repeat step or long-press
          * threshold. */
+        /* Never blocks indefinitely any more: an accessory plugged in after
+         * boot only becomes visible on a rescan, and the old -1 meant the
+         * thread sat in poll() forever waiting on keys that did not exist
+         * yet. The wait still shortens while a key is held for its repeat. */
         int ret = poll(fds, (nfds_t) nfds,
-                        (volume_held || power_pending_long_press || next_pending_seek) ? VOLUME_REPEAT_INTERVAL_MS : -1);
+                        (volume_held || power_pending_long_press || next_pending_seek)
+                            ? VOLUME_REPEAT_INTERVAL_MS : MEDIA_KEY_RESCAN_INTERVAL_MS);
         if (ret == 0) {
             apply_due_volume_repeats();
             apply_due_power_long_press();
             apply_due_next_seek();
+            nfds = scan_media_key_devices(fds, nfds, paths);
             continue;
         }
         if (ret < 0) continue;
 
         for (int i = 0; i < nfds; i++) {
+            /* An unplugged accessory reports an error rather than data. Its
+             * slot is closed and the last one moved down, so a cable can come
+             * and go without leaking descriptors or wedging the poll set. */
+            if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                DBG_LOG("hw_buttons: %s went away, closing fd_index=%d\n", paths[i], i);
+                close(fds[i].fd);
+                nfds--;
+                if (i != nfds) {
+                    fds[i] = fds[nfds];
+                    memcpy(paths[i], paths[nfds], sizeof(paths[i]));
+                }
+                i--;
+                continue;
+            }
             if (!(fds[i].revents & POLLIN)) continue;
 
             struct input_event ev;

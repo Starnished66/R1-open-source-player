@@ -283,3 +283,5 @@ src/library/cover_decode_jpeg_fixtures.h
 repomix-output.xml
 src/library/cover_decode_scale_test.c
 inline remote follow-up fixes.diff
+src/ui/screen_builders_test.c
+print_heights.c

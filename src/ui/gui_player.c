@@ -81,8 +81,8 @@ lv_obj_t * player_overlay_panel = NULL;
 lv_obj_t * player_background_img = NULL;
 lv_obj_t * cover_card = NULL;
 lv_obj_t * cover_img = NULL;
-lv_obj_t * song_folder_label = NULL;
-lv_obj_t * song_album_label = NULL;
+lv_obj_t * artist_label = NULL;
+lv_obj_t * album_label = NULL;
 lv_obj_t * song_quality_label = NULL;
 lv_obj_t * song_bitrate_label = NULL;
 lv_obj_t * song_track_label = NULL;
@@ -1612,8 +1612,8 @@ void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     const char * album_text = out_meta->has_album ? out_meta->album : "";
 
     lv_label_set_text(song_title_label, title_text);
-    if (song_album_label) lv_label_set_text(song_album_label, album_text);
-    lv_label_set_text(song_folder_label, folder_text);
+    if (album_label) lv_label_set_text(album_label, album_text);
+    lv_label_set_text(artist_label, folder_text);
     gui_shell_update_quick_drawer_track(title_text, folder_text, album_text);
     refresh_format_badge();
     if (is_remote_track && remote_meta.artwork_url[0]) {
@@ -1758,8 +1758,8 @@ static void delete_song_confirm_cb(lv_event_t * e) {
         clear_player_source();
         set_play_button_state(false);
         lv_label_set_text(song_title_label, "No track loaded");
-        if (song_album_label) lv_label_set_text(song_album_label, "");
-        if (song_folder_label) lv_label_set_text(song_folder_label, "");
+        if (album_label) lv_label_set_text(album_label, "");
+        if (artist_label) lv_label_set_text(artist_label, "");
         nav_pop(); /* nothing left to show on the player screen */
     } else {
         int new_index = (del_index < playlist_count) ? del_index : playlist_count - 1;
@@ -1949,7 +1949,7 @@ static void player_lyrics_set_open(bool open, bool animate) {
     lv_anim_delete(player_screen, player_lyrics_morph);
     if (open) {
         lv_obj_update_layout(player_screen);
-        lv_obj_t * objects[] = { cover_card, song_title_label, song_folder_label, song_album_label };
+        lv_obj_t * objects[] = { cover_card, song_title_label, artist_label, album_label };
         int32_t cover_size = player_s(112);
         int32_t left = player_x(24), top = player_y(48);
         int32_t text_x = left + cover_size + player_x(16);
@@ -1976,7 +1976,7 @@ static void player_lyrics_set_open(bool open, bool animate) {
         for (uint32_t i = 0; i < lv_obj_get_child_count(player_screen); ++i) {
             lv_obj_t * child = lv_obj_get_child(player_screen, i);
             if (child == player_overlay_panel || child == cover_card || child == song_title_label ||
-                child == song_album_label || child == song_folder_label) continue;
+                child == album_label || child == artist_label) continue;
             player_lyrics_hide_object(child);
         }
         player_lyrics_hide_object(favorite_circle);
@@ -2274,11 +2274,11 @@ static void player_secondary_label_enable_marquee(lv_obj_t * label) {
  * Each row is one line of its own font, stacked with a uniform gap. The
  * fonts are fixed per board, so this resolves to one layout per board. */
 static void player_layout_metadata_stack(void) {
-    if (!song_title_label || !song_album_label || !song_folder_label) return;
+    if (!song_title_label || !album_label || !artist_label) return;
 
     const lv_font_t * title_font = lv_obj_get_style_text_font(song_title_label, 0);
-    const lv_font_t * artist_font = lv_obj_get_style_text_font(song_folder_label, 0);
-    const lv_font_t * album_font = lv_obj_get_style_text_font(song_album_label, 0);
+    const lv_font_t * artist_font = lv_obj_get_style_text_font(artist_label, 0);
+    const lv_font_t * album_font = lv_obj_get_style_text_font(album_label, 0);
     int32_t title_h = title_font ? lv_font_get_line_height(title_font) : player_y(32);
     int32_t artist_h = artist_font ? lv_font_get_line_height(artist_font) : player_y(26);
     int32_t album_h = album_font ? lv_font_get_line_height(album_font) : player_y(26);
@@ -2293,10 +2293,10 @@ static void player_layout_metadata_stack(void) {
 
     lv_obj_set_y(song_title_label, title_y);
     lv_obj_set_height(song_title_label, title_h);
-    lv_obj_set_y(song_folder_label, artist_y);
-    lv_obj_set_height(song_folder_label, artist_h);
-    lv_obj_set_y(song_album_label, album_y);
-    lv_obj_set_height(song_album_label, album_h);
+    lv_obj_set_y(artist_label, artist_y);
+    lv_obj_set_height(artist_label, artist_h);
+    lv_obj_set_y(album_label, album_y);
+    lv_obj_set_height(album_label, album_h);
 
     player_transition_mark_dirty();
 }
@@ -2393,29 +2393,29 @@ static lv_obj_t * build_player_screen(uint32_t screen_width, uint32_t screen_hei
     lv_obj_set_width(song_title_label, BOARD_SCREEN_WIDTH - 2 * player_x(22));
     player_label_enable_marquee(song_title_label);
 
-    song_album_label = lv_label_create(scr);
-    lv_label_set_text(song_album_label, "");
-    lv_obj_add_style(song_album_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(song_album_label, player_meta_font, 0);
-    lv_obj_set_style_text_align(song_album_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_x(song_album_label, player_x(22));
+    album_label = lv_label_create(scr);
+    lv_label_set_text(album_label, "");
+    lv_obj_add_style(album_label, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(album_label, player_meta_font, 0);
+    lv_obj_set_style_text_align(album_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_x(album_label, player_x(22));
     /* Content height so circular marquee does not fall back to vertical scrolling. */
-    lv_obj_set_width(song_album_label, BOARD_SCREEN_WIDTH - 2 * player_x(22));
-    lv_obj_set_height(song_album_label, LV_SIZE_CONTENT);
-    player_secondary_label_enable_marquee(song_album_label);
+    lv_obj_set_width(album_label, BOARD_SCREEN_WIDTH - 2 * player_x(22));
+    lv_obj_set_height(album_label, LV_SIZE_CONTENT);
+    player_secondary_label_enable_marquee(album_label);
 
-    song_folder_label = lv_label_create(scr); /* holds ARTIST text, keep this name */
-    lv_label_set_text(song_folder_label, "");
-    lv_obj_add_style(song_folder_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(song_folder_label, player_meta_font, 0);
-    lv_obj_set_style_text_align(song_folder_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_x(song_folder_label, player_x(22));
+    artist_label = lv_label_create(scr);
+    lv_label_set_text(artist_label, "");
+    lv_obj_add_style(artist_label, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(artist_label, player_meta_font, 0);
+    lv_obj_set_style_text_align(artist_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_x(artist_label, player_x(22));
     /* Circular marquee falls back to vertical scrolling when text exceeds
      * a fixed height. Fit the actual font metrics (including loaded fallback
      * fonts) while retaining the fixed width for horizontal overflow. */
-    lv_obj_set_width(song_folder_label, BOARD_SCREEN_WIDTH - 2 * player_x(22));
-    lv_obj_set_height(song_folder_label, LV_SIZE_CONTENT);
-    player_secondary_label_enable_marquee(song_folder_label);
+    lv_obj_set_width(artist_label, BOARD_SCREEN_WIDTH - 2 * player_x(22));
+    lv_obj_set_height(artist_label, LV_SIZE_CONTENT);
+    player_secondary_label_enable_marquee(artist_label);
     player_layout_metadata_stack();
 
     /* Back/dismiss button. build_header_back_button()'s shared 64x64 default
@@ -4095,8 +4095,8 @@ void gui_player_teardown(void) {
     player_background_img = NULL;
     cover_card = NULL;
     cover_img = NULL;
-    song_folder_label = NULL;
-    song_album_label = NULL;
+    artist_label = NULL;
+    album_label = NULL;
     song_count_label = NULL;
     song_title_label = NULL;
     quality_pill = NULL;
@@ -4491,8 +4491,8 @@ void gui_player_handle_sd_unmount(void) {
     clear_player_source();
     set_play_button_state(false);
     if (song_title_label) lv_label_set_text(song_title_label, "No track loaded");
-    if (song_album_label) lv_label_set_text(song_album_label, "");
-    if (song_folder_label) lv_label_set_text(song_folder_label, "");
+    if (album_label) lv_label_set_text(album_label, "");
+    if (artist_label) lv_label_set_text(artist_label, "");
     if (lv_screen_active() == player_screen) nav_pop();
 }
 
@@ -5019,7 +5019,7 @@ const char * gui_player_get_now_playing_title(void) {
 }
 
 const char * gui_player_get_now_playing_folder(void) {
-    return song_folder_label ? lv_label_get_text(song_folder_label) : "";
+    return artist_label ? lv_label_get_text(artist_label) : "";
 }
 
 

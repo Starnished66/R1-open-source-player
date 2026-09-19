@@ -944,7 +944,7 @@ static void update_timer_cb(lv_timer_t * timer) {
 
     if (current_settings.remote_control_enabled) {
         /* No separate now-playing metadata cache exists in this app beyond
-         * what's already on screen -- song_title_label/song_folder_label
+         * what's already on screen -- song_title_label/artist_label
          * are this app's own single source of truth for title/artist (see
          * apply_track_metadata_to_ui()), so read them back rather than
          * standing up a second copy of the same state just for this.

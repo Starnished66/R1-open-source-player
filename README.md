@@ -108,7 +108,7 @@ Produces a stripped `open_hiby_player_target` (or `open_hiby_player_target_<boar
 
 # Installing on a device
 
-There are two ways to run a build on hardware. Copying a player binary onto the SD card does **not** rewrite firmware. Flashing a `.upt` image through recovery **does**, and a bad image can brick the DAP.
+There are two ways to run a build on hardware. Copying a player binary onto the SD card does **not** rewrite firmware. Flashing a `.upt` image through recovery **does**.
 
 Read **[TESTING.md](TESTING.md)** before any real-device session. It exists because skipped steps have frozen a device and caused reboot loops.
 
@@ -116,7 +116,7 @@ Read **[TESTING.md](TESTING.md)** before any real-device session. It exists beca
 
 > **Requires the full `.upt` to have been flashed first.** This method works only because the open-source bootloader is already on the device, and that bootloader arrives with the firmware image below. On stock firmware nothing reads this path and the update is ignored. Flash the `.upt` once, then use this for every update after it.
 
-Copy the binary to this exact path (*inside* `.open_hiby_player`; never replace that directory):
+Download `open_hiby_player` from the **[releases page](https://github.com/Starnished66/R1-open-source-player/releases)**, or build your own with `make target`. Copy it to this exact path (*inside* `.open_hiby_player`; never replace that directory):
 
 ```text
 /data/mnt/sd_0/.open_hiby_player/open_hiby_player
@@ -126,11 +126,15 @@ On the card that is `SD/.open_hiby_player/open_hiby_player`. Use the matching bo
 
 ## Full firmware image (`.upt`)
 
-This rewrites the recovery-updatable firmware. **It can brick the device.**
+This rewrites the recovery-updatable firmware. Needed once, to put the open-source bootloader on the device, and again only when the bootloader itself changes. After that, player updates go through the SD path above.
 
-Keep a known-good recovery image first. The packer requires the staging base image, rejects images over 45 MiB, and will not mix R1 and R3 binaries.
+Download `r1.upt` from the **[releases page](https://github.com/Starnished66/R1-open-source-player/releases)**. Keep a known-good recovery image first.
 
-Needed once, to put the open-source bootloader on the device, and again only when the bootloader itself changes. Build R1 binaries with `make target BOARD=r1` and `make bootloader BOARD=r1`, then follow **[docs/HOW_TO_BUILD_A_UPT_FILE.md](docs/HOW_TO_BUILD_A_UPT_FILE.md)**. Once it is on, player updates go through the SD path above.
+### Building one yourself
+
+Build the R1 binaries with `make target BOARD=r1` and `make bootloader BOARD=r1`, then follow **[docs/HOW_TO_BUILD_A_UPT_FILE.md](docs/HOW_TO_BUILD_A_UPT_FILE.md)**.
+
+This needs a base image, which is not in the repository — download the *Base image for new releases* from the releases page. It has to be that approved staging image: the packer checks the base's `hiby_player.sh` and refuses an arbitrary stock `.upt` or an older public beta. It also rejects images over 45 MiB and will not mix R1 and R3 binaries.
 
 ---
 

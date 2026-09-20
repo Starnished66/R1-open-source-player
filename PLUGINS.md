@@ -1932,8 +1932,7 @@ It also demonstrates the success/busy return contract of `show_text_input()`.
    leaves those changes in place after being toggled off; only reverting
    them yourself (or a plugin that explicitly does so, e.g. re-toggling a
    theme back on and picking a different one) removes them.
-5. Follow [TESTING.md](TESTING.md) when launching through ADB and watch the
-   foreground output.
+5. Launch through ADB and watch the foreground output.
 
 ### Reading plugin errors
 

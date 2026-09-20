@@ -224,6 +224,7 @@
 
 # Local-only known-issues tracker (not part of the public docs)
 /ISSUES.md
+/TESTING.md
 
 # Claude Code
 /CLAUDE.md

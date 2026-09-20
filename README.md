@@ -108,10 +108,6 @@ Produces a stripped `open_hiby_player_target` (or `open_hiby_player_target_<boar
 
 # Installing on a device
 
-There are two ways to run a build on hardware. Copying a player binary onto the SD card does **not** rewrite firmware. Flashing a `.upt` image through recovery **does**.
-
-Read **[TESTING.md](TESTING.md)** before any real-device session. It exists because skipped steps have frozen a device and caused reboot loops.
-
 ## Player-only update (preferred)
 
 > **Requires the full `.upt` to have been flashed first.** This method works only because the open-source bootloader is already on the device, and that bootloader arrives with the firmware image below. On stock firmware nothing reads this path and the update is ignored. Flash the `.upt` once, then use this for every update after it.

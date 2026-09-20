@@ -159,9 +159,3 @@ See **[LICENSE](LICENSE)** (GNU GPL version 3).
 The project statically links [FAAD2](https://github.com/knik0/faad2) for AAC decoding, which is GPLv2-licensed. Other major dependencies, including `dr_libs`, LVGL, and tinyalsa, use permissive licenses.
 
 If that copyleft combination is ever undesirable for a particular deployment, the practical solution would be to remove AAC support or replace FAAD2 with a decoder under a compatible permissive license — not to attempt to isolate the existing FAAD2 implementation from the resulting binary.
-
----
-
-# Technical notes
-
-Implementation notes and real-device findings: **[TECHNICAL_NOTES.md](TECHNICAL_NOTES.md)**.

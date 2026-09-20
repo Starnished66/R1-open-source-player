@@ -2,13 +2,9 @@
 
 An open-source music player replacement for HiBy OS, built from scratch in C with [LVGL](https://lvgl.io/).
 
-The goal is simple: replace the closed-source stock `hiby_player` with a modern, community-driven player that makes better use of the hardware while retaining the parts of HiBy OS that already work well.
+The goal is to replace the closed-source stock `hiby_player` with a community-driven player that makes better use of the hardware.
 
-The project currently targets the **HiBy R1** and is being developed with support for additional HiBy devices in mind. The R1 has been tested extensively on real hardware, not just in the host simulator.
-
-The player reuses the stock firmware's UI assets, fonts, and existing system services where practical, including Bluetooth, Wi-Fi, and DLNA functionality. Everything else is implemented from scratch.
-
-> **Status:** Fully usable on real R1 hardware, with a growing set of features beyond the stock player.
+> **Status:** Fully usable on real R1 hardware. Board-specific builds also exist for the R3 Pro II and R3 II 2025; support is model-specific and should not be assumed for unlisted HiBy devices.
 
 ---
 
@@ -22,359 +18,121 @@ Contributing code, testing builds, documenting hardware behavior, and reporting 
 
 ---
 
-## Why?
+# Device Support
 
-HiBy's stock player is closed source and tightly integrated with the firmware. That makes fixing bugs, adding features, or changing how the device behaves difficult.
+Makefile `BOARD` values: `r1` (default), `r3proii`, `r3ii_2025`. R1 binaries keep the unsuffixed names; the others get a `_$(BOARD)` suffix so they cannot overwrite an R1 build.
 
-This project aims to change that.
+## HiBy R1
 
-The player provides:
+**Status: Supported and actively tested.** Primary development platform. Tested on real hardware (framebuffer, touchscreen, audio, physical buttons, Bluetooth, Wi-Fi).
 
-- A fully open-source playback engine
-- A more capable music library
-- Better playlist handling
-- Network streaming and remote control
-- Improved device integration
-- Modern touch interactions
-- Features that are missing or unnecessarily restricted in the stock software
-- A foundation for future community development
+```bash
+make target                 # -> open_hiby_player_target
+make bootloader             # -> open_hiby_bootloader
+```
 
-The intention isn't to recreate every quirk of the stock application. Where the stock player gets in the way, this project aims to improve it.
+## HiBy R3 Pro II
+
+```bash
+make target BOARD=r3proii   # -> open_hiby_player_target_r3proii
+```
+
+The tree has a 480×720 layout, 4.4 mm balanced-output routing, extra charger-IC handling, and UI scaling. Do not treat an R3 build as an R1 binary.
+
+## HiBy R3 II 2025
+
+```bash
+make target BOARD=r3ii_2025 # -> open_hiby_player_target_r3ii_2025
+```
+
+The tree has a 320×480 layout and the same `BOARD` scaling path. Same caution: model-specific, not an R1 drop-in.
+
+Support for other HiBy devices may be possible, but should not be assumed without hardware testing.
 
 ---
 
 # Features
 
-## 🎵 Playback
-
-- FLAC, MP3, WAV, AIFF/AIFF-C
-- DSD64 / DSD128 (`.dsf` / `.dff`)
-- AAC — raw ADTS and `.m4a`
-- ALAC
-- APE / Monkey's Audio
-- OPUS
-- Gapless playback **enabled by default**
-- Crossfade
-- ReplayGain track gain
-- 10-band parametric EQ (PEQ)
-- Per-band filter type, gain, and Q
-- Pre-amp control
-- Save, overwrite, and reuse PEQ presets stored on the SD card
-- Resume the last track either playing or prepared in a paused state, including its original album context
-- Physical hardware controls for volume, play/pause, next/previous
-- Automatic track advancement
-- Sequential, Repeat All, Repeat One, and Shuffle playback modes
-- Proper playlist-end handling
-- Bluetooth playback support
-- Bluetooth metadata streaming
-- Bluetooth DAC finally works
-- Album art downscaling, supporting up to 1200x1200 resolutions
-- Embedded and external album artwork (`cover.*` and `folder.*`)
-- Queue / "Up Next" — add, inspect, remove, and clear queued songs independently of shuffle or repeat mode
-
-## 📚 Music Library
-
-- File browser
-- All Songs
-- Artists
-- Albums
-- Album Artists
-- Playlists — Favorites, Most Played, and user-created M3U/M3U8, all in one place
-- Real tag scanning
-- Embedded album artwork
-- FLAC metadata
-- MP3 ID3v1 / ID3v2
-- WAV RIFF metadata
-- M4A metadata
-- M3U / M3U8 playlists
-- Full screen synced Lyrics support. 
-- Dynamic playlist loading directly from the SD card
-- Incremental music database updates instead of rescanning the entire library
-- Rockbox tagcache as the on-disk music database (no SQLite)
-- Paged/virtualized song lists for very large albums and libraries
-- SD card hotplug support
-- Built-in plain-text (`.txt`) book reader with Favorites, scoped to `Books/` on the SD card
-- Audiobook browsing and playback through the included Audiobooks plugin
-
-## 🌐 Network & Streaming
-
-- **Subsonic-compatible streaming**
-  - Subsonic
-  - Navidrome
-  - Airsonic
-  - Other compatible servers
-  - HTTPS streaming with TLS
-  - Optional dedicated Subsonic tile directly on the Home screen
-- **Subsonic music downloading**
-- DLNA / UPnP-AV renderer
-- AirPlay support using the existing stock protocols where possible
-- Remote control over LAN
-- Built-in lightweight web server
-- Responsive browser-based remote-control interface
-- Browse Artists, Albums, Favorites, Most Played, and SD-card playlists remotely
-- Add songs to the queue and manage the current queue from the web interface
-- Add songs to existing playlists from the web interface
-- Wi-Fi music import with the stock limitations removed
-- Import support for all supported file types
-
-The LAN remote-control interface provides a simple way to control the player from a phone, tablet, or PC without requiring a dedicated application.
-
-## 🔌 Device & Hardware Integration
-
-- USB DAC support
-- Smoothed real battery percentage that filters transient fuel-gauge jumps
-- Real Wi-Fi signal strength
-- Charge limiter (caps charging around 85%) for improved battery longevity
-- **Safe Charging (500mA)** mode with immediate, persistent PMIC-level current limiting
-- Configurable idle shutdown or suspend behavior
-- Car mode
-- Improved Bluetooth connection reliability
-- Bluetooth A2DP status in the top bar
-- Automatic playback stop when the audio output disconnects
-- Physical hardware button support
-- Time Zone picker with immediate application and persistent settings
-- Startup volume
-- Resume-last-track modes with preserved library context
-- Storage, USB DAC, and ADB modes through a recoverable USB mode selector
-- Configurable charge-status LEDs
-
-## 🎨 Interface
-
-- Stock firmware UI assets and fonts
-- Interactive finger-following swipe transitions
-- Swipe up to return home
-- Pull-down quick controls
-- Sleep timer
-- Crossfade quick toggle
-- Configurable screen timeout presets from 15 seconds to 30 minutes
-- Optional idle screen dimming to approximately 5% brightness
-- Configurable font size and battery-percentage display
-- Font-aware row sizing for Medium and BlindMF accessibility text sizes
-- Delayed, speed-normalized marquee scrolling for long row titles instead of wrapping or overlapping adjacent rows
-- Non-Latin text rendering:
-  - Cyrillic
-  - Japanese kana/kanji
-  - Korean Hangul
-  - Thai
-- App-wide accent color theming
-- Full theme support via installable `.theme` files — app-wide colors, icon swapping (bulk or per-icon), and Home screen tile styling, all switchable live with no restart
-- Customizable Home screen: reorder, hide, or add tiles (including plugin-provided ones), switch between the native icon grid or a scrollable list, and set a static plugin-provided background image
-- Independently themeable Music, Stream Media, and Wireless screens (icon grid or list mode, per-row styling)
-- Manual or automatic clock, with 12-hour or 24-hour display
-- Focused Books section for plain-text reading and plugin-provided audiobook tools
-
-## 🧩 Plugins
-
-- Third-party Lua plugins — no rebuild or reflash needed
-- Drop a `.lua` file in `.plugins/` on the SD card, it's picked up automatically
-- Versioned `plugin.*` API with capability discovery
-- Extension rows for Books and the Settings, Display, Playback, Power, and System screens
-- Extension tiles for Stream Media and, since API 7, Home itself
-- Custom row sizing, icons, text sizing, list screens, settings screens, and text input
-- Live UI reload — apply a plugin's icon, color, background image, or Home/launcher layout changes immediately, without restarting the player or dropping active Bluetooth/Wi-Fi/Subsonic/DLNA/AirPlay/Remote Control connections
-- Reorder, drop, or add Home screen tiles from a plugin or theme, including plugins that register their own
-- Set a static Home screen background image from a plugin
-- Enable or disable individual installed plugins from Settings without removing their files from the SD card
-- Playback state/control/events, library access, synchronous and asynchronous HTTP, MD5, theming, and PEQ access
-- Audiobooks example with per-book/chapter progress, resume, bookmarks, and Continue Listening
-- File-configured Net Radio example that loads station names and URLs from `Radio.txt`
-- Play Through example for continuing through folders or albums
-- Extended Sleep Timer example with durations up to three hours
-- Themes example with a dozen installable `.theme` presets covering colors, icons, and Home layout
-- MSEB example — a mood-based tone-tuning screen built on the 10-band PEQ, reverse-engineered from the stock firmware's own MSEB feature naming and axis order
-- Last.fm scrobbling, sound profiles, playback tools, asynchronous HTTP, and other API examples
-
----
-
-# Planned Features
-
-The following features are planned or currently incomplete:
-
-- Song info.
-- Additional community-requested features
-
-This list will evolve as development continues.
-
----
-
-# Device Support
-
-## HiBy R1
-
-**Status: Supported and actively tested.**
-
-The R1 is the primary development and testing platform for this project.
-
-The player has been tested on real hardware using the device's framebuffer, touchscreen, audio hardware, physical buttons, Bluetooth, Wi-Fi, and other system interfaces.
-
-## HiBy R3 Pro II
-
-**Status: Currently untested.**
-
-The R3 Pro II is not currently considered supported.
-
-Additional work is required before it can be properly supported:
-
-- Add support for the **balanced output port**
-- Add support for the device's **additional hardware buttons**
-- Test and adjust **UI scaling** for the R3 Pro II's display resolution
-- Perform full real-device testing
-- Me actually getting one of these devices on hand to do a full testing.
-
-Support for other HiBy devices may also be possible, but should not be assumed without hardware testing.
-
----
-
-# Terminology
-
-- **Host device / host** — the machine you're developing on, such as your laptop or PC.
-- **Target device / target** — the HiBy device you're building for, such as the R1.
-
----
-
-# Development
-
-## 1. Local Development — Arch Linux Host Simulator
-
-The project includes an SDL2-based host simulator, allowing the GUI and much of the player logic to be developed without a physical device.
-
-### Requirements
-
-- `sdl2`
-- `make`
-- `gcc`
-- `pkg-config`
-- `git`
-
-### Build
-
-```bash
-make
-```
-
-This automatically clones LVGL if necessary and builds the project for the host architecture.
-
-### Run
-
-```bash
-./open_hiby_player_host
-```
-
-This opens the player in an SDL2 window.
-
-Mouse click-and-drag can be used to simulate touch interaction and scrolling.
-
----
-
-# 2. Cross-Compiling for HiBy OS
-
-The HiBy devices use a MIPS target environment with an old glibc version (2.22). Rather than depending on a matching legacy sysroot, the target build uses a **musl-based static toolchain**.
-
-The resulting executable is statically linked and therefore depends on the stable Linux kernel syscall ABI rather than the target device's libc.
-
-This makes it practical to build for the older and somewhat unusual HiBy OS environment.
-
-## Install the Target Toolchain
-
-On Arch Linux:
-
-```bash
-yay -S mipsel-linux-musl-cross
-```
-
-The package builds a complete GCC + musl toolchain from source.
-
-The initial build may take 15–30 minutes or more depending on the host system.
-
-Support for other distributions is not documented yet. Contributions are welcome.
-
-## Build for the Target
-
-```bash
-make target
-```
-
-This produces:
-
-```text
-open_hiby_player_target
-```
-
-The resulting binary is statically linked for little-endian MIPS (`mipsel`).
-
----
-
-# Testing Without Hardware
-
-The target binary can be sanity-checked using QEMU user-mode emulation.
-
-On Arch Linux:
-
-```bash
-sudo pacman -S qemu-user
-```
-
-Then:
-
-```bash
-qemu-mipsel ./open_hiby_player_target
-```
-
-The program should print its startup banner and then fail when attempting to access devices such as:
-
-```text
-/dev/fb0
-/dev/input/eventN
-```
-
-This is expected when running under normal host Linux. Those device nodes do not exist in the host environment.
-
-The test is primarily intended to verify that the binary starts and executes correctly under the target architecture.
-
----
-
-# Real Device Testing
-
-For instructions on installing, launching, and testing the player on real HiBy hardware, see:
-
-**[TESTING.md](TESTING.md)**
-
-The testing guide contains the device-specific procedures and important warnings for working with the stock player, ADB, framebuffer, and other hardware interfaces.
-
----
-
-# Modifying Unpacked Firmware
-
-TODO
-
----
-
-# Technical Notes & Real-Device Findings
-
-Detailed implementation notes, reverse-engineering information, root causes, verification methods, and real-device bugs discovered during development are maintained separately in:
-
-**[TECHNICAL_NOTES.md](TECHNICAL_NOTES.md)**
-
-If you're simply looking to use the player, you can safely skip this section.
-
-If you're modifying the code, debugging hardware behavior, or working on HiBy OS itself, the technical notes are the place to start.
+- 🎵 **Playback** — local files (FLAC, MP3, WAV, AIFF, DSD, AAC, ALAC, APE, Opus, and others), gapless by default, crossfade, ReplayGain, 10-band PEQ with SD-card presets, hardware buttons, Bluetooth (including Bluetooth DAC), USB DAC, queue / Up Next
+- 📚 **Library** — file browser, artists / albums / playlists (including M3U/M3U8), Rockbox tagcache, incremental scans, synced lyrics, SD hotplug, plain-text book reader; audiobooks via plugin
+- 🌐 **Network** — Subsonic-compatible streaming (HTTPS), downloads, DLNA renderer, AirPlay via stock protocols where possible, LAN web remote, Wi-Fi music import
+- 🔌 **Device** — charge limiter and Safe Charging, idle shutdown or suspend, car mode, USB Storage / DAC / ADB selector, timezone, configurable charge LEDs
+- 🎨 **Interface** — stock assets and fonts, swipe navigation, pull-down quick controls, `.theme` files, customizable Home screen, non-Latin text (Cyrillic, Japanese, Korean, Thai)
 
 ---
 
 # 🧩 Plugins
 
-Third-party functionality can be added without recompiling the app, as plain Lua scripts — no toolchain, no C, no rebuild/reflash cycle.
+Third-party features are plain Lua — no C toolchain, rebuild, or firmware reflash.
 
-Drop a `.lua` file into `.plugins/` on the SD card and it's picked up automatically at startup. The versioned `plugin.*` API exposes native extension rows and list screens, configurable row layout, text input, theming, Home/launcher layout and background-image customization, SD-card and library access, playback control/events, PEQ, cryptographic helpers, and synchronous or asynchronous HTTP. Individual installed plugins can also be enabled or disabled at runtime from **Settings → Plugins**, without removing their files from the SD card.
+Drop a `.lua` file in `.plugins/` on the SD card. Plugins are loaded at startup. Enable or disable them from Settings without deleting the files. The versioned `plugin.*` API covers UI extensions (including Home tiles), playback, library access, HTTP, theming, and PEQ.
 
-Theme, icon, background image, and layout changes can be applied live — `plugin.reload_ui()` and the more targeted `plugin.refresh_theme()` rebuild the affected screens in place, with no restart and no interruption to playback or active Bluetooth/Wi-Fi/Subsonic/DLNA/AirPlay/Remote Control connections.
+Examples live in `plugins_examples/` (Audiobooks, Themes, MSEB, Net Radio, Last.fm, Play Through, and others).
 
-An example **Audiobooks** plugin is included (`plugins_examples/Audiobooks.lua`) — a book-folder browser → chapter-list → playback plugin with per-book progress, automatic resume, bookmarks, and Continue Listening, reachable from **Books → Audiobooks**. An example **Themes** plugin (`plugins_examples/Themes.lua`) ships with a dozen installable `.theme` presets demonstrating app-wide colors, icon swapping, and full Home-layout control — reordering, hiding, and adding tiles. An example **MSEB** plugin (`plugins_examples/MSEB.lua`) adds a mood-based tone-tuning screen on top of the built-in 10-band PEQ, reverse-engineered from the stock firmware's own MSEB feature. An example **Home Background** plugin (`plugins_examples/HomeBackground.lua`) sets a static image behind Home's own tiles. Other examples include Last.fm scrobbling, file-configured network radio, Play Through folders/albums, a three-hour sleep timer, sound profiles, asynchronous HTTP, playback extensions, and broader plugin-interface demonstrations.
+Full API: **[PLUGINS.md](PLUGINS.md)**
 
-For the full `plugin.*` API reference and instructions on writing and testing your own plugin, see:
+---
 
-**[PLUGINS.md](PLUGINS.md)**
+# Development
 
+## Host simulator (Arch Linux)
+
+Requirements: `sdl2`, `make`, `gcc`/`g++`, `git`. `make` clones LVGL if needed.
+
+Stock graphics are not redistributed — populate `assets/theme2/` from your own firmware dump.
+
+```bash
+make
+./open_hiby_player_host
+```
+
+(`make` is `make host`. Default `BOARD` is `r1`.) Click-and-drag in the SDL2 window simulates touch.
+
+## Cross-compile for HiBy OS
+
+HiBy devices are little-endian MIPS, so target builds use a static musl toolchain (`mipsel-linux-musl-gcc`). On Arch Linux:
+
+```bash
+yay -S mipsel-linux-musl-cross
+```
+
+That builds from source and takes a while. Other distributions are not documented yet.
+
+```bash
+make target
+```
+
+Produces a stripped `open_hiby_player_target` (or `open_hiby_player_target_<board>`). Pass `BOARD` as in Device Support.
+
+---
+
+# Installing on a device
+
+There are two ways to run a build on hardware. Copying a player binary onto the SD card does **not** rewrite firmware. Flashing a `.upt` image through recovery **does**, and a bad image can brick the DAP.
+
+Read **[TESTING.md](TESTING.md)** before any real-device session. It exists because skipped steps have frozen a device and caused reboot loops.
+
+## Player-only update (preferred)
+
+> **Requires the full `.upt` to have been flashed first.** This method works only because the open-source bootloader is already on the device, and that bootloader arrives with the firmware image below. On stock firmware nothing reads this path and the update is ignored. Flash the `.upt` once, then use this for every update after it.
+
+Copy the binary to this exact path (*inside* `.open_hiby_player`; never replace that directory):
+
+```text
+/data/mnt/sd_0/.open_hiby_player/open_hiby_player
+```
+
+On the card that is `SD/.open_hiby_player/open_hiby_player`. Use the matching board binary, then reboot — the bootloader copies it to internal storage.
+
+## Full firmware image (`.upt`)
+
+This rewrites the recovery-updatable firmware. **It can brick the device.**
+
+Keep a known-good recovery image first. The packer requires the staging base image, rejects images over 45 MiB, and will not mix R1 and R3 binaries.
+
+Needed once, to put the open-source bootloader on the device, and again only when the bootloader itself changes. Build R1 binaries with `make target BOARD=r1` and `make bootloader BOARD=r1`, then follow **[docs/HOW_TO_BUILD_A_UPT_FILE.md](docs/HOW_TO_BUILD_A_UPT_FILE.md)**. Once it is on, player updates go through the SD path above.
+
+---
 
 # Acknowledgments
 
@@ -396,30 +154,14 @@ Huge thanks to everyone who has contributed to the existing HiBy reverse-enginee
 
 # License
 
-This project is licensed under the **GNU General Public License v2.0**. See [LICENSE](LICENSE).
+See **[LICENSE](LICENSE)** (GNU GPL version 3).
 
-The project statically links [FAAD2](https://github.com/knik0/faad2) for AAC decoding, which is GPLv2-licensed. As a result, the resulting binary is distributed under GPLv2 as a whole rather than treating the AAC decoder as an isolated component.
+The project statically links [FAAD2](https://github.com/knik0/faad2) for AAC decoding, which is GPLv2-licensed. Other major dependencies, including `dr_libs`, LVGL, and tinyalsa, use permissive licenses.
 
-Other major dependencies, including `dr_libs`, LVGL, and tinyalsa, use permissive licenses.
-
-If GPLv2 is ever undesirable for a particular deployment, the practical solution would be to remove AAC support or replace FAAD2 with a decoder under a compatible permissive license—not to attempt to isolate the existing FAAD2 implementation from the resulting binary.
+If that copyleft combination is ever undesirable for a particular deployment, the practical solution would be to remove AAC support or replace FAAD2 with a decoder under a compatible permissive license — not to attempt to isolate the existing FAAD2 implementation from the resulting binary.
 
 ---
 
-# Contributing
+# Technical notes
 
-Contributions, bug reports, hardware testing, reverse-engineering findings, and feature requests are welcome.
-
-If you have a HiBy device that isn't currently supported, testing and reporting hardware-specific behavior can be particularly useful.
-
-Feature requests are also welcome—especially those that improve the player without adding unnecessary complexity.
-
----
-
-# Project Direction
-
-The long-term goal is not simply to make a replacement for `hiby_player`.
-
-It's to build a **community-maintained music player for HiBy hardware** that is easier to modify, easier to debug, and capable of features that the stock software doesn't provide.
-
-The project is still actively evolving. Expect rough edges, experimental features, and hardware-specific quirks—but also expect the player to keep getting better.
+Implementation notes and real-device findings: **[TECHNICAL_NOTES.md](TECHNICAL_NOTES.md)**.

@@ -1,4 +1,4 @@
-# Compás Player for HiBy OS
+# Compás Player
 
 An open-source music player replacement for HiBy OS, built from scratch in C with [LVGL](https://lvgl.io/).
 

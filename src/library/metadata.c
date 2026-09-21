@@ -2005,6 +2005,28 @@ static void metadata_read_scan_tags(const char * path, track_metadata_t * out) {
     out->lyrics = NULL;
 }
 
+static bool reap_scan_parser_child(pid_t pid, track_metadata_t * out, bool ok) {
+    /* Bounded reap, same as subprocess_run_timeout()'s own final wait --
+     * even after SIGKILL, a child genuinely stuck in an uninterruptible
+     * kernel read stays unreapable until that I/O naturally unblocks, so
+     * this can't be a plain blocking waitpid() either. */
+    /* A successful child has already sent its full result and should exit
+     * promptly; the shorter poll avoids a 50 ms delay on each quick read. */
+    const int reap_sleep_us = ok ? 1000 : 50000;
+    for (int waited_us = 0; waited_us < 1000000; waited_us += reap_sleep_us) {
+        int status = 0;
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+            if (ok && WIFEXITED(status) && WEXITSTATUS(status) == 0) return true;
+            memset(out, 0, sizeof(*out));
+            return false;
+        }
+        usleep(reap_sleep_us);
+    }
+    kill(pid, SIGKILL);
+    remember_abandoned_metadata_child(&scan_child_pool, pid);
+    return ok;
+}
+
 bool metadata_read_isolated(const char * path, track_metadata_t * out, int timeout_ms) {
     memset(out, 0, sizeof(*out));
     if (!path || !path[0]) return false;
@@ -2077,22 +2099,7 @@ bool metadata_read_isolated(const char * path, track_metadata_t * out, int timeo
         kill(pid, SIGKILL);
     }
 
-    /* Bounded reap, same as subprocess_run_timeout()'s own final wait --
-     * even after SIGKILL, a child genuinely stuck in an uninterruptible
-     * kernel read stays unreapable until that I/O naturally unblocks, so
-     * this can't be a plain blocking waitpid() either. */
-    for (int waited_ms = 0; waited_ms < 1000; waited_ms += 50) {
-        int status = 0;
-        if (waitpid(pid, &status, WNOHANG) == pid) {
-            if (ok && WIFEXITED(status) && WEXITSTATUS(status) == 0) return true;
-            memset(out, 0, sizeof(*out));
-            return false;
-        }
-        usleep(50000);
-    }
-    kill(pid, SIGKILL);
-    remember_abandoned_metadata_child(&scan_child_pool, pid);
-    return ok;
+    return reap_scan_parser_child(pid, out, ok);
 }
 
 static bool read_with_deadline(int fd, void * dst, size_t size,

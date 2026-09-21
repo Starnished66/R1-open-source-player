@@ -17,7 +17,38 @@ static void frame(FILE * f, const char * id, const unsigned char * data, size_t 
     assert(fwrite(data, 1, size, f) == size);
 }
 
+static int64_t monotonic_ms(void) {
+    struct timespec now;
+    assert(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+    return (int64_t) now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static void test_scan_child_reap(void) {
+    int64_t start = monotonic_ms();
+    for (int i = 0; i < 32; i++) {
+        pid_t child = fork();
+        assert(child >= 0);
+        if (child == 0) { usleep(5000); _exit(0); }
+        track_metadata_t result = {0};
+        assert(reap_scan_parser_child(child, &result, true));
+    }
+    assert(monotonic_ms() - start < 1000);
+
+    pid_t stuck = fork();
+    assert(stuck >= 0);
+    if (stuck == 0) { for (;;) pause(); }
+    track_metadata_t result = {0};
+    start = monotonic_ms();
+    assert(!reap_scan_parser_child(stuck, &result, false));
+    assert(monotonic_ms() - start < 1800);
+    int status;
+    assert(waitpid(stuck, &status, 0) == stuck);
+    assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+    reap_abandoned_metadata_children(&scan_child_pool);
+}
+
 int main(void) {
+    test_scan_child_reap();
     const unsigned char lyrics[] = {0, 'e', 'n', 'g', 0, 'h', 'i'};
     const unsigned char picture[] = {0, 'i','m','a','g','e','/','j','p','e','g',0,3,0, 1,2,3,4};
     unsigned size = 20 + sizeof(lyrics) + sizeof(picture);

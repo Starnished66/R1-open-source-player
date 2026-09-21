@@ -74,6 +74,8 @@ database.
 - Damaged FLAC files no longer send the player into a retry loop that
   reboots the device. Bad frames are skipped where possible, closer to
   how a desktop player treats a still-playable file.
+- Fixed a boot-time case where missing sound-device nodes caused every
+  track to report "Playback error: audio output failed."
 - Using the player as a USB DAC no longer lets queued audio pile up as
   extra delay during a long session. While USB DAC mode is active, a
   reset-to-Home action stays on that overlay instead of returning to the

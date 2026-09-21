@@ -4282,6 +4282,12 @@ static bool resume_playlist_needs_lazy_order = false;
 #define SD_QUEUE_RESUME_DIR "/data/mnt/sd_0/.open_hiby_player"
 #endif
 
+/* A lazy All-Songs queue has no paths until playlist_path_at() resolves them.
+ * Persisting one above this bound would materialize and strdup the whole
+ * library, which is unbounded work for a periodic checkpoint on the target.
+ * The settings last_track/last_source_kind resume path remains available. */
+#define LAZY_QUEUE_CHECKPOINT_MAX_ENTRIES 32768
+
 static atomic_bool sd_card_absent_immediate = false;
 
 void gui_player_notify_sd_unmounted_immediate(void) {
@@ -4319,6 +4325,19 @@ static pthread_t checkpoint_thread;
 static bool checkpoint_running;
 static atomic_bool checkpoint_done;
 static atomic_bool checkpoint_urgent_pending;
+static atomic_bool checkpoint_large_lazy_cleanup_pending;
+
+static bool queue_checkpoint_is_large_lazy(void) {
+    return playlist_lazy_sort_order != NULL &&
+           playlist_count > LAZY_QUEUE_CHECKPOINT_MAX_ENTRIES;
+}
+
+static void remove_queue_checkpoint_files(void) {
+    /* Remove both locations: boot may inspect either one depending on mount
+     * state, and an in-flight worker may have been writing either target. */
+    (void) unlink(QUEUE_RESUME_PATH);
+    (void) unlink(SD_QUEUE_RESUME_PATH);
+}
 
 /* Plain uint64_t, not atomic: this target's toolchain lacks a native 64-bit
  * atomic instruction and needs libatomic for one (confirmed -- linking
@@ -4346,6 +4365,9 @@ static void * queue_checkpoint_worker(void * arg) {
         if (ctx->failure_rev_ptr) *(ctx->failure_rev_ptr) = 0;
     }
     queue_resume_free(&ctx->queue);
+    if (atomic_load(&checkpoint_large_lazy_cleanup_pending)) {
+        remove_queue_checkpoint_files();
+    }
     atomic_store(&checkpoint_done, true);
     return NULL;
 }
@@ -4355,11 +4377,32 @@ bool gui_player_queue_write_busy(void) {
 }
 
 void gui_player_queue_checkpoint(void) {
+    if (queue_checkpoint_is_large_lazy()) {
+        /* Set this before observing the worker: if it is just finishing, the
+         * worker will remove anything it wrote; the join path below covers the
+         * race where it has already published checkpoint_done. */
+        atomic_store(&checkpoint_large_lazy_cleanup_pending, true);
+        atomic_store(&checkpoint_urgent_pending, false);
+        if (checkpoint_running) {
+            if (!atomic_load(&checkpoint_done)) return;
+            pthread_join(checkpoint_thread, NULL);
+            checkpoint_running = false;
+        }
+        remove_queue_checkpoint_files();
+        checkpoint_revision_internal = 0;
+        checkpoint_position_internal = -1;
+        checkpoint_revision_sd = 0;
+        checkpoint_position_sd = -1;
+        atomic_store(&checkpoint_large_lazy_cleanup_pending, false);
+        return;
+    }
+
     if (checkpoint_running) {
         if (!atomic_load(&checkpoint_done)) return;
         pthread_join(checkpoint_thread, NULL);
         checkpoint_running = false;
     }
+    atomic_store(&checkpoint_large_lazy_cleanup_pending, false);
     if (!gui_player_has_active_track()) return;
     double position = deferred_resume_pending ? deferred_resume_position : audio_get_resume_position_seconds();
 

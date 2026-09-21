@@ -1,159 +1,166 @@
 # What's New
 
-Changes from August 31 to September 15, 2026, for the next weekly beta.
+Changes since the September 15, 2026 release notes, for the September 21
+weekly beta.
 
-This update brings a redesigned player and menus, lyrics that open directly
-from the album cover, smoother navigation, and improvements to audio playback
-and library browsing. It also adds headphone remote controls and clearer
-feedback when a Subsonic connection or library request fails.
+This update redesigns the quick drawer, returns Now Playing to three
+centered title, artist, and album lines, and replaces the power-button
+countdown with Power Off and Reboot. Bluetooth headphones stay connected
+when a track's sample rate differs from the wireless link, with per-headset
+sample-rate controls. Tracks tagged with more than one artist are filed
+under each name, and USB remotes, gapless playback, and ADB placement
+are improved. Large libraries also browse more smoothly, update more
+quickly when files have not changed, and recover more safely from a damaged
+database.
 
 ## A refreshed player and interface
 
-- **A new Now Playing layout.** Album art sits in a rounded card over a
-  blurred background drawn from the cover. The title and smaller, gray
-  artist/album line are left-aligned, with a short pause before long text
-  starts scrolling. The cover also shows your position in the queue.
-- **Lyrics stay part of the player.** Tap the cover to shrink it into the
-  upper-left corner, move the track information beside it, and show lyrics
-  below. Tap again to bring back the full cover and playback controls.
-  Fixed a drawer-gesture conflict that hid the return animation. Lyrics can
-  be disabled in Music Controls.
-- **Clearer playback details.** The quality badge expands to show the
-  format, bit depth, and sample rate without scrolling. Its outer ring was
-  removed after it caused visible flickering. The three-dot menu now sits
-  beside the next-track button, and the favorite button is easier to tap.
-- **A more consistent look.** Home, Settings, Wireless, and other main menus
-  have refreshed icons and backgrounds. Net Radio and Audiobooks follow
-  the new menu style too. The status bar uses Lucide icons, including the
-  battery, with a centered clock and sizing independent of text-size settings.
-  The battery icon is now larger and easier to read at a glance.
+- **Now Playing shows title, artist, and album as three centered lines.**
+  The combined gray artist/album line is gone. The block sits above the
+  cover from each line's own size, and tapping the cover for lyrics still
+  moves all three beside the smaller artwork.
+- **Player text no longer follows Font Size.** Title, artist, and album
+  stay at one size per model so the layout does not collide with the cover
+  when Display -> Font Size is increased.
+- **A redesigned quick drawer.** Pull down for Wi-Fi, Bluetooth, Sleep, and
+  Crossfade. Drag the handle, or anywhere above the now-playing card, to
+  reveal AirPlay, DLNA, Gapless, and Remote, then brightness and volume.
+  Installed plugins can add up to four extra tiles; Gain Mode and MSEB do
+  so when those plugins are present. An upward drag collapses the extra
+  rows, or closes the drawer when there is nothing to collapse.
+- **The drawer card uses the frosted cover.** Title, artist, album, and
+  the format badge are centered over it, matching Now Playing. Transport
+  controls sit along the bottom. Long titles wait to start scrolling until
+  the drawer is actually open.
+- **The status bar stays visible while the drawer is open,** including
+  clock and battery, even if Now Playing had hidden the top bar. The
+  drawer also scales on the shorter R3 Pro II and R3 II 2025 screens.
+- **Long-press power now offers Power Off and Reboot.** A frosted overlay
+  replaces the three-second countdown. Tap an action immediately, or tap
+  elsewhere to dismiss. Reboot and Factory Reset actually restart instead
+  of powering the device off.
+- **Submenus dropped their colored row backgrounds.** Music, Settings,
+  Books, DAC, Wireless, and similar screens no longer draw a per-tile
+  backdrop, which had been making those lists feel sluggish, especially
+  on R3 Pro II. Home still uses its tile cards.
+- The built-in screen background is black again when no custom theme is
+  active. The About screen now identifies the app as **Compás Player**.
 - Fixed a gesture conflict where swiping on the Now Playing seek bar could
   trigger the back-swipe navigation instead of adjusting playback position.
-- **More display options.** Home supports custom background images and
-  individual tile colors through themes and plugins. You can also choose
-  how long the screen waits before dimming. Custom fonts have improved
-  performance and optional emoji support.
+- Swiping a song list no longer jumps to a letter if the gesture drifts
+  onto the A-Z strip. The strip only takes a drag that started on it.
+- At the largest font size, the lyrics empty message wraps instead of
+  running off the screen, and the idle Power Off / Suspend choices no
+  longer overlap the timeout slider.
+- Changing Font Size or a custom font now updates every already-built
+  Settings screen, so a submenu you had not opened yet no longer shows
+  titles scrolling the wrong way.
+- Toasts grow with their message and wrap long text instead of overflowing
+  a fixed box.
+- The Home indicator no longer stays visible on a cold boot until you
+  leave Home and come back.
+- The screen turns on and off more quickly from the power button. When it
+  is off, the panel is fully blanked, which saves a little battery.
 
 ## Playback and everyday controls
 
-- Added **SBC-XQ** to Bluetooth codec settings for higher-quality SBC
-  output to compatible headphones. Turn Bluetooth off and on after
-  switching into or out of this mode.
-- Added native 24-bit USB audio output and support for 24-bit crossfades.
-  Improved high-sample-rate playback and fixed USB DAC compatibility with macOS.
-- Improved Bluetooth DAC buffering for longer listening sessions and fixed
-  Bluetooth/USB output write-timeout handling.
-- Improved automatic switching between the R3 Pro II's 3.5mm and 4.4mm
-  outputs. Fixed playback-position restoration after a restart, seek-bar
-  positioning, and EQ preset saving.
-- Added an **In-line Remote** setting for supported wired-headphone
-  controls. It is enabled by default.
-- Reworked playlist and queue handling. Queue state is now stored on the
-  SD card, and the active queue clears when that card is removed.
+- **Gapless playback can be turned off.** It stays on by default, from
+  Music Settings -> Playback and from the quick drawer. Turning it off
+  also turns Crossfade off, because a crossfade needs the next track
+  ready; turning Crossfade on turns Gapless back on.
+- **USB remotes now work.** Playback buttons on a USB headphone cable or
+  dongle control play/pause, next, previous, and volume. A remote can be
+  plugged in after the player has already started.
+- Damaged FLAC files no longer send the player into a retry loop that
+  reboots the device. Bad frames are skipped where possible, closer to
+  how a desktop player treats a still-playable file.
+- Using the player as a USB DAC no longer lets queued audio pile up as
+  extra delay during a long session. While USB DAC mode is active, a
+  reset-to-Home action stays on that overlay instead of returning to the
+  normal Home screen.
 
-## Faster browsing and better artwork support
+## Library browsing
 
-- More artwork stays cached, reducing repeated thumbnail loading as you
-  browse. Player-sized cover caching and lighter metadata reads also
-  reduce work when opening tracks and lyrics.
-- Added progressive JPEG support and improved handling of large JPEGs,
-  16-bit PNGs, BMPs, and JPEGs with unusual color-sampling layouts. Artwork
-  detection and decoding are more reliable across different files.
-- Album lists now show **Album Artist** information.
-- In Files, the back button and back swipe move up one folder before
-  leaving the browser. Quick swipes are less likely to bounce back, and a
-  crash during player-screen swipe navigation was fixed.
+- **Large folders open promptly in Files.** Folder contents appear in pages
+  instead of creating every visible row at once. Previous and Next let you
+  move through a folder with many entries.
+- **Music database updates reuse unchanged files.** A manual Update Music
+  Database or an automatic rescan checks for changes instead of doing the
+  work of a first scan again. Initial scans also spend less time waiting
+  after each track's metadata is read.
+- **Safer database recovery and migration.** If a saved database is damaged,
+  the player can recover an earlier valid copy and tells you when to run
+  Update Music Database to save it. A missing SD card or failed database
+  load no longer causes an automatic rebuild that could replace the saved
+  library. Migrating an older database keeps favorites and play history;
+  the old copy remains available if migration fails.
+- **Very large queues no longer exhaust player memory on resume.** For a
+  huge All Songs queue, the player remembers the last track without saving
+  every queued path. The exact queue and shuffle order may not survive a
+  restart in this case.
+- **An optional offline first-scan tool** can build the music database on a
+  computer for a large SD library, then copy the validated result to a card
+  that has no existing database. It supports MP3, AAC, M4A, FLAC, WAV, and
+  the player's other supported music formats; install Python's `mutagen`
+  package to read their tags.
+- **Tracks with more than one artist are filed under each name.** A tag
+  such as "Artist A;Artist B" (semicolon or slash) appears under both in
+  Artists. Album Artist is left as a single grouping. Opening an album
+  from one artist shows only that artist's tracks, not every track on the
+  album.
+- **Folders can be kept out of the music database.** Put a
+  **database.ignore** file in a folder to exclude it and everything under
+  it. A nested **database.unignore** brings a subfolder back.
+- A library scan no longer stops at the first unreadable file or folder,
+  which could previously finish with an empty library. Songs are removed
+  only when the file is actually gone, so a folder the scan could not
+  read no longer loses its tracks. If the card is not mounted, the scan
+  is skipped instead of recording an empty library. The completion
+  message tells you when some folders could not be read, or that there
+  is no SD card.
 
-## Subsonic and plugins
+## Bluetooth, USB, and wireless
 
-- **Subsonic requests now have visible failure feedback.** Connection and
-  library-loading screens have a 30-second UI timeout. Errors distinguish
-  network failures, HTTP responses, and invalid server data instead of
-  silently returning to the previous screen.
-- **Failed artist loading can be retried.** A successful login no longer
-  requires a populated artist list. If the initial artist request fails,
-  opening Artists retries it rather than leaving a permanently empty cache.
-- Added the missing Subsonic download-button icon and improved handling of server
-  addresses with trailing slashes or `/rest`.
-- Last.fm now keeps a persistent queue of scrobbles for upload when the
-  service is reachable again, including after a restart.
-- Plugins can be enabled, disabled, and reloaded from Settings without a
-  firmware reinstall. Fixed unexpected restarts during plugin management
-  and integrated plugin options into Music Settings categories.
-- Added the **MSEB** plugin, with MSEB-inspired sound shaping using the
-  player's own parametric EQ, and improved its navigation.
-  Lock Screen gained a clock over artwork and smoother swipe-up behavior;
-  Play Through also received fixes.
+- **Headphones stay connected when a track's sample rate differs from
+  the wireless link.** The player converts the audio instead of tearing
+  down the connection. Bluetooth no longer restarts its audio service on
+  every boot, which had been dropping a headset that connected first.
+- **Bluetooth -> Advanced holds the less-used controls.** Codec, sample
+  rate, volume sync, unnamed-device hiding, and Speex resampling live
+  there so the device list stays the focus. Sample Rate lists what the
+  connected headset actually supports. Automatic is 44.1 kHz, which
+  matches most CD-derived libraries. Each accessory remembers its own
+  rate. Changing it may briefly disconnect the headset; reconnect if it
+  does not come back. The list then shows the rate that actually took.
+- A connected headset's row shows the codec **and** the negotiated
+  sample rate, so you can see which link you actually got.
+- Opening Bluetooth while music is playing no longer runs a full
+  discovery scan, which had been making playback stutter. The known-device
+  list still refreshes; Rescan is there when you want discovery.
+- Your codec preference is applied when headphones connect, instead of
+  waiting until a later track change. Changing the codec still asks you
+  to turn Bluetooth off and on.
+- Bluetooth DAC mode is no longer restored after a restart, which had
+  left headphones unable to connect with no overlay on screen to exit.
+- **ADB moved to Developer Options** (Settings -> About). It stays on
+  across a restart. Other USB modes return to Storage on boot, so a
+  leftover DAC mode cannot block local playback. Storage and DAC stay
+  dimmed on the USB Mode screen while ADB has the port.
+- The drawer's Wi-Fi toggle no longer drops a second tap while the radio
+  is still switching. A double tap settles on the last choice.
+- Developer Options now says **Enable debug logging** (was database
+  logging). Crash and reload diagnostics write only when that toggle is
+  on.
 
-## Device support, charging, and updates
+## Plugins
 
-- Added board-specific builds and display layouts for **R3 Pro II** and
-  **R3 II 2025**, alongside the R1 build. Hardware support and behavior
-  remain specific to each model.
-- On R3 Pro II, Charge Limiter and Safe Charging now apply voltage and
-  current limits to the dedicated charger, with restoration when disabled.
-  Charging status also reads from the correct hardware source.
-- Improved installation of player updates from the SD card. The bootloader
-  compares build dates so an older installed player does not override a
-  newer player included in a firmware update.
-- Fixed the Firmware Update action powering off instead of rebooting into
-  recovery, and corrected updater status text.
-- **No unnecessary library scans after charging.** Unplugging from a wall
-  charger or a charging-only cable no longer triggers a database update.
-  Automatic scans now require a confirmed USB Storage connection to a
-  computer and still respect the auto-rescan setting. A confirmed Storage
-  session is remembered even if the USB controller suspends or resets
-  before unplugging, and unreadable power-status samples are no longer
-  treated as disconnections. This detects a computer Storage session, not
-  individual file transfers: a computer connection can still trigger a scan
-  even if no files were changed.
-
-## Behind the scenes
-
-Upgraded LVGL, the library that powers the interface, from **9.1 to 9.5**.
-
-Song lists now read track duration and format in the background, so titles
-appear without waiting for every audio file to be opened. Details fill in
-without resetting your scroll position, and results from pages you have left
-are ignored. WMA decoder initialization is also synchronized so background
-probing and playback can safely open WMA files at the same time.
-
-Shared UI builders and substantial cleanup across the player reduce duplicated
-code and make layouts easier to maintain. Other work includes safer handling
-of overlapping DLNA requests, reduced memory use during plugin reloads,
-and improved crash diagnostics. The build configuration
-again selects mbedTLS 3.6.2 after connectivity regressions with 3.6.7.
-
-Corrected the upgraded Bluetooth service's pairing-storage location so saved
-headphones and trust settings survive a restart, and Bluetooth sample-rate
-changes no longer count as an immediate headphone disconnect. Turning
-Bluetooth on now makes a bounded background attempt to reconnect the last
-used headphones. Bluetooth status checks behind the top bar and quick-drawer
-icons also no longer fork one process per paired device on every refresh,
-removing a source of UI slowdown after turning on both Bluetooth and Wi-Fi.
-
-Improved playback restart recovery, including bounded retries for temporary
-output-open failures and preserved output format for eligible 24-bit tracks
-during pause, seek, and track-change fades. Routine volume and playback
-settings now save in the background, Web Import and Open Link/DLNA service
-changes run in the background, and Wi-Fi signal updates no longer wait on
-command-line tools on the UI thread. Library scans that fail to save now
-record the specific cause in the diagnostic log instead of a plain pass/fail
-flag, when database logging is enabled in Developer Options.
-
-Prepared a refresh of the firmware's Bluetooth audio and supporting
-libraries, led by BlueALSA 5.0.0, with updated ALSA, SBC, AAC, GLib, D-Bus,
-zlib, and XML parsing libraries and ALSA utilities (1.2.16) in the candidate
-base image, plus compatibility with newer BlueZ paired-device commands. The
-device's kernel, hardware drivers, and working LDAC libraries remain
-unchanged; device playback and reconnect testing is still required before
-inclusion.
-
-Automated daily builds continue; weekly beta builds are scheduled for Mondays
-at 1:00 p.m. Costa Rica time.
+- Plugins can put an on/off tile in the quick drawer. Gain Mode (High/Low)
+  and MSEB appear there when those plugins are installed.
+- The example plugin set adds the **Obsidian Audio** theme and three EQ
+  profiles in Sound Profiles: Harman IE 2017, V Shape, and U Shape.
 
 ## Before updating
 
-Emoji support needs the new font supplied in the full firmware package;
-replacing only the player executable will not install it. Updated plugin
-features also require the corresponding plugin files.
+Speex resampling and the Bluetooth boot-script fix need the full firmware
+package; replacing only the player executable will not install them.
+Updated plugin features also require the corresponding plugin files.

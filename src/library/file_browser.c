@@ -28,6 +28,12 @@ static char root_dir[PATH_MAX];
 static char current_dir[PATH_MAX];
 static dir_entry_t * entries = NULL;
 static int entry_count = 0;
+/* Keep the widget tree bounded when a music root contains hundreds of
+ * thousands of files.  The complete directory remains in `entries`, so
+ * sorting and selection semantics are unchanged; only one screenful-ish
+ * page is materialized by rebuild_list(). */
+#define FILE_BROWSER_PAGE_SIZE 64
+static int page_start = 0;
 
 static lv_obj_t * path_label;
 static lv_obj_t * list;
@@ -107,10 +113,19 @@ static int scan_directory(const char * dir_path, dir_entry_t ** out_entries) {
         char full_path[PATH_MAX];
         snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, de->d_name);
 
-        struct stat st;
-        if (stat(full_path, &st) != 0) continue;
-
-        bool is_dir = S_ISDIR(st.st_mode);
+        bool is_dir;
+        if (de->d_type == DT_DIR) {
+            is_dir = true;
+        } else if (de->d_type == DT_REG) {
+            is_dir = false;
+        } else {
+            /* DT_UNKNOWN (and symlinks) are common on some filesystems. Keep
+             * the stat fallback so the old target-following behavior stays
+             * unchanged for those entries. */
+            struct stat st;
+            if (stat(full_path, &st) != 0) continue;
+            is_dir = S_ISDIR(st.st_mode);
+        }
         bool is_playlist = !is_dir && library_is_m3u_file(de->d_name);
         /* Only shown at all if a caller actually wants .cue sheets (see
          * file_browser_init()'s own comment) -- a caller with cue_select_cb
@@ -144,6 +159,9 @@ static int scan_directory(const char * dir_path, dir_entry_t ** out_entries) {
 static void scan_current_dir(void) {
     free_entries();
     entry_count = scan_directory(current_dir, &entries);
+    if (page_start >= entry_count) {
+        page_start = entry_count > 0 ? ((entry_count - 1) / FILE_BROWSER_PAGE_SIZE) * FILE_BROWSER_PAGE_SIZE : 0;
+    }
 }
 
 /* Builds the playlist from every playable file in the current directory
@@ -211,6 +229,17 @@ static void up_click_cb(lv_event_t * e) {
     file_browser_go_up();
 }
 
+static void page_click_cb(lv_event_t * e) {
+    int delta = (int) (intptr_t) lv_event_get_user_data(e);
+    int next = page_start + delta;
+    if (next < 0) next = 0;
+    if (next >= entry_count) next = entry_count > 0
+        ? ((entry_count - 1) / FILE_BROWSER_PAGE_SIZE) * FILE_BROWSER_PAGE_SIZE : 0;
+    if (next == page_start) return;
+    page_start = next;
+    rebuild_list();
+}
+
 static void entry_click_cb(lv_event_t * e) {
     int index = (int) (intptr_t) lv_event_get_user_data(e);
 
@@ -218,6 +247,7 @@ static void entry_click_cb(lv_event_t * e) {
         char new_dir[PATH_MAX];
         snprintf(new_dir, sizeof(new_dir), "%s/%s", current_dir, entries[index].name);
         snprintf(current_dir, sizeof(current_dir), "%s", new_dir);
+        page_start = 0;
         scan_current_dir();
         rebuild_list();
     } else if (entries[index].is_playlist) {
@@ -287,7 +317,14 @@ static void rebuild_list(void) {
         add_file_row("Back", "sub_back/btn_back.png", up_click_cb, NULL);
     }
 
-    for (int i = 0; i < entry_count; i++) {
+    if (page_start > 0) {
+        add_file_row("Previous", "sub_back/btn_back.png", page_click_cb,
+                     (void *) (intptr_t) -FILE_BROWSER_PAGE_SIZE);
+    }
+
+    int page_end = page_start + FILE_BROWSER_PAGE_SIZE;
+    if (page_end > entry_count) page_end = entry_count;
+    for (int i = page_start; i < page_end; i++) {
         const char * icon_asset = NULL;
         if (entries[i].is_dir) icon_asset = "touch_list/list_folder.png";
         else if (entries[i].is_playlist) icon_asset = "sub_back/btn_playlist.png";
@@ -296,6 +333,11 @@ static void rebuild_list(void) {
          * represent "tap to see a list of tracks", not a single song). */
         else if (entries[i].is_cue) icon_asset = "sub_back/btn_playlist.png";
         add_file_row(entries[i].name, icon_asset, entry_click_cb, (void *) (intptr_t) i);
+    }
+
+    if (page_end < entry_count) {
+        add_file_row("Next", "playing_plane/btn_next.png", page_click_cb,
+                     (void *) (intptr_t) FILE_BROWSER_PAGE_SIZE);
     }
 }
 
@@ -405,6 +447,7 @@ void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select
     cue_select_cb = on_cue_select;
     snprintf(root_dir, sizeof(root_dir), "%s", root);
     snprintf(current_dir, sizeof(current_dir), "%s", root);
+    page_start = 0;
 
     path_label = lv_label_create(parent);
     lv_obj_set_style_text_color(path_label, lv_color_make(180, 180, 180), 0);
@@ -441,6 +484,7 @@ void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select
 void file_browser_reset_to_root(void) {
     if (!list) return; /* gui_library_get_files_screen() not built yet -- nothing to refresh */
     snprintf(current_dir, sizeof(current_dir), "%s", root_dir);
+    page_start = 0;
     scan_current_dir();
     rebuild_list();
 }

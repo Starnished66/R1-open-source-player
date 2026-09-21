@@ -7,7 +7,7 @@
 #define ACCENT_PALETTE_COUNT 16
 /* Native defaults only: live surfaces/text continue to use mutable styles
  * so plugin palettes (including light themes) remain authoritative. */
-#define GUI_COLOR_SCREEN 0x121418
+#define GUI_COLOR_SCREEN 0x000000
 #define GUI_COLOR_ROW 0x1C2026
 #define GUI_COLOR_PANEL 0x252A32
 #define GUI_COLOR_PRESSED 0x303743

@@ -447,7 +447,7 @@ static void dev_options_row_cb(lv_event_t * e) {
 
 static lv_obj_t * build_about_screen(void) {
     static pill_list_item_t items[4];
-    items[0] = (pill_list_item_t){ "Open Source Player for HiBy OS", PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
+    items[0] = (pill_list_item_t){ "Compás Player", PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[1] = (pill_list_item_t){ app_version_label(), PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[2] =
         (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };

@@ -204,6 +204,7 @@
 # ...except the compile_commands.json generator the Makefile's own
 # `compile_commands.json` target invokes -- this one ships with the repo.
 !/generate_compile_commands.py
+!/scripts/offline_library_scan.py
 
 # Standalone development self-tests are local-only and are not shipped in
 # the public source/release tree. Match future files in any directory too.
@@ -290,3 +291,10 @@ src/library/cover_decode_scale_test.c
 inline remote follow-up fixes.diff
 src/ui/screen_builders_test.c
 print_heights.c
+final_diff.patch
+
+# Local library-rework notes and regression harnesses
+/docs/LIBRARY_REWORK_STATUS.md
+/scripts/tests/
+/scripts/__pycache__/
+src/library/metadata_artwork_test.c

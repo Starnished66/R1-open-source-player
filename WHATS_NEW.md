@@ -84,6 +84,10 @@ database.
 - **Large folders open promptly in Files.** Folder contents appear in pages
   instead of creating every visible row at once. Previous and Next let you
   move through a folder with many entries.
+- **SD card hot swaps unload the old library and queue.** The player detects
+  a replacement card even when the old filesystem mount or device node
+  lingers, then loads the new card's saved library and queue without another
+  scan. A card with no database still gets its first scan.
 - **Music database updates reuse unchanged files.** A manual Update Music
   Database or an automatic rescan checks for changes instead of doing the
   work of a first scan again. Initial scans also spend less time waiting

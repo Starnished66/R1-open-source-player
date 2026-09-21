@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <time.h>
 #ifdef HOST_BUILD
 #include <execinfo.h>
@@ -163,6 +164,47 @@ static bool sd_mount_point_mounted(void) {
     return parent_st.st_dev != mnt_st.st_dev;
 }
 
+/* mdev normally creates these nodes when the card appears.  If mdev died or
+ * missed the hotplug event, however, an old block node can remain in /dev
+ * with the previous card's major/minor pair.  Read the kernel's current pair
+ * from sysfs and repair only the two SD nodes we own before trying mount.
+ * Never replace a non-block entry: an unexpected file or symlink at either
+ * path must remain untouched. */
+static void sync_sd_device_node(const char * device_name, const char * device_path) {
+    char sysfs_path[PATH_MAX];
+    unsigned int major_num, minor_num;
+    struct stat node_st;
+    FILE * sysfs;
+
+    if (snprintf(sysfs_path, sizeof(sysfs_path),
+                 "/sys/class/block/%s/dev", device_name) >= (int) sizeof(sysfs_path)) {
+        return;
+    }
+    sysfs = fopen(sysfs_path, "r");
+    if (!sysfs) return;
+    if (fscanf(sysfs, "%u:%u", &major_num, &minor_num) != 2) {
+        fclose(sysfs);
+        return;
+    }
+    fclose(sysfs);
+
+    dev_t expected = makedev(major_num, minor_num);
+    if (lstat(device_path, &node_st) == 0) {
+        if (!S_ISBLK(node_st.st_mode)) return;
+        if (node_st.st_rdev == expected) return;
+        if (unlink(device_path) != 0) return;
+    } else if (errno != ENOENT) {
+        return;
+    }
+
+    (void) mknod(device_path, S_IFBLK | 0660, expected);
+}
+
+static void sync_sd_device_nodes(void) {
+    sync_sd_device_node("mmcblk0", "/dev/mmcblk0");
+    sync_sd_device_node("mmcblk0p1", "/dev/mmcblk0p1");
+}
+
 /* Tries each supported filesystem type (vfat, exfat, NTFS) against one
  * device node in turn, stopping at the first that actually mounts.
  *
@@ -196,6 +238,8 @@ void mount_sd_card_if_needed(void) {
     mkdir("/data/mnt", 0755);
     mkdir("/data/mnt/sd_0", 0755);
     if (sd_mount_point_mounted()) return;
+
+    sync_sd_device_nodes();
 
     try_mount_sd_device_node("/dev/mmcblk0p1");
     if (sd_mount_point_mounted()) return;

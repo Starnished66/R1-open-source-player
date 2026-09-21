@@ -4524,13 +4524,25 @@ void gui_player_handle_sd_unmount(void) {
      * are already correctly rechecked, non-blockingly, by the next call to
      * gui_player_queue_checkpoint(). */
 
-    if (!gui_player_has_active_track()) return;
-    const char * cur_path = playlist_path_at(playlist_index);
-    if (!is_sd_card_path(cur_path)) return;
+    /* Lazy song queues belong to the SD database even when no path has been
+     * resolved yet. Never resolve every entry of a 300K queue on the UI
+     * thread just to decide whether it must be cleared. */
+    bool has_sd_playlist = playlist_lazy_sort_order != NULL;
+    for (int i = 0; !has_sd_playlist && i < playlist_count; i++) {
+        if (is_sd_card_path(playlist[i])) {
+            has_sd_playlist = true;
+            break;
+        }
+    }
+    if (!has_sd_playlist) return;
 
-    audio_stop();
-    plugin_manager_notify_stopped();
+    const char * cur_path = playlist_path_at(playlist_index);
+    if (is_sd_card_path(cur_path)) {
+        audio_stop();
+        plugin_manager_notify_stopped();
+    }
     free_playlist();
+    remote_control_sync_queue(NULL, 0);
     clear_player_source();
     set_play_button_state(false);
     if (song_title_label) lv_label_set_text(song_title_label, "No track loaded");

@@ -49,6 +49,7 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <limits.h>
 #include <ctype.h>
 #include <time.h>
@@ -4179,16 +4180,15 @@ static void refresh_library_screens_after_reload(void) {
                      true, METADATA_DB_AZ_ALL_SONGS, all_songs_fetch_page);
 }
 
-/* Fast path for SD card reinsertion: loads the card's existing database
- * cache first for immediate library availability. Normal and fresh caches
- * get a background rescan; recovered snapshots await an explicit update. */
+/* SD reinsertion loads an existing saved database and queue without walking
+ * the whole tree again. A card with no database still needs its first scan;
+ * users can explicitly update a saved database after changing files. */
 static void reload_library_on_sd_reinsert(void) {
     playlist_files_refresh_async(PLAYLISTS_DIR);
     library_load_from_cache_only();
     refresh_library_screens_after_reload();
     if (gui_library_auto_rescan_enabled() &&
-        (library_cache_load_outcome == METADATA_DB_LOAD_SUCCESS_NORMAL ||
-         library_cache_load_outcome == METADATA_DB_LOAD_SUCCESS_FRESH)) {
+        library_cache_load_outcome == METADATA_DB_LOAD_SUCCESS_FRESH) {
         start_library_auto_rescan();
     } else {
         report_library_cache_load();
@@ -4327,27 +4327,54 @@ static bool sd_mount_fail_notified = false;
  * isn't left staring at an empty library wondering what's wrong). */
 #define SD_MOUNT_FAIL_STREAK_THRESHOLD 6
 
-bool sd_card_root_is_mounted(void) {
+static bool sd_card_mount_attached(dev_t * mounted_device) {
     struct stat parent_st, root_st;
     if (stat("/data/mnt", &parent_st) != 0) return false;
     if (stat(MUSIC_ROOT_DIR, &root_st) != 0) return false;
-    return parent_st.st_dev != root_st.st_dev;
+    if (parent_st.st_dev == root_st.st_dev) return false;
+    if (mounted_device) *mounted_device = root_st.st_dev;
+    return true;
+}
+
+static bool sd_kernel_device_matches(dev_t mounted_device, const char * node) {
+    char path[96];
+    snprintf(path, sizeof(path), "/sys/class/block/%s/dev", node);
+    FILE * file = fopen(path, "r");
+    if (!file) return false;
+    unsigned major_number, minor_number;
+    bool matches = fscanf(file, "%u:%u", &major_number, &minor_number) == 2 &&
+                   mounted_device == makedev(major_number, minor_number);
+    fclose(file);
+    return matches;
+}
+
+bool sd_card_root_is_mounted(void) {
+    dev_t mounted_device;
+    if (!sd_card_mount_attached(&mounted_device)) return false;
+    /* ntfs-3g uses a FUSE filesystem device rather than the underlying MMC
+     * device. Its identity is checked by the card CID in the hotplug poll;
+     * presence in sysfs still catches a removed card. */
+    if (major(mounted_device) != 179) {
+        struct stat st;
+        return stat("/sys/class/block/mmcblk0", &st) == 0;
+    }
+    /* The kernel can leave an exFAT mount attached after the card is pulled.
+     * /dev/mmcblk0p1 can also be stale if mdev missed the replacement event.
+     * Compare the mount's actual device with sysfs, which follows the newly
+     * inserted card even when its /dev node has not been recreated. */
+    return sd_kernel_device_matches(mounted_device, "mmcblk0p1") ||
+           sd_kernel_device_matches(mounted_device, "mmcblk0");
 }
 
 static bool sd_card_device_node_present(void) {
     struct stat st;
-    /* Either node counts as "still present" -- mount_sd_card_if_needed()
-     * (main.c) now falls back to the whole-disk node for a partition-less
-     * card (see its own comment), so a card mounted that way only ever has
-     * a /dev/mmcblk0 node, never a p1 one. Checking p1 alone here would
-     * make this wrongly conclude such a card had been physically removed
-     * on the very next poll after it successfully mounted, force-unmounting
-     * a card that's still sitting right there. */
-    return stat("/dev/mmcblk0p1", &st) == 0 || stat("/dev/mmcblk0", &st) == 0;
+    /* Query sysfs rather than /dev: mdev may have left stale nodes behind.
+     * A partition-less card has only the whole-disk entry. */
+    return stat("/sys/class/block/mmcblk0p1", &st) == 0 ||
+           stat("/sys/class/block/mmcblk0", &st) == 0;
 }
 
-/* Whole-disk node, as opposed to sd_card_device_node_present()'s first-
- * partition node above -- present whenever a card is physically inserted
+/* Whole-disk sysfs entry -- present whenever a card is physically inserted
  * regardless of whether it has a partition table at all, so this is what
  * distinguishes "no card" from "card inserted but can't be mounted" for the
  * mount-failure/Format SD Card flow below (mount_sd_card_if_needed() itself
@@ -4356,7 +4383,22 @@ static bool sd_card_device_node_present(void) {
  * mounts genuinely needs a repartition/reformat, not just a different -t). */
 static bool sd_card_base_device_present(void) {
     struct stat st;
-    return stat("/dev/mmcblk0", &st) == 0;
+    return stat("/sys/class/block/mmcblk0", &st) == 0;
+}
+
+static void sd_card_read_cid(char out[64]) {
+    out[0] = '\0';
+    FILE * file = fopen("/sys/class/block/mmcblk0/device/cid", "r");
+    if (!file) return;
+    if (fgets(out, 64, file)) out[strcspn(out, "\r\n")] = '\0';
+    fclose(file);
+}
+
+static void clear_removed_sd_library(void) {
+    gui_player_handle_sd_unmount();
+    metadata_db_close();
+    refresh_library_screens_after_reload();
+    file_browser_reset_to_root();
 }
 
 void poll_sd_card_hotplug(void) {
@@ -4373,6 +4415,9 @@ void poll_sd_card_hotplug(void) {
      * (SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD) before tearing down library
      * state to debounce brief transient unmounts. */
     static int unmount_confirm_streak = 0;
+    static dev_t last_mounted_device;
+    static char last_card_cid[64];
+    static bool have_last_card_identity;
 #define SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD 2
 
     time_t now = time(NULL);
@@ -4380,7 +4425,25 @@ void poll_sd_card_hotplug(void) {
     last_check = now;
 
     bool mounted = sd_card_root_is_mounted();
-    if (mounted && !sd_card_device_node_present()) {
+    bool stale_mount = !mounted && sd_card_mount_attached(NULL);
+    dev_t current_mounted_device = 0;
+    char current_card_cid[64];
+    if (mounted) sd_card_mount_attached(&current_mounted_device);
+    sd_card_read_cid(current_card_cid);
+    bool replaced_between_polls = mounted && was_mounted && have_last_card_identity &&
+        (last_mounted_device != current_mounted_device ||
+         (last_card_cid[0] && current_card_cid[0] && strcmp(last_card_cid, current_card_cid) != 0));
+    if (replaced_between_polls && !library_rescan_active) {
+        /* An old card may have been unmounted and a new one mounted wholly
+         * between polls. The mount is valid, but the in-memory library and
+         * queue still belong to the previous card. */
+        cancel_album_thumbnail_generation();
+        atomic_store(&album_thumb_gen_retry_pending, false);
+        gui_player_notify_sd_unmounted_immediate();
+        clear_removed_sd_library();
+        was_mounted = false;
+    }
+    if (stale_mount || (mounted && !sd_card_device_node_present())) {
         /* -l (lazy): the node's already gone, so there's no real device
          * left to flush to, and a plain umount would fail with EBUSY if
          * this app (or anything else) still has an fd open on a file under
@@ -4397,7 +4460,6 @@ void poll_sd_card_hotplug(void) {
         if (group_probe_job && group_probe_job_generation == group_probe_generation)
             cancel_group_song_probes();
         gui_player_notify_sd_unmounted_immediate();
-        mount_sd_card_if_needed();
         if (was_mounted) {
             /* Stop post-scan artwork reads/writes as soon as removal is
              * observed. Joining is deliberately deferred to the next
@@ -4406,17 +4468,13 @@ void poll_sd_card_hotplug(void) {
             cancel_album_thumbnail_generation();
             atomic_store(&album_thumb_gen_retry_pending, false);
             unmount_confirm_streak++;
-            if (unmount_confirm_streak >= SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD && !library_rescan_active) {
-                gui_player_handle_sd_unmount();
-                /* Close the SD-resident tagcache so a later reinsert opens
-                 * the files on whichever card is actually mounted, not a
-                 * stale handle. Do not scan: the mountpoint is empty and
-                 * a scan would write a blank database there. */
-                metadata_db_close();
-                refresh_library_screens_after_reload();
-                file_browser_reset_to_root();
+            if ((stale_mount || unmount_confirm_streak >= SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD) &&
+                !library_rescan_active) {
+                /* Close old handles before loading the next card. */
+                clear_removed_sd_library();
                 was_mounted = false;
                 unmount_confirm_streak = 0;
+                have_last_card_identity = false;
             }
             /* Else: not yet confirmed (or a rescan from something else,
              * e.g. Settings > Update Music Database, is already running)
@@ -4427,6 +4485,11 @@ void poll_sd_card_hotplug(void) {
              * `!was_mounted` reinsertion check (still false) mean neither
              * edge ever fires. */
         }
+
+        /* Tear down state tied to the old card before mounting a replacement.
+         * Otherwise a rapid swap can hide the unmounted edge from the next
+         * poll and leave the previous card's library and queue in memory. */
+        mount_sd_card_if_needed();
 
         /* Card is physically there (the whole-disk node exists) but still
          * won't mount after repeated retries. mount_sd_card_if_needed()
@@ -4462,6 +4525,12 @@ void poll_sd_card_hotplug(void) {
     mount_fail_streak = 0;
     sd_mount_fail_notified = false;
     unmount_confirm_streak = 0; /* seeing "mounted" again cancels any not-yet-confirmed removal */
+    if (library_rescan_active && (!was_mounted || replaced_between_polls)) {
+        /* Keep the old identity until the scan worker releases its database
+         * handles; the next poll must still perform the card handoff. */
+        gui_player_notify_sd_unmounted_immediate();
+        return;
+    }
     /* Every poll that observes the card mounted un-sticks the checkpoint
      * target, even for a transient blip that never reached the confirmed-
      * removal streak above. */
@@ -4491,6 +4560,9 @@ void poll_sd_card_hotplug(void) {
         gui_player_restore_sd_queue(true);
     }
     was_mounted = true;
+    last_mounted_device = current_mounted_device;
+    snprintf(last_card_cid, sizeof(last_card_cid), "%s", current_card_cid);
+    have_last_card_identity = true;
 }
 #else
 bool sd_card_root_is_mounted(void) {

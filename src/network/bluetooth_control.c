@@ -2548,7 +2548,8 @@ bool bt_control_apply_output_settings(bool dac_mode_enabled, bool volume_sync_en
     if (!dac_mode_enabled && bt_rate_wants_audio_cd()) argv[i++] = (char *) BT_A2DP_FORCE_44K1_ARG;
     if (!dac_mode_enabled && bt_codec_is_sbc_xq())
         argv[i++] = (char *) "--sbc-quality=xq";
-    if (!dac_mode_enabled) i = bt_codec_append_daemon_args(argv, i);
+    if (dac_mode_enabled) argv[i++] = (char *) "--all-codecs";
+    else i = bt_codec_append_daemon_args(argv, i);
     argv[i] = NULL;
     if (!spawn_bluealsa_and_verify(argv)) {
         pthread_mutex_unlock(&bt_daemon_respawn_mutex);

@@ -3996,9 +3996,48 @@ static bool library_rescan_succeeded;
 /* Set when the walk could not read part of the tree, so the toast does not
  * claim a full update. Rows whose file is missing are still removed. */
 static bool library_rescan_incomplete;
-/* Set when the card is not mounted, so the toast does not claim a full
- * update and nothing was deleted this pass. */
-static bool library_rescan_not_mounted;
+static bool library_rescan_allow_rebuild;
+static bool library_rescan_load_blocked;
+static bool library_rescan_saved;
+static bool library_rescan_migrating;
+static bool library_rescan_migration_cleanup;
+static const char library_recovered_message[] = "Library recovered. Use Settings > Update Music Database to save";
+
+/* Retain the highest-priority outcome observed during an operation. */
+static metadata_db_load_outcome_t combine_load_outcomes(metadata_db_load_outcome_t a, metadata_db_load_outcome_t b) {
+    if (a == METADATA_DB_LOAD_FAILED || b == METADATA_DB_LOAD_FAILED) return METADATA_DB_LOAD_FAILED;
+    if (a == METADATA_DB_LOAD_UNMOUNTED || b == METADATA_DB_LOAD_UNMOUNTED) return METADATA_DB_LOAD_UNMOUNTED;
+    if (a == METADATA_DB_LOAD_SUCCESS_RECOVERED || b == METADATA_DB_LOAD_SUCCESS_RECOVERED) return METADATA_DB_LOAD_SUCCESS_RECOVERED;
+    if (a == METADATA_DB_LOAD_SUCCESS_NORMAL || b == METADATA_DB_LOAD_SUCCESS_NORMAL) return METADATA_DB_LOAD_SUCCESS_NORMAL;
+    return METADATA_DB_LOAD_SUCCESS_FRESH;
+}
+
+/* Cache reports are owned by the UI thread. */
+static metadata_db_load_outcome_t library_cache_load_outcome;
+static bool library_cache_load_pending;
+/* Initialized before pthread_create and published by library_rescan_done_flag. */
+static metadata_db_load_outcome_t library_operation_outcome;
+static metadata_db_load_outcome_t reload_library_cache(void);
+
+static void report_library_cache_load(void) {
+    if (!library_cache_load_pending) return;
+    library_cache_load_pending = false;
+    if (metadata_db_migration_needed() &&
+        library_cache_load_outcome != METADATA_DB_LOAD_FAILED &&
+        library_cache_load_outcome != METADATA_DB_LOAD_UNMOUNTED) {
+        show_info_toast("Library migration pending. Favourites and play history will be kept");
+        return;
+    }
+    switch (library_cache_load_outcome) {
+        case METADATA_DB_LOAD_FAILED:
+            show_error_toast("Library unavailable. Use Settings > Update Music Database to rebuild");
+            break;
+        case METADATA_DB_LOAD_UNMOUNTED: show_error_toast("No SD card"); break;
+        case METADATA_DB_LOAD_SUCCESS_RECOVERED: show_info_toast(library_recovered_message); break;
+        case METADATA_DB_LOAD_SUCCESS_FRESH: show_info_toast("Library empty"); break;
+        case METADATA_DB_LOAD_SUCCESS_NORMAL: show_info_toast("Library loaded"); break;
+    }
+}
 
 static void * library_rescan_thread_func(void * arg) {
     (void) arg;
@@ -4011,6 +4050,7 @@ static void * library_rescan_thread_func(void * arg) {
     uint64_t started_ms = db_log_enabled() ? db_log_now_ms() : 0;
     DB_LOG("DB", "rescan_thread_begin rss_kb=%ld", db_log_rss_kb());
     library_scan_once();
+    metadata_db_migration_cancel();
     DB_LOG("DB", "rescan_thread_end songs=%lld elapsed_ms=%llu rss_kb=%ld",
            (long long) metadata_db_get_song_count(), (unsigned long long) (db_log_now_ms() - started_ms),
            db_log_rss_kb());
@@ -4028,7 +4068,7 @@ bool gui_library_auto_rescan_enabled(void) {
  * call chains through metadata parsers and tagcache indexing. */
 #define LIBRARY_RESCAN_THREAD_STACK_SIZE (4 * 1024 * 1024)
 
-void start_library_rescan(void) {
+static void start_library_rescan_with_repair(bool allow_rebuild) {
     /* Ignore request if a rescan is already running. */
     if (library_rescan_active) return;
     DB_LOG("DB", "rescan_requested existing_songs=%lld rss_kb=%ld",
@@ -4037,23 +4077,38 @@ void start_library_rescan(void) {
      * target. Do not overlap it with a previous warmer or lazy cover decode;
      * cancellation is cooperative and bounded by the artwork timeout. */
     quiesce_album_artwork_workers();
+    library_rescan_allow_rebuild = allow_rebuild;
+    library_operation_outcome = !allow_rebuild && library_cache_load_pending ? library_cache_load_outcome
+                                                                           : METADATA_DB_LOAD_SUCCESS_NORMAL;
     atomic_store_explicit(&library_rescan_done_flag, false, memory_order_relaxed);
     library_rescan_active = true;
-    library_rescan_token = gui_busy_show("Updating\nmusic database...", "");
+    library_rescan_token = gui_busy_show(metadata_db_migration_needed() ? "Migrating\nmusic database..."
+                                                                       : "Updating\nmusic database...", "");
     gui_busy_set_progress(library_rescan_token, 0);
 
     pthread_attr_t attr;
     pthread_attr_t * attr_ptr = NULL;
-    if (pthread_attr_init(&attr) == 0) {
+    bool attr_initialized = pthread_attr_init(&attr) == 0;
+    if (attr_initialized) {
         if (pthread_attr_setstacksize(&attr, LIBRARY_RESCAN_THREAD_STACK_SIZE) == 0) attr_ptr = &attr;
     }
     bool created = pthread_create(&library_rescan_thread, attr_ptr, library_rescan_thread_func, NULL) == 0;
-    if (attr_ptr) pthread_attr_destroy(&attr);
+    if (attr_initialized) pthread_attr_destroy(&attr);
+    if (created) library_cache_load_pending = false;
     if (!created) {
+        library_operation_outcome = METADATA_DB_LOAD_FAILED;
         library_rescan_active = false;
         gui_busy_hide(library_rescan_token);
         show_error_toast("Thread launch failed");
     }
+}
+
+void start_library_rescan(void) {
+    start_library_rescan_with_repair(true);
+}
+
+void start_library_auto_rescan(void) {
+    start_library_rescan_with_repair(false);
 }
 
 /* Rebuilds the five prebuilt library screens (All Songs, Artists, Albums,
@@ -4083,14 +4138,7 @@ static void refresh_library_screens_after_reload(void) {
     if (lv_screen_active() != gui_busy_get_screen()) {
         nav_reset_to_home();
     }
-    /* Purge screens being replaced from nav_stack before deleting them so a
-     * subsequent nav_pop() does not pop a deleted screen -- a no-op for the
-     * nav-stack part after nav_reset_to_home() above already cleared it,
-     * but this ALSO clears gui_navigation.c's back_target_cache_screen if
-     * it points at any of these (real use-after-free caught in review:
-     * that cache can be covered by a screen one of these lists pushed, and
-     * previously only the busy-screen branch ran this cleanup, leaving the
-     * non-busy path free to delete a screen this cache still pointed at). */
+    /* Remove replaced screens from navigation and the back-target cache. */
     lv_obj_t * being_replaced[] = { all_songs_screen, artists_screen, albums_screen, album_artist_screen,
                                      recently_added_screen };
     gui_navigation_remove_screen_instances(being_replaced, (int)(sizeof(being_replaced) / sizeof(being_replaced[0])));
@@ -4132,17 +4180,20 @@ static void refresh_library_screens_after_reload(void) {
 }
 
 /* Fast path for SD card reinsertion: loads the card's existing database
- * cache first for immediate library availability, followed by a background
- * rescan to detect any files modified while unmounted. */
+ * cache first for immediate library availability. Normal and fresh caches
+ * get a background rescan; recovered snapshots await an explicit update. */
 static void reload_library_on_sd_reinsert(void) {
     playlist_files_refresh_async(PLAYLISTS_DIR);
     library_load_from_cache_only();
     refresh_library_screens_after_reload();
-    if (metadata_db_get_song_count() > 0) {
-        show_info_toast("Library loaded");
-        start_album_thumbnail_generation();
+    if (gui_library_auto_rescan_enabled() &&
+        (library_cache_load_outcome == METADATA_DB_LOAD_SUCCESS_NORMAL ||
+         library_cache_load_outcome == METADATA_DB_LOAD_SUCCESS_FRESH)) {
+        start_library_auto_rescan();
+    } else {
+        report_library_cache_load();
+        if (metadata_db_get_song_count() > 0) start_album_thumbnail_generation();
     }
-    if (gui_library_auto_rescan_enabled()) start_library_rescan();
 }
 
 /* How long the "Library updated" success message stays up once a rescan
@@ -4184,7 +4235,10 @@ void poll_library_rescan(void) {
         return;
     }
 
-    if (!library_rescan_active) return;
+    if (!library_rescan_active) {
+        report_library_cache_load();
+        return;
+    }
 
     if (!atomic_load_explicit(&library_rescan_done_flag, memory_order_acquire)) {
         /* Still scanning -- total stays 0 until the initial file walk
@@ -4201,21 +4255,47 @@ void poll_library_rescan(void) {
     pthread_join(library_rescan_thread, NULL);
 
     refresh_library_screens_after_reload();
+
     /* Thumbnail generation is optional cache warming. It must not become a
      * second user-visible phase after "Updating music database..." -- no
      * progress screen, no toast. The worker yields and cancels when Albums
      * opens so visible-row decode stays first. */
-    if (!library_rescan_succeeded) {
+    bool overall_success = library_rescan_succeeded &&
+                           library_operation_outcome != METADATA_DB_LOAD_FAILED &&
+                           library_operation_outcome != METADATA_DB_LOAD_UNMOUNTED;
+    if (!overall_success) {
         gui_busy_hide(library_rescan_token);
         nav_reset_to_home();
-        if (library_rescan_not_mounted) show_error_toast("No SD card");
-        else show_error_toast("Library update failed");
+        if (library_rescan_migrating && !library_rescan_migration_cleanup) {
+            show_error_toast("Library migration failed. Old library intact. Use Settings > Update Music Database to retry");
+        } else if (library_operation_outcome == METADATA_DB_LOAD_UNMOUNTED) {
+            show_error_toast("No SD card");
+        } else if (library_rescan_load_blocked) {
+            if (library_operation_outcome == METADATA_DB_LOAD_SUCCESS_RECOVERED)
+                show_info_toast(library_recovered_message);
+            else
+                show_error_toast("Library unavailable. Use Settings > Update Music Database to rebuild");
+        } else {
+            show_error_toast("Library update failed. Check SD card and retry");
+        }
         return;
     }
     start_album_thumbnail_generation();
     gui_busy_hide(library_rescan_token);
-    show_info_toast(library_rescan_incomplete ? "Library updated, some folders could not be read"
-                                              : "Library updated");
+
+    if (library_rescan_migrating) {
+        show_info_toast(metadata_db_migration_cleanup_pending()
+                            ? "Library migrated. Old database cleanup will retry"
+                            : "Library migrated. Favourites and play history kept");
+    } else if (library_operation_outcome == METADATA_DB_LOAD_SUCCESS_RECOVERED) {
+        show_info_toast(library_rescan_saved
+                            ? (library_rescan_incomplete ? "Library recovered and saved, some folders could not be read"
+                                                         : "Library recovered and saved")
+                            : library_recovered_message);
+    } else {
+        show_info_toast(library_rescan_incomplete ? "Library updated, some folders could not be read"
+                                                  : "Library updated");
+    }
     library_rescan_success_pending = true;
     library_rescan_success_since_tick = lv_tick_get();
 }
@@ -4396,7 +4476,7 @@ void poll_sd_card_hotplug(void) {
     } else if (!boot_library_recheck_done) {
         boot_library_recheck_done = true;
         fallback_font_on_sd_mounted();
-        if (metadata_db_get_song_count() == 0 && !library_rescan_active) {
+        if (metadata_db_get_load_outcome() == METADATA_DB_LOAD_UNMOUNTED && !library_rescan_active) {
             file_browser_reset_to_root();
             reload_library_on_sd_reinsert();
         }
@@ -4522,7 +4602,7 @@ void poll_sd_format(void) {
         show_error_toast("SD card formatted");
         sd_mount_fail_notified = false; /* give the freshly-formatted card a clean slate */
         if (!library_rescan_active) {
-            start_library_rescan();
+            start_library_auto_rescan();
             file_browser_reset_to_root();
         }
     } else {
@@ -4919,8 +4999,11 @@ void plugin_stream_tile_click_cb(lv_event_t * e) {
  * list -- tapping an album from there lands on show_group_songs() same as
  * every other terminal list. One persistent screen shared by both callers,
  * same rebuild-in-place approach as group_songs_screen. */
-static group_row_t * artist_albums_groups;
 static int artist_albums_group_count;
+/* The compact-list page provider may run on its fetch worker while a rapid
+ * drill-down replaces the screen's current artist. Snapshot both fields as
+ * one pair so an abandoned fetch never observes a torn query. */
+static pthread_mutex_t artist_albums_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Name/kind of the artist or album artist this screen is currently showing
  * -- set by show_artist_albums(), read back by artist_album_row_click_cb()'s
  * own "All Songs" row (index 0, see that function's own comment) to fetch
@@ -5114,13 +5197,15 @@ static void artist_album_row_click_cb(int index) {
     }
     int group_index = index - 1;
     if (group_index < 0 || group_index >= artist_albums_group_count) return;
-    group_row_t * group = &artist_albums_groups[group_index];
+    group_row_t group;
+    if (metadata_db_get_albums_for_group(artist_albums_current_kind, artist_albums_current_name,
+                                         group_index, 1, &group) != 1) return;
     int n = 0;
-    group_song_entry_t * entries = load_album_entries_filtered(group->name, group->album_artist,
-                                                                group->song_count,
+    group_song_entry_t * entries = load_album_entries_filtered(group.name, group.album_artist,
+                                                                group.song_count,
                                                                 artist_albums_song_filter(), &n);
     if (!entries) return;
-    show_music_group_songs(group->name, entries, n);
+    show_music_group_songs(group.name, entries, n);
     free_group_song_entries(entries, n);
     group_songs_source_is_album = true;
 }
@@ -5260,8 +5345,11 @@ static void album_more_click_cb(int index) {
 static void artist_album_more_click_cb(int index) {
     if (index > 0) {
         int group_index = index - 1;
-        if (group_index >= 0 && group_index < artist_albums_group_count)
-            open_album_collection_menu(&artist_albums_groups[group_index], artist_albums_song_filter());
+        group_row_t group;
+        if (group_index >= 0 && group_index < artist_albums_group_count &&
+            metadata_db_get_albums_for_group(artist_albums_current_kind, artist_albums_current_name,
+                                              group_index, 1, &group) == 1)
+            open_album_collection_menu(&group, artist_albums_song_filter());
         return;
     }
     int64_t offset = metadata_db_get_group_offset(artist_albums_current_kind,
@@ -5314,12 +5402,9 @@ static void album_thumbnail_screen_unloaded_cb(lv_event_t * e) {
     album_thumbnail_end_screen(list);
 }
 
-/* Matches by song-index membership (not album NAME, unlike Albums/Album
- * Artist's own name-based match) -- this screen already only ever holds
- * albums belonging to the ONE artist just tapped into (artist_albums_
- * groups is built from artist_group->indices), so an index check is both
- * more precise (no risk of a same-named album by a different artist
- * lighting this up) and cheaper than resolving artist/album strings again.
+/* Resolve the matching album's sorted result offset directly. This keeps the
+ * now-playing refresh bounded even for an artist with a large catalog, while
+ * preserving the database's canonical/truncated group names and ordering.
  * Same standalone-refresh reasoning as refresh_group_songs_now_playing_
  * indicator() -- callable without rebuilding rows, e.g. on a live playback
  * change while this screen stays open. */
@@ -5329,60 +5414,66 @@ void refresh_artist_albums_now_playing_indicator(void) {
     int match = -1;
     song_row_t playing;
     if (now_playing_path[0] && metadata_db_get_song_by_path(now_playing_path, &playing)) {
-        for (int i = 0; i < artist_albums_group_count; i++) {
-            if (strcasecmp(artist_albums_groups[i].name, playing.tags.album) == 0 &&
-                strcasecmp(artist_albums_groups[i].album_artist, playing.tags.album_artist) == 0) {
-                /* +1 -- show_artist_albums() prepends an "All Songs" row at
-                 * index 0, ahead of every artist_albums_groups[] entry. */
-                match = i + 1;
-                break;
-            }
-        }
+        int64_t offset = metadata_db_get_album_for_group_offset(artist_albums_current_kind,
+                                                                 artist_albums_current_name,
+                                                                 playing.tags.album,
+                                                                 playing.tags.album_artist);
+        if (offset >= 0 && offset < artist_albums_group_count)
+            /* +1 -- show_artist_albums() prepends an "All Songs" row at
+             * index 0, ahead of every fetched album row. */
+            match = (int) offset + 1;
     }
 
     compact_list_set_now_playing(artist_albums_list, match);
 }
 
+/* Paged artist-album rows keep the complete result set out of memory. Row
+ * zero is the synthetic All Songs action; database offset zero starts at
+ * display index one. */
+static int artist_albums_fetch_page(void * ctx, int offset, int count, compact_list_page_row_t out_rows[]) {
+    (void) ctx;
+    char current_name[sizeof(artist_albums_current_name)];
+    metadata_db_group_kind_t current_kind;
+    pthread_mutex_lock(&artist_albums_state_mutex);
+    snprintf(current_name, sizeof(current_name), "%s", artist_albums_current_name);
+    current_kind = artist_albums_current_kind;
+    pthread_mutex_unlock(&artist_albums_state_mutex);
+
+    int prefix = 0;
+    if (offset == 0 && count > 0) {
+        memset(&out_rows[0], 0, sizeof(out_rows[0]));
+        snprintf(out_rows[0].label, sizeof(out_rows[0].label), "%s", "All Songs");
+        snprintf(out_rows[0].trailing_asset, sizeof(out_rows[0].trailing_asset), "%s", "playing_plane/ic_more.png");
+        prefix = 1;
+        count--;
+    } else {
+        offset--;
+    }
+    if (count <= 0) return prefix;
+    group_row_t * rows = malloc(sizeof(*rows) * (size_t) count);
+    int n = rows ? metadata_db_get_albums_for_group(current_kind, current_name, offset, count, rows) : 0;
+    for (int i = 0; i < n; i++) {
+        snprintf(out_rows[prefix + i].label, sizeof(out_rows[prefix + i].label), "%s", rows[i].name);
+        out_rows[prefix + i].identity = rows[i].first_song_id;
+        snprintf(out_rows[prefix + i].trailing_asset, sizeof(out_rows[prefix + i].trailing_asset),
+                 "%s", "playing_plane/ic_more.png");
+    }
+    free(rows);
+    return n + prefix;
+}
+
 void show_artist_albums(const char * name, metadata_db_group_kind_t kind) {
+    pthread_mutex_lock(&artist_albums_state_mutex);
     snprintf(artist_albums_current_name, sizeof(artist_albums_current_name), "%s", name);
     artist_albums_current_kind = kind;
+    pthread_mutex_unlock(&artist_albums_state_mutex);
 
-    free(artist_albums_groups);
-    artist_albums_groups = NULL;
     int64_t count64 = metadata_db_count_albums_for_group(kind, name);
     artist_albums_group_count = count64 > 0 && count64 <= INT_MAX ? (int) count64 : 0;
-    if (artist_albums_group_count > 0) {
-        artist_albums_groups = malloc(sizeof(*artist_albums_groups) * (size_t) artist_albums_group_count);
-        if (!artist_albums_groups) artist_albums_group_count = 0;
-        else artist_albums_group_count = metadata_db_get_albums_for_group(kind, name, 0, artist_albums_group_count,
-                                                                           artist_albums_groups);
-    }
 
     lv_label_set_text(artist_albums_title_label, name);
-    /* "All Songs" prepended at index 0 -- artist_album_row_click_cb() and
-     * refresh_artist_albums_now_playing_indicator() both account for this
-     * same +1 shift against artist_albums_groups[]. identity=0 (no real
-     * song id) makes album_row_thumbnail_decorator() hide this row's cover
-     * image via its own existing song_id<=0 fallback -- no decorator
-     * changes needed. */
-    compact_list_item_t * items = artist_albums_group_count > 0
-        ? malloc(sizeof(*items) * (size_t) (artist_albums_group_count + 1)) : NULL;
-    if (items) {
-        items[0] = (compact_list_item_t){
-            .label = "All Songs", .identity = 0, .trailing_asset = "playing_plane/ic_more.png"
-        };
-        for (int i = 0; i < artist_albums_group_count; i++) {
-            items[i + 1] = (compact_list_item_t){
-                .label = artist_albums_groups[i].name,
-                .identity = artist_albums_groups[i].first_song_id,
-                .trailing_asset = "playing_plane/ic_more.png"
-            };
-        }
-        compact_list_set_items(artist_albums_list, items, artist_albums_group_count + 1);
-        free(items);
-    } else {
-        compact_list_set_items(artist_albums_list, NULL, 0);
-    }
+    compact_list_set_paged_provider(artist_albums_list, artist_albums_fetch_page, NULL,
+                                    artist_albums_group_count + 1);
     compact_list_set_row_decorator(artist_albums_list, album_row_thumbnail_decorator, NULL);
     compact_list_set_trailing_click(artist_albums_list, artist_album_more_click_cb);
     refresh_artist_albums_now_playing_indicator();
@@ -5766,6 +5857,41 @@ static bool scan_spool_read_path(FILE * f, char * path, size_t path_size) {
     return true;
 }
 
+/* Prove that discovery still describes the complete unchanged library before
+ * entering the staging path. Any malformed or ambiguous spool data falls
+ * through to the normal update so the existing recovery semantics remain. */
+static bool library_scan_unchanged_fast_path(const char * spool_path, int discovered_count) {
+    FILE * spool = fopen(spool_path, "rb");
+    if (!spool) return false;
+
+    bool unchanged = true;
+    char path[PATH_MAX];
+    for (int i = 0; i < discovered_count; i++) {
+        struct stat st;
+        cached_tags_t cached;
+        if (!scan_spool_read_path(spool, path, sizeof(path)) || path[0] == '\0' ||
+            stat(path, &st) != 0 ||
+            !metadata_db_get(path, (int64_t) st.st_mtime, (int64_t) st.st_size, &cached)) {
+            unchanged = false;
+            break;
+        }
+    }
+
+    /* The count must describe the whole spool, including no trailing record
+     * or read error, before it can authorize skipping the update. */
+    if (unchanged && (fgetc(spool) != EOF || ferror(spool))) unchanged = false;
+    if (fclose(spool) != 0) unchanged = false;
+    if (!unchanged) return false;
+    if (remove(spool_path) != 0) return false;
+
+    library_scan_progress_done = discovered_count;
+    library_rescan_succeeded = true;
+    library_rescan_incomplete = false;
+    library_rescan_saved = false;
+    DB_LOG("DB", "update_unchanged files=%d rss_kb=%ld", discovered_count, db_log_rss_kb());
+    return true;
+}
+
 typedef enum {
     SCAN_SONG_CACHED,   /* metadata_db_get() hit -- no parse attempted */
     SCAN_SONG_PARSED,   /* isolated read + DB upsert succeeded */
@@ -5872,7 +5998,10 @@ static void rescan_playlists(void) {
 void library_scan_once(void) {
     library_rescan_succeeded = false;
     library_rescan_incomplete = false;
-    library_rescan_not_mounted = false;
+    library_rescan_load_blocked = false;
+    library_rescan_saved = false;
+    library_rescan_migrating = metadata_db_migration_needed();
+    library_rescan_migration_cleanup = metadata_db_migration_cleanup_pending();
     bool db_logging = db_log_enabled();
     uint64_t scan_started_ms = db_logging ? db_log_now_ms() : 0;
     uint64_t phase_started_ms = scan_started_ms;
@@ -5880,7 +6009,31 @@ void library_scan_once(void) {
     library_scan_progress_total = 0;
 
     DB_LOG("DB", "scan_begin root=%s rss_kb=%ld", MUSIC_ROOT_DIR, db_log_rss_kb());
-    metadata_db_open();
+    metadata_db_load_outcome_t open_outcome = metadata_db_open();
+    bool preserve_rebuild = false;
+    if (open_outcome == METADATA_DB_LOAD_FAILED && library_rescan_allow_rebuild) {
+        bool prepared = metadata_db_prepare_rebuild();
+        open_outcome = metadata_db_get_load_outcome();
+        preserve_rebuild = prepared && open_outcome == METADATA_DB_LOAD_FAILED;
+        if (preserve_rebuild)
+            open_outcome = METADATA_DB_LOAD_SUCCESS_NORMAL;
+    }
+    library_operation_outcome = combine_load_outcomes(library_operation_outcome, open_outcome);
+    if (library_operation_outcome == METADATA_DB_LOAD_FAILED ||
+        library_operation_outcome == METADATA_DB_LOAD_UNMOUNTED) {
+        library_rescan_load_blocked = !library_rescan_allow_rebuild;
+        return;
+    }
+    if (!library_rescan_allow_rebuild && open_outcome == METADATA_DB_LOAD_SUCCESS_RECOVERED) {
+        library_rescan_load_blocked = true;
+        return;
+    }
+    library_rescan_migrating = metadata_db_migration_needed();
+    library_rescan_migration_cleanup = metadata_db_migration_cleanup_pending();
+    if (!metadata_db_migration_prepare()) {
+        library_operation_outcome = combine_load_outcomes(library_operation_outcome, METADATA_DB_LOAD_FAILED);
+        return;
+    }
     DB_LOG("DB", "db_open elapsed_ms=%llu songs=%lld rss_kb=%ld",
            (unsigned long long) (db_log_now_ms() - phase_started_ms), (long long) metadata_db_get_song_count(),
            db_log_rss_kb());
@@ -5897,7 +6050,7 @@ void library_scan_once(void) {
      * cleanly to zero files. */
     if (!sd_card_root_is_mounted()) {
         DB_LOG("DB", "discover_skipped reason=not_mounted rss_kb=%ld", db_log_rss_kb());
-        library_rescan_not_mounted = true;
+        library_operation_outcome = combine_load_outcomes(library_operation_outcome, METADATA_DB_LOAD_UNMOUNTED);
         return;
     }
 
@@ -5909,13 +6062,28 @@ void library_scan_once(void) {
                                      &skipped_count)) {
         DB_LOG("DB", "discover_failed elapsed_ms=%llu rss_kb=%ld",
                (unsigned long long) (db_log_now_ms() - phase_started_ms), db_log_rss_kb());
-        return; /* preserve the last known-good in-memory + on-disk library */
+        library_operation_outcome = combine_load_outcomes(library_operation_outcome, METADATA_DB_LOAD_FAILED);
+        return;
     }
     DB_LOG("DB", "discover_end files=%d skipped=%d elapsed_ms=%llu spool=%s rss_kb=%ld",
            discovered_count, skipped_count, (unsigned long long) (db_log_now_ms() - phase_started_ms),
            spool_path, db_log_rss_kb());
 
+    if (preserve_rebuild && discovered_count == 0) {
+        DB_LOG("DB", "rebuild_rejected reason=no_files");
+        metadata_db_abort_update();
+        library_operation_outcome = combine_load_outcomes(library_operation_outcome, METADATA_DB_LOAD_FAILED);
+        remove(spool_path);
+        return;
+    }
+
     library_scan_progress_total = discovered_count;
+    if (open_outcome == METADATA_DB_LOAD_SUCCESS_NORMAL && !preserve_rebuild &&
+        !library_rescan_migrating && skipped_count == 0 && discovered_count >= 0 &&
+        metadata_db_get_song_count() == (int64_t) discovered_count &&
+        library_scan_unchanged_fast_path(spool_path, discovered_count))
+        return;
+
     phase_started_ms = db_logging ? db_log_now_ms() : 0;
     metadata_db_begin_update();
     DB_LOG("DB", "update_begin files=%d rss_kb=%ld", discovered_count, db_log_rss_kb());
@@ -5924,6 +6092,8 @@ void library_scan_once(void) {
     if (!spool) {
         DB_LOG("DB", "spool_open_failed rss_kb=%ld path=%s", db_log_rss_kb(), spool_path);
         metadata_db_abort_update();
+        library_operation_outcome = combine_load_outcomes(library_operation_outcome, metadata_db_get_load_outcome());
+        library_operation_outcome = combine_load_outcomes(library_operation_outcome, METADATA_DB_LOAD_FAILED);
         remove(spool_path);
         return;
     }
@@ -5976,14 +6146,23 @@ void library_scan_once(void) {
     fclose(spool);
     remove(spool_path);
 
-    if (!complete) {
+    if (!complete || (library_rescan_migrating && !library_rescan_migration_cleanup && skipped_count > 0)) {
         DB_LOG("DB", "spool_read_incomplete done=%d total=%d rss_kb=%ld", done, discovered_count, db_log_rss_kb());
         metadata_db_abort_update();
+        library_operation_outcome = combine_load_outcomes(library_operation_outcome, metadata_db_get_load_outcome());
+        library_operation_outcome = combine_load_outcomes(library_operation_outcome, METADATA_DB_LOAD_FAILED);
         return;
     }
 
     DB_LOG("DB", "update_end skipped=%d", skipped_count);
     bool committed = metadata_db_end_update();
+    if (committed && library_rescan_migrating) committed = metadata_db_migration_finish();
+    if (committed && library_rescan_migrating) library_rescan_migration_cleanup = true;
+    metadata_db_load_outcome_t commit_outcome = metadata_db_get_load_outcome();
+    library_rescan_saved = committed && !preserve_rebuild;
+    library_operation_outcome = combine_load_outcomes(library_operation_outcome, commit_outcome);
+    if (!committed)
+        library_operation_outcome = combine_load_outcomes(library_operation_outcome, METADATA_DB_LOAD_FAILED);
     library_rescan_succeeded = committed;
     library_rescan_incomplete = committed && skipped_count > 0;
     if (!committed)
@@ -5993,33 +6172,26 @@ void library_scan_once(void) {
            (long long) metadata_db_get_song_count(), db_log_rss_kb());
 
     phase_started_ms = db_logging ? db_log_now_ms() : 0;
-    library_load_from_cache_only();
+    metadata_db_load_outcome_t reload_outcome = reload_library_cache();
+    library_rescan_saved = library_rescan_saved && reload_outcome == METADATA_DB_LOAD_SUCCESS_NORMAL;
+    library_operation_outcome = combine_load_outcomes(library_operation_outcome, reload_outcome);
     DB_LOG("DB", "reload_end songs=%lld elapsed_ms=%llu total_ms=%llu rss_kb=%ld",
            (long long) metadata_db_get_song_count(), (unsigned long long) (db_log_now_ms() - phase_started_ms),
            (unsigned long long) (db_log_now_ms() - scan_started_ms), db_log_rss_kb());
 }
 
-/* Boot-time equivalent of library_scan_once() that loads existing cached
- * metadata from the database without walking the filesystem or re-reading
- * file tags. The filesystem walk and tag extraction only run on explicit
- * user-triggered rescan. */
-void library_load_from_cache_only(void) {
+static metadata_db_load_outcome_t reload_library_cache(void) {
     library_scan_progress_done = 0;
     library_scan_progress_total = 0;
-
-    /* Close first so a remounted card is not served from a still-open
-     * handle against the previous (or empty unmounted) mount. */
-    metadata_db_close();
-    metadata_db_open();
+    return metadata_db_reload();
 }
 
-    /* Kicks off the persistent album-art warmer at boot (normally only
-     * started after a rescan or SD reinsert) so its first
-     * ALBUM_THUMBNAIL_CACHE_SIZE decoded thumbnails are already sitting in
-     * album_thumbnail_cache[] before the user ever opens Albums, in addition
-     * to its existing on-disk sized-BMP warming. No-op on a fresh/empty
-     * database, matching every other start_album_thumbnail_generation() call
-     * site's own guard. */
+/* Loads saved metadata without scanning and queues one UI report. */
+void library_load_from_cache_only(void) {
+    library_cache_load_outcome = reload_library_cache();
+    library_cache_load_pending = true;
+}
+
 /* Kicks off the persistent album-art warmer at boot (normally only started
  * after a rescan or SD reinsert) so its first ALBUM_THUMBNAIL_CACHE_SIZE
  * decoded thumbnails are already sitting in album_thumbnail_cache[] before

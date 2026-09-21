@@ -205,6 +205,7 @@ static void poll_dlna_control(void);
  * download_thread_func() (defined well before that point) needs to trigger
  * a rescan once its own batch download finishes. */
 void start_library_rescan(void);
+void start_library_auto_rescan(void);
 void poll_wifi_scan(void);
 void poll_wifi_connect(void);
 void poll_wifi_connect_saved(void);
@@ -1355,7 +1356,7 @@ void gui_stream_media_refresh(void) {
  * load(). */
 static void fresh_database_rescan_timer_cb(lv_timer_t * timer) {
     lv_timer_delete(timer);
-    start_library_rescan();
+    start_library_auto_rescan();
 }
 
 #define FRESH_DATABASE_RESCAN_DELAY_MS 500
@@ -1492,23 +1493,9 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #ifndef HOST_BUILD
     boot_checkpoint("library_load_from_cache_only done");
 #endif
-    /* Fresh SD card / first run: no database_idx.tcd* file exists yet, so
-     * library_load_from_cache_only() above just opened an empty in-memory
-     * library with nothing to show -- see metadata_db_had_no_saved_
-     * database()'s own comment for why this is distinct from a real,
-     * previously-scanned-but-genuinely-empty library (which must NOT
-     * trigger an unrequested rescan every boot). Deferred via a one-shot
-     * lv_timer, same pattern as fallback_font_schedule_deferred_load()
-     * just below in this same function, rather than calling start_library_
-     * rescan() synchronously here: that spawns a background thread which
-     * mutates live tagcache state (metadata_db_begin_update()/upsert per
-     * file) while gui_init() is still synchronously building every screen
-     * below this point, several of which activate their own paged DB
-     * queries as soon as they're built. Every existing start_library_
-     * rescan() call site already assumes the app has finished booting into
-     * its normal event-loop phase; this defers to that exact same phase
-     * instead of being the first caller to violate that assumption. */
-    if (metadata_db_had_no_saved_database() && gui_library_auto_rescan_enabled()) fresh_database_schedule_deferred_rescan();
+    /* A fresh database schedules its first scan after UI initialization. */
+    if ((metadata_db_get_load_outcome() == METADATA_DB_LOAD_SUCCESS_FRESH || metadata_db_migration_needed()) &&
+        gui_library_auto_rescan_enabled()) fresh_database_schedule_deferred_rescan();
     /* No whole-library load anywhere in this boot path, on purpose --
      * remote_control.c queries metadata_db.c directly (its own METADATA_DB_
      * GUARD) rather than needing a synced copy of the library, and each of

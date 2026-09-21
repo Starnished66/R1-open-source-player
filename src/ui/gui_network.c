@@ -94,6 +94,7 @@ extern player_settings_t current_settings;
 extern void nav_push(lv_obj_t * screen);
 extern void nav_pop(void);
 extern void nav_remove_stack_slot(int depth);
+extern void start_library_auto_rescan(void);
 extern void finalize_screen_navigation(lv_obj_t * screen);
 extern void show_error_toast(const char * msg);
 extern void show_info_toast(const char * msg);
@@ -2357,7 +2358,7 @@ void poll_usb_storage_hotplug(void) {
      * is picked up by the next ordinary rescan trigger or a manual one from
      * Settings. */
     if (storage_session_ended && !usb_dac_mode_active && gui_library_auto_rescan_enabled()) {
-        start_library_rescan();
+        start_library_auto_rescan();
     }
 
     if (!connected || !usb_storage_rebind_pending || usb_mode_switch_active) return;
@@ -2896,14 +2897,9 @@ void poll_import_web_stop(void) {
     import_web_stop_suppress_rescan = false;
     if (suppress_rescan) return;
 
-    /* No confirmation popup: same reasoning as poll_usb_storage_hotplug()'s
-     * own disconnect-edge trigger -- a foreground, blocking rescan (start_
-     * library_rescan()'s own "Updating music database..." busy screen)
-     * sidesteps a silent background scan contending with whatever the user
-     * does right after closing Web Import, at the cost of making the user
-     * wait through it explicitly if a genuinely large download means a lot
-     * changed. */
-    if (gui_library_auto_rescan_enabled()) start_library_rescan();
+    /* Automatically rescan with the "Updating music database..." busy
+     * screen, preserving recovered snapshots and libraries that failed to load. */
+    if (gui_library_auto_rescan_enabled()) start_library_auto_rescan();
 }
 
 /* Shared by import_wifi_back_cb() (user-initiated exit) and import_wifi_

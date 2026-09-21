@@ -11,9 +11,8 @@
  * lets library_scan_once() (gui.c) skip re-reading tags (metadata_read(),
  * one open+parse per file) for every file that hasn't changed since the
  * last scan. Backed by a POSIX port of Rockbox's tagcache (database_idx.tcd
- * plus per-tag database_N.tcd files), not SQLite. Large libraries keep
- * unique tags in RAM and mmap title/path files instead of interning every
- * string. */
+ * plus per-tag database_N.tcd files), with versioned generation-local browse
+ * indices. Queries seek into those files and copy only requested rows. */
 
 typedef struct {
     char title[128];
@@ -25,17 +24,38 @@ typedef struct {
     int32_t disc_number;  /* -1 when absent; 0 marks a legacy cache row */
 } cached_tags_t;
 
-/* Opens the on-disk tagcache at its fixed path (the SD-card root on
- * target, ./ on host). Safe to call more than once; a no-op if already
- * open. */
-void metadata_db_open(void);
+typedef enum {
+    METADATA_DB_LOAD_SUCCESS_NORMAL,
+    METADATA_DB_LOAD_SUCCESS_FRESH,
+    METADATA_DB_LOAD_SUCCESS_RECOVERED,
+    METADATA_DB_LOAD_FAILED,
+    METADATA_DB_LOAD_UNMOUNTED
+} metadata_db_load_outcome_t;
+
+/* Opens the on-disk tagcache at its fixed path (the SD-card root on target,
+ * ./ on host). If it is already open, returns its existing load outcome. */
+metadata_db_load_outcome_t metadata_db_open(void);
 void metadata_db_close(void);
-/* True when the most recent metadata_db_open() found no saved database at
- * all on the mounted music root (fresh SD card / first run) -- see
- * tagcache_had_no_saved_database()'s own comment. False if the SD card
- * wasn't mounted yet when metadata_db_open() ran (nothing was actually
- * checked that call), same as every other query against an unready DB. */
-bool metadata_db_had_no_saved_database(void);
+
+/* Reopens the database after an unmount or interrupted operation. A saved
+ * database that unexpectedly reloads as FRESH is rejected as a failed load. */
+metadata_db_load_outcome_t metadata_db_reload(void);
+
+/* Makes an explicit user-requested rebuild possible after a failed load.
+ * Returns true when a writable database is available for scanning. */
+bool metadata_db_prepare_rebuild(void);
+
+/* Returns the outcome of the most recent open, update, or abort.
+ * FRESH means no saved database files exist; a saved empty database is NORMAL. */
+metadata_db_load_outcome_t metadata_db_get_load_outcome(void);
+
+/* Migration extraction and replay run on the existing scan worker. The scan
+ * must commit successfully before finish replays and commits statistics. */
+bool metadata_db_migration_needed(void);
+bool metadata_db_migration_cleanup_pending(void);
+bool metadata_db_migration_prepare(void);
+bool metadata_db_migration_finish(void);
+void metadata_db_migration_cancel(void);
 
 /* Resolves the Artists row a track belongs to in one lock scope. Returns false
  * without waiting when the database is busy (a split rebuild holds the lock for
@@ -63,7 +83,7 @@ void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cache
 bool metadata_db_end_update(void);
 
 /* Ends an interrupted scan without committing. Reloads the last committed
- * database so in-RAM upserts from the aborted pass are discarded. */
+ * database so staged upserts from the aborted pass are discarded. */
 void metadata_db_abort_update(void);
 
 /* ---- Bounded, paged access to the tagcache -- Rockbox-style: the unique
@@ -231,6 +251,8 @@ int metadata_db_get_albums_page_filtered(const char * artist_or_album_artist_fil
 
 /* Exact Artist/Album-Artist drill-down variants. Unlike the legacy remote
  * helper above, these filter only the requested tag column. */
+int64_t metadata_db_get_album_for_group_offset(metadata_db_group_kind_t kind, const char *name,
+                                               const char *album, const char *album_artist);
 int64_t metadata_db_count_albums_for_group(metadata_db_group_kind_t kind, const char * name);
 int metadata_db_get_albums_for_group(metadata_db_group_kind_t kind, const char * name, int offset, int max_rows,
                                       group_row_t * out_rows);

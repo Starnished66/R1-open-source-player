@@ -5,7 +5,10 @@
 #include "subsonic_saved_servers.h"
 #include "tagcache.h"
 #include "fallback_font.h"
+#include "library_endian.h"
 
+#include <dirent.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 #include <pthread.h>
@@ -17,31 +20,194 @@
 #include <unistd.h>
 
 #ifdef HOST_BUILD
-  #define METADATA_DB_DIR "./.open_hiby_player"
+  #define METADATA_DB_ROOT "."
 #else
-  #define METADATA_DB_DIR "/data/mnt/sd_0/.open_hiby_player"
+  #define METADATA_DB_ROOT "/data/mnt/sd_0"
 #endif
+#define METADATA_DB_DIR METADATA_DB_ROOT "/.compas"
+#define METADATA_DB_OLD_DIR METADATA_DB_ROOT "/.open_hiby_player"
+#define MIGRATION_PENDING METADATA_DB_DIR "/migration.pending"
+#define MIGRATION_COMPLETE METADATA_DB_DIR "/migration.complete"
 
 static bool db_ready;
+static bool migration_pending;
+static bool migration_cleanup;
+static tagcache_stats_snapshot_t * migration_stats;
 static pthread_once_t metadata_db_mutex_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t metadata_db_mutex;
+static pthread_mutex_t metadata_update_mutex;
+static _Thread_local unsigned metadata_query_depth;
 
 static void metadata_db_mutex_init(void) {
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&metadata_db_mutex, &attr);
+    pthread_mutex_init(&metadata_update_mutex, &attr);
     pthread_mutexattr_destroy(&attr);
 }
 
 typedef struct { bool locked; } metadata_db_guard_t;
 static void metadata_db_guard_release(metadata_db_guard_t * guard) {
-    if (guard->locked) pthread_mutex_unlock(&metadata_db_mutex);
+    if (guard->locked) { metadata_query_depth--; pthread_mutex_unlock(&metadata_db_mutex); }
 }
 #define METADATA_DB_GUARD \
     pthread_once(&metadata_db_mutex_once, metadata_db_mutex_init); \
     pthread_mutex_lock(&metadata_db_mutex); \
+    metadata_query_depth++; \
     metadata_db_guard_t metadata_db_guard __attribute__((cleanup(metadata_db_guard_release))) = { true }
+
+static void metadata_update_guard_release(metadata_db_guard_t *guard) {
+    if (guard->locked) pthread_mutex_unlock(&metadata_update_mutex);
+}
+#define METADATA_UPDATE_GUARD \
+    pthread_once(&metadata_db_mutex_once, metadata_db_mutex_init); \
+    pthread_mutex_lock(&metadata_update_mutex); \
+    metadata_db_guard_t metadata_update_guard __attribute__((cleanup(metadata_update_guard_release))) = { true }
+
+static void metadata_query_unlock(void) {
+    for (unsigned i = 0; i < metadata_query_depth; i++) pthread_mutex_unlock(&metadata_db_mutex);
+}
+static void metadata_query_lock(void) {
+    for (unsigned i = 0; i < metadata_query_depth; i++) pthread_mutex_lock(&metadata_db_mutex);
+}
+
+static bool database_file_name(const char * name) {
+    return strcmp(name, "tagcache.gen") == 0 ||
+           (strncmp(name, "database_", 9) == 0 && strstr(name + 9, ".tcd") != NULL);
+}
+
+/* Returns -1 on an inspection error, 0 when absent, and 1 when present. */
+static int database_files_present(const char * dir) {
+    DIR * d = opendir(dir);
+    if (!d) return errno == ENOENT ? 0 : -1;
+    int result = 0;
+    for (;;) {
+        errno = 0;
+        struct dirent * de = readdir(d);
+        if (!de) {
+            if (errno) result = -1;
+            break;
+        }
+        if (database_file_name(de->d_name)) result = 1;
+    }
+    if (closedir(d) != 0) result = -1;
+    return result;
+}
+
+static int migration_marker_present(const char * path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return errno == ENOENT ? 0 : -1;
+    return S_ISREG(st.st_mode) ? 1 : -1;
+}
+
+static bool migration_detect(void) {
+    migration_pending = migration_cleanup = false;
+    int complete = migration_marker_present(MIGRATION_COMPLETE);
+    int pending = migration_marker_present(MIGRATION_PENDING);
+    if (complete < 0 || pending < 0) return false;
+    if (complete) {
+        int old = database_files_present(METADATA_DB_OLD_DIR);
+        if (old < 0) return false;
+        migration_cleanup = old != 0 || pending != 0;
+        return true;
+    }
+    if (pending) {
+        migration_pending = true;
+        return true;
+    }
+    int current = database_files_present(METADATA_DB_DIR);
+    if (current < 0) return false;
+    if (current) return true;
+    int old = database_files_present(METADATA_DB_OLD_DIR);
+    if (old < 0) return false;
+    migration_pending = old != 0;
+    return true;
+}
+
+static bool migration_write_marker(const char * path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        if (errno != EEXIST || migration_marker_present(path) != 1) return false;
+        fd = open(path, O_RDONLY);
+        if (fd < 0) return false;
+    }
+    bool ok = fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    return ok && library_fsync_dir(METADATA_DB_DIR) && library_fsync_dir(METADATA_DB_ROOT);
+}
+
+static bool migration_delete_old_files(void) {
+    DIR * d = opendir(METADATA_DB_OLD_DIR);
+    if (!d) return errno == ENOENT;
+    bool ok = true;
+    for (;;) {
+        errno = 0;
+        struct dirent * de = readdir(d);
+        if (!de) {
+            if (errno) ok = false;
+            break;
+        }
+        if (!database_file_name(de->d_name)) continue;
+        if (unlinkat(dirfd(d), de->d_name, 0) != 0 && errno != ENOENT) ok = false;
+    }
+    if (closedir(d) != 0) ok = false;
+    return library_fsync_dir(METADATA_DB_OLD_DIR) && ok;
+}
+
+bool metadata_db_migration_needed(void) {
+    METADATA_DB_GUARD;
+    return migration_pending || migration_cleanup;
+}
+
+bool metadata_db_migration_cleanup_pending(void) {
+    METADATA_DB_GUARD;
+    return migration_cleanup;
+}
+
+void metadata_db_migration_cancel(void) {
+    METADATA_UPDATE_GUARD;
+    METADATA_DB_GUARD;
+    tagcache_free_stats(migration_stats);
+    migration_stats = NULL;
+}
+
+bool metadata_db_migration_prepare(void) {
+    METADATA_UPDATE_GUARD;
+    METADATA_DB_GUARD;
+    metadata_db_migration_cancel();
+    if (!db_ready) return false;
+    if (!migration_pending) return true;
+    if (!tagcache_extract_stats(METADATA_DB_OLD_DIR, &migration_stats)) return false;
+    if (!migration_write_marker(MIGRATION_PENDING)) {
+        metadata_db_migration_cancel();
+        return false;
+    }
+    return true;
+}
+
+bool metadata_db_migration_finish(void) {
+    METADATA_UPDATE_GUARD;
+    METADATA_DB_GUARD;
+    if (!db_ready || metadata_db_get_load_outcome() != METADATA_DB_LOAD_SUCCESS_NORMAL) return false;
+    if (migration_pending) {
+        if (!migration_stats || !tagcache_replay_stats(migration_stats)) return false;
+        if (!metadata_db_end_update() || metadata_db_get_load_outcome() != METADATA_DB_LOAD_SUCCESS_NORMAL) return false;
+        if (!library_fsync_dir(METADATA_DB_DIR) || !library_fsync_dir(METADATA_DB_ROOT) ||
+            !migration_write_marker(MIGRATION_COMPLETE)) return false;
+        migration_pending = false;
+        migration_cleanup = true;
+        metadata_db_migration_cancel();
+    }
+    if (migration_cleanup) {
+        if (!library_fsync_dir(METADATA_DB_DIR) || !library_fsync_dir(METADATA_DB_ROOT) ||
+            !migration_write_marker(MIGRATION_COMPLETE)) return false;
+        if (unlink(MIGRATION_PENDING) != 0 && errno != ENOENT) return false;
+        if (!library_fsync_dir(METADATA_DB_DIR)) return false;
+        migration_cleanup = !migration_delete_old_files();
+    }
+    return true;
+}
 
 #ifndef HOST_BUILD
 static bool music_root_is_mounted(void) {
@@ -65,9 +231,10 @@ static int32_t clamp_i32(int64_t v) {
 }
 
 typedef struct {
-    const char * path;
+    int32_t id;
     int32_t count;
     int32_t last_played;
+    int32_t ordinal;
 } played_hit_t;
 
 static int cmp_hit_played(const void * a, const void * b) {
@@ -75,7 +242,33 @@ static int cmp_hit_played(const void * a, const void * b) {
     const played_hit_t * hb = b;
     if (ha->count != hb->count) return ha->count < hb->count ? 1 : -1;
     if (ha->last_played != hb->last_played) return ha->last_played < hb->last_played ? 1 : -1;
+    /* Equal play counts and timestamps are ordered by ascending stable song ID. */
+    if (ha->ordinal != hb->ordinal) return ha->ordinal < hb->ordinal ? -1 : 1;
     return 0;
+}
+
+static void played_hit_heap_sift_up(played_hit_t * heap, int index) {
+    while (index > 0) {
+        int parent = (index - 1) / 2;
+        if (cmp_hit_played(&heap[parent], &heap[index]) >= 0) break;
+        played_hit_t swap = heap[parent];
+        heap[parent] = heap[index];
+        heap[index] = swap;
+        index = parent;
+    }
+}
+
+static void played_hit_heap_sift_down(played_hit_t * heap, int count, int index) {
+    for (;;) {
+        if (count < 2 || index > (count - 2) / 2) return;
+        int child = index * 2 + 1;
+        if (child + 1 < count && cmp_hit_played(&heap[child], &heap[child + 1]) < 0) child++;
+        if (cmp_hit_played(&heap[index], &heap[child]) >= 0) return;
+        played_hit_t swap = heap[index];
+        heap[index] = heap[child];
+        heap[child] = swap;
+        index = child;
+    }
 }
 
 static void copy_song(const tagcache_song_t * src, song_row_t * dst) {
@@ -106,96 +299,81 @@ static int az_kind_to_group(metadata_db_az_kind_t kind) {
     }
 }
 
-typedef struct pair_node {
-    const char * a;
-    const char * b;
-    struct pair_node * next;
-} pair_node_t;
+static metadata_db_load_outcome_t last_outcome = METADATA_DB_LOAD_UNMOUNTED;
 
-static bool pair_set_add(pair_node_t ** buckets, int bucket_n, const char * a, const char * b) {
-    uint32_t h = 2166136261u;
-    const char * s = a ? a : "";
-    while (*s) {
-        h ^= (unsigned char) *s++;
-        h *= 16777619u;
+static metadata_db_load_outcome_t capture_tagcache_outcome(bool update_ready) {
+    switch (tagcache_get_load_outcome()) {
+        case TAGCACHE_LOAD_SUCCESS_NORMAL: last_outcome = METADATA_DB_LOAD_SUCCESS_NORMAL; break;
+        case TAGCACHE_LOAD_SUCCESS_FRESH: last_outcome = METADATA_DB_LOAD_SUCCESS_FRESH; break;
+        case TAGCACHE_LOAD_SUCCESS_RECOVERED: last_outcome = METADATA_DB_LOAD_SUCCESS_RECOVERED; break;
+        case TAGCACHE_LOAD_FAILED: last_outcome = METADATA_DB_LOAD_FAILED; break;
     }
-    s = b ? b : "";
-    while (*s) {
-        h ^= (unsigned char) *s++;
-        h *= 16777619u;
-    }
-    int slot = (int) (h & (uint32_t) (bucket_n - 1));
-    for (pair_node_t * it = buckets[slot]; it; it = it->next) {
-        if (it->a == a && it->b == b) return false;
-    }
-    pair_node_t * node = malloc(sizeof(*node));
-    if (!node) return false;
-    node->a = a;
-    node->b = b;
-    node->next = buckets[slot];
-    buckets[slot] = node;
-    return true;
+    if (update_ready) db_ready = last_outcome != METADATA_DB_LOAD_FAILED;
+    return last_outcome;
 }
 
-static bool pair_set_has(pair_node_t ** buckets, int bucket_n, const char * a, const char * b) {
-    uint32_t h = 2166136261u;
-    const char * s = a ? a : "";
-    while (*s) {
-        h ^= (unsigned char) *s++;
-        h *= 16777619u;
-    }
-    s = b ? b : "";
-    while (*s) {
-        h ^= (unsigned char) *s++;
-        h *= 16777619u;
-    }
-    int slot = (int) (h & (uint32_t) (bucket_n - 1));
-    for (pair_node_t * it = buckets[slot]; it; it = it->next) {
-        if (it->a == a && it->b == b) return true;
-    }
-    return false;
-}
-
-static void pair_set_free(pair_node_t ** buckets, int bucket_n) {
-    for (int i = 0; i < bucket_n; i++) {
-        pair_node_t * it = buckets[i];
-        while (it) {
-            pair_node_t * n = it->next;
-            free(it);
-            it = n;
-        }
-    }
-}
-
-static bool song_matches_filters(const tagcache_song_t * song, const char * query, const char * artist_filter,
-                                 const char * album_artist_filter, const char * album_filter) {
-    if (query && query[0]) {
-        if (!tagcache_ascii_casestr(song->title, query) && !tagcache_ascii_casestr(song->artist, query)) return false;
-    }
-    if (artist_filter && artist_filter[0] && !tagcache_artist_matches(song->artist, artist_filter)) return false;
-    if (album_artist_filter && album_artist_filter[0] &&
-        tagcache_cmp_ascii(song->album_artist, album_artist_filter) != 0)
-        return false;
-    if (album_filter && album_filter[0] && tagcache_cmp_ascii(song->album, album_filter) != 0) return false;
-    return true;
-}
-
-void metadata_db_open(void) {
+metadata_db_load_outcome_t metadata_db_open(void) {
+    METADATA_UPDATE_GUARD;
     METADATA_DB_GUARD;
-    if (db_ready) return;
+    if (db_ready) {
+        return last_outcome;
+    }
 
 #ifndef HOST_BUILD
-    if (!music_root_is_mounted()) return;
+    if (!music_root_is_mounted()) {
+        last_outcome = METADATA_DB_LOAD_UNMOUNTED;
+        return last_outcome;
+    }
 #endif
 
-    mkdir(METADATA_DB_DIR, 0755);
-    if (!tagcache_open(METADATA_DB_DIR)) return;
-    db_ready = true;
+    struct stat directory_stat;
+    if ((stat(METADATA_DB_DIR, &directory_stat) != 0 &&
+         (errno != ENOENT || mkdir(METADATA_DB_DIR, 0755) != 0)) || !migration_detect()) {
+        last_outcome = METADATA_DB_LOAD_FAILED;
+        return last_outcome;
+    }
+    tagcache_open(METADATA_DB_DIR);
+    return capture_tagcache_outcome(true);
 }
 
-bool metadata_db_had_no_saved_database(void) {
+metadata_db_load_outcome_t metadata_db_reload(void) {
+    METADATA_UPDATE_GUARD;
     METADATA_DB_GUARD;
-    return db_ready && tagcache_had_no_saved_database();
+    bool had_saved_db = db_ready &&
+                        (last_outcome == METADATA_DB_LOAD_SUCCESS_NORMAL ||
+                         last_outcome == METADATA_DB_LOAD_SUCCESS_RECOVERED);
+    metadata_db_close();
+    metadata_db_load_outcome_t outcome = metadata_db_open();
+    if (had_saved_db && outcome == METADATA_DB_LOAD_SUCCESS_FRESH) {
+        metadata_db_close();
+        last_outcome = METADATA_DB_LOAD_FAILED;
+        db_ready = false;
+        return last_outcome;
+    }
+    return outcome;
+}
+
+bool metadata_db_prepare_rebuild(void) {
+    METADATA_UPDATE_GUARD;
+    METADATA_DB_GUARD;
+    metadata_db_load_outcome_t outcome = metadata_db_open();
+    if (outcome == METADATA_DB_LOAD_SUCCESS_NORMAL ||
+        outcome == METADATA_DB_LOAD_SUCCESS_FRESH ||
+        outcome == METADATA_DB_LOAD_SUCCESS_RECOVERED)
+        return db_ready;
+    if (outcome == METADATA_DB_LOAD_UNMOUNTED) return false;
+
+    if (!migration_detect()) return false;
+    mkdir(METADATA_DB_DIR, 0755);
+    bool prepared = tagcache_open_for_rebuild(METADATA_DB_DIR);
+    capture_tagcache_outcome(false);
+    db_ready = prepared;
+    return db_ready;
+}
+
+metadata_db_load_outcome_t metadata_db_get_load_outcome(void) {
+    METADATA_DB_GUARD;
+    return last_outcome;
 }
 
 /* Re-files every track under a new delimiter set. Held under the same guard as
@@ -228,20 +406,26 @@ bool metadata_db_try_artist_row(const char * raw_artist, int64_t * out_offset) {
 
 
 void metadata_db_close(void) {
+    METADATA_UPDATE_GUARD;
     METADATA_DB_GUARD;
+    metadata_db_migration_cancel();
+    migration_pending = migration_cleanup = false;
     tagcache_close();
     db_ready = false;
+    last_outcome = METADATA_DB_LOAD_UNMOUNTED;
     path_cache_drop();
     remote_state_drop();
 }
 
 void metadata_db_begin_update(void) {
+    METADATA_UPDATE_GUARD;
     METADATA_DB_GUARD;
     if (!db_ready) return;
-    tagcache_begin_update();
+    tagcache_begin_update_with_lock(metadata_query_unlock, metadata_query_lock);
 }
 
 bool metadata_db_get(const char * path, int64_t mtime, int64_t size, cached_tags_t * out) {
+    METADATA_UPDATE_GUARD;
     METADATA_DB_GUARD;
     if (!db_ready) return false;
     tagcache_song_t song;
@@ -261,6 +445,7 @@ bool metadata_db_get(const char * path, int64_t mtime, int64_t size, cached_tags
 }
 
 void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cached_tags_t * tags) {
+    METADATA_UPDATE_GUARD;
     METADATA_DB_GUARD;
     if (!db_ready || !tags) return;
     tagcache_upsert(path, clamp_i32(mtime), clamp_i32(size), tags->title, tags->artist, tags->album, tags->album_artist,
@@ -271,15 +456,20 @@ void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cache
 }
 
 bool metadata_db_end_update(void) {
+    METADATA_UPDATE_GUARD;
     METADATA_DB_GUARD;
     if (!db_ready) return false;
-    return tagcache_end_update();
+    bool ok = tagcache_end_update_with_lock(metadata_query_unlock, metadata_query_lock);
+    capture_tagcache_outcome(true);
+    return ok;
 }
 
 void metadata_db_abort_update(void) {
+    METADATA_UPDATE_GUARD;
     METADATA_DB_GUARD;
     if (!db_ready) return;
     tagcache_abort_update();
+    capture_tagcache_outcome(true);
 }
 
 int64_t metadata_db_get_song_count(void) {
@@ -467,41 +657,39 @@ void metadata_db_get_az_table(metadata_db_az_kind_t kind, int out_table[27]) {
     for (int i = 0; i < 27; i++) out_table[i] = -1;
     if (!db_ready) return;
 
-    bool seen[26] = { false };
-    int position = 0;
-    int gkind = az_kind_to_group(kind);
-    if (gkind >= 0) {
-        int n = tagcache_group_count(gkind);
-        for (int i = 0; i < n; i++) {
-            tagcache_group_t g;
-            if (!tagcache_group_at(gkind, i, &g)) continue;
-            const char * text = g.name ? g.name : "";
-            if (text[0]) {
-                unsigned char c = (unsigned char) text[0];
-                if (c >= 'a' && c <= 'z') c = (unsigned char) (c - ('a' - 'A'));
-                if (c >= 'A' && c <= 'Z' && !seen[c - 'A']) {
-                    seen[c - 'A'] = true;
-                    out_table[c - 'A'] = position;
-                }
+    int group_kind = az_kind_to_group(kind);
+    int count = group_kind >= 0 ? tagcache_group_count(group_kind) : tagcache_live_count();
+    for (int letter = 0; letter < 26; letter++) {
+        int lo = 0, hi = count;
+        unsigned char target = (unsigned char)('a' + letter);
+        while (lo < hi) {
+            int mid = lo + (hi - lo) / 2;
+            unsigned char first;
+            if (group_kind >= 0) {
+                tagcache_group_t group;
+                if (!tagcache_group_at(group_kind, mid, &group)) break;
+                first = (unsigned char)group.name[0];
+            } else {
+                tagcache_song_t song;
+                if (!tagcache_song_fields_at_title_rank(mid, TAGCACHE_FIELD_TITLE, &song)) break;
+                first = (unsigned char)song.title[0];
             }
-            position++;
+            if (first >= 'A' && first <= 'Z') first += 'a' - 'A';
+            if (first < target) lo = mid + 1; else hi = mid;
         }
-    } else {
-        int32_t live = tagcache_live_count();
-        for (int32_t i = 0; i < live; i++) {
+        if (lo >= count) continue;
+        unsigned char first;
+        if (group_kind >= 0) {
+            tagcache_group_t group;
+            if (!tagcache_group_at(group_kind, lo, &group)) continue;
+            first = (unsigned char)group.name[0];
+        } else {
             tagcache_song_t song;
-            if (!tagcache_song_at_title_rank(i, &song)) continue;
-            const char * text = song.title ? song.title : "";
-            if (text[0]) {
-                unsigned char c = (unsigned char) text[0];
-                if (c >= 'a' && c <= 'z') c = (unsigned char) (c - ('a' - 'A'));
-                if (c >= 'A' && c <= 'Z' && !seen[c - 'A']) {
-                    seen[c - 'A'] = true;
-                    out_table[c - 'A'] = position;
-                }
-            }
-            position++;
+            if (!tagcache_song_fields_at_title_rank(lo, TAGCACHE_FIELD_TITLE, &song)) continue;
+            first = (unsigned char)song.title[0];
         }
+        if (first >= 'A' && first <= 'Z') first += 'a' - 'A';
+        if (first == target) out_table[letter] = lo;
     }
     for (int i = 24; i >= 0; i--) {
         if (out_table[i] == -1) out_table[i] = out_table[i + 1];
@@ -509,34 +697,33 @@ void metadata_db_get_az_table(metadata_db_az_kind_t kind, int out_table[27]) {
     out_table[26] = out_table[0] > 0 ? 0 : -1;
 }
 
-int metadata_db_search_names(metadata_db_az_kind_t kind, const char * needle, int max_rows,
-                              metadata_db_search_hit_t * out_hits) {
+int metadata_db_search_names(metadata_db_az_kind_t kind, const char *needle, int max_rows,
+                             metadata_db_search_hit_t *out_hits) {
     METADATA_DB_GUARD;
     if (!db_ready || max_rows <= 0 || !needle || !needle[0]) return 0;
-    int w = 0;
-    int gkind = az_kind_to_group(kind);
-    if (gkind >= 0) {
-        int n = tagcache_group_count(gkind);
-        for (int i = 0; i < n && w < max_rows; i++) {
-            tagcache_group_t g;
-            if (!tagcache_group_at(gkind, i, &g)) continue;
-            if (!tagcache_ascii_casestr(g.name, needle)) continue;
-            snprintf(out_hits[w].label, sizeof(out_hits[w].label), "%s", g.name);
-            out_hits[w].offset = i;
-            w++;
+    int group_kind = az_kind_to_group(kind), w = 0;
+    tagcache_query_t query;
+    tagcache_query_begin(&query, group_kind >= 0 ? group_kind : TAGCACHE_QUERY_TITLES,
+                         needle, NULL, NULL, NULL);
+    int32_t rank;
+    while (w < max_rows && tagcache_query_next(&query, &rank)) {
+        if (group_kind >= 0) {
+            tagcache_group_t group;
+            if (!tagcache_group_at(group_kind, rank, &group)) continue;
+            snprintf(out_hits[w].label, sizeof(out_hits[w].label), "%s", group.name);
+        } else {
+            tagcache_song_t song;
+            if (!tagcache_song_fields_at_title_rank(rank, TAGCACHE_FIELD_TITLE, &song)) continue;
+            /* Display truncation follows the public song-row title size. */
+            song_row_t row = {0};
+            snprintf(row.tags.title, sizeof(row.tags.title), "%s", song.title);
+            if (!row.tags.title[0]) {
+                if (!tagcache_song_fields_by_id(song.id, TAGCACHE_FIELD_PATH, &song)) continue;
+                snprintf(row.path, sizeof(row.path), "%s", song.path);
+            }
+            metadata_db_song_display_title(&row, out_hits[w].label, sizeof(out_hits[w].label));
         }
-        return w;
-    }
-    int32_t live = tagcache_live_count();
-    for (int32_t i = 0; i < live && w < max_rows; i++) {
-        tagcache_song_t song;
-        if (!tagcache_song_at_title_rank(i, &song)) continue;
-        if (!tagcache_ascii_casestr(song.title, needle)) continue;
-        song_row_t row = { 0 };
-        copy_song(&song, &row);
-        metadata_db_song_display_title(&row, out_hits[w].label, sizeof(out_hits[w].label));
-        out_hits[w].offset = (int) i;
-        w++;
+        out_hits[w++].offset = rank;
     }
     return w;
 }
@@ -551,169 +738,85 @@ void metadata_db_song_display_title(const song_row_t * row, char * out, size_t o
     utf8_truncate_safe(out, slash ? slash + 1 : row->path, out_size);
 }
 
-int metadata_db_search_songs(const char * query_text, song_row_t * out_rows, int max_rows) {
-    METADATA_DB_GUARD;
-    if (!db_ready || max_rows <= 0 || !query_text || !query_text[0]) return 0;
-    int32_t live = tagcache_live_count();
-    int w = 0;
-    for (int32_t i = 0; i < live && w < max_rows; i++) {
-        tagcache_song_t song;
-        if (!tagcache_song_at_title_rank(i, &song)) continue;
-        if (!tagcache_ascii_casestr(song.title, query_text) && !tagcache_ascii_casestr(song.artist, query_text)) continue;
-        copy_song(&song, &out_rows[w++]);
-    }
-    return w;
+int metadata_db_search_songs(const char *query_text, song_row_t *out_rows, int max_rows) {
+    if (!query_text || !query_text[0]) return 0;
+    return metadata_db_get_songs_filtered_page(query_text, NULL, NULL, NULL, 0, max_rows, out_rows);
 }
 
-int64_t metadata_db_count_songs_filtered(const char * query, const char * artist_filter,
-                                          const char * album_artist_filter, const char * album_filter) {
+int64_t metadata_db_count_songs_filtered(const char *needle, const char *artist,
+                                        const char *album_artist, const char *album) {
     METADATA_DB_GUARD;
     if (!db_ready) return 0;
-    int32_t live = tagcache_live_count();
-    int64_t n = 0;
-    for (int32_t i = 0; i < live; i++) {
-        tagcache_song_t song;
-        if (!tagcache_song_at_title_rank(i, &song)) continue;
-        if (song_matches_filters(&song, query, artist_filter, album_artist_filter, album_filter)) n++;
-    }
-    return n;
+    tagcache_query_t query;
+    tagcache_query_begin(&query, TAGCACHE_QUERY_SONGS, needle, artist, album_artist, album);
+    return tagcache_query_count(&query);
 }
 
-int metadata_db_get_songs_filtered_page(const char * query, const char * artist_filter,
-                                         const char * album_artist_filter, const char * album_filter, int offset,
-                                         int max_rows, song_row_t * out_rows) {
+int metadata_db_get_songs_filtered_page(const char *needle, const char *artist,
+                                        const char *album_artist, const char *album, int offset,
+                                        int max_rows, song_row_t *out_rows) {
     METADATA_DB_GUARD;
     if (!db_ready || max_rows <= 0) return 0;
-    if (offset < 0) offset = 0;
-    int32_t live = tagcache_live_count();
-    bool unfiltered = !(query && query[0]) && !(artist_filter && artist_filter[0]) &&
-                      !(album_artist_filter && album_artist_filter[0]) && !(album_filter && album_filter[0]);
+    tagcache_query_t query;
+    tagcache_query_begin(&query, TAGCACHE_QUERY_SONGS, needle, artist, album_artist, album);
+    tagcache_query_skip(&query, offset);
     int w = 0;
-    if (unfiltered) {
-        for (int32_t i = offset; i < live && w < max_rows; i++) {
-            tagcache_song_t song;
-            if (!tagcache_song_at_title_rank(i, &song)) continue;
-            copy_song(&song, &out_rows[w++]);
-        }
-        return w;
-    }
-    int skipped = 0;
-    for (int32_t i = 0; i < live && w < max_rows; i++) {
+    int32_t rank;
+    while (w < max_rows && tagcache_query_next(&query, &rank)) {
         tagcache_song_t song;
-        if (!tagcache_song_at_title_rank(i, &song)) continue;
-        if (!song_matches_filters(&song, query, artist_filter, album_artist_filter, album_filter)) continue;
-        if (skipped < offset) {
-            skipped++;
-            continue;
-        }
-        copy_song(&song, &out_rows[w++]);
+        if (tagcache_song_at_title_rank(rank, &song)) copy_song(&song, &out_rows[w++]);
     }
     return w;
 }
 
-int metadata_db_get_albums_page_filtered(const char * artist_or_album_artist_filter, int offset, int max_rows,
-                                          group_row_t * out_rows) {
+int metadata_db_get_albums_page_filtered(const char *filter, int offset, int max_rows,
+                                         group_row_t *out_rows) {
     METADATA_DB_GUARD;
     if (!db_ready || max_rows <= 0) return 0;
-    if (offset < 0) offset = 0;
-    bool have_filter = artist_or_album_artist_filter && artist_or_album_artist_filter[0];
-    const int buckets = 4096;
-    pair_node_t ** set = NULL;
-    if (have_filter) {
-        set = calloc((size_t) buckets, sizeof(*set));
-        if (!set) return 0;
-        int32_t slots = tagcache_slot_count();
-        for (int32_t s = 0; s < slots; s++) {
-            tagcache_song_t song;
-            if (!tagcache_song_at_slot(s, &song)) continue;
-            if (!tagcache_artist_matches(song.artist, artist_or_album_artist_filter) &&
-                tagcache_cmp_ascii(song.album_artist, artist_or_album_artist_filter) != 0)
-                continue;
-            pair_set_add(set, buckets, song.album, song.album_artist);
-        }
-    }
-    int n = tagcache_group_count(TAGCACHE_GROUP_ALBUM);
-    int skipped = 0;
-    int w = 0;
-    for (int i = 0; i < n && w < max_rows; i++) {
-        tagcache_group_t g;
-        if (!tagcache_group_at(TAGCACHE_GROUP_ALBUM, i, &g)) continue;
-        if (have_filter && !pair_set_has(set, buckets, g.name, g.album_artist)) continue;
-        if (skipped < offset) {
-            skipped++;
-            continue;
-        }
-        copy_group(&g, &out_rows[w++]);
-    }
-    if (set) {
-        pair_set_free(set, buckets);
-        free(set);
+    if (!filter || !filter[0]) return metadata_db_get_groups_page(METADATA_DB_GROUP_ALBUM, offset, max_rows, out_rows);
+    int a = 0, b = 0, skipped = 0, w = 0;
+    int left = tagcache_group_album_at(TAGCACHE_GROUP_ARTIST, filter, a);
+    int right = tagcache_group_album_at(TAGCACHE_GROUP_ALBUM_ARTIST, filter, b);
+    while ((left >= 0 || right >= 0) && w < max_rows) {
+        int rank = left < 0 ? right : right < 0 ? left : left < right ? left : right;
+        if (left == rank) left = tagcache_group_album_at(TAGCACHE_GROUP_ARTIST, filter, ++a);
+        if (right == rank) right = tagcache_group_album_at(TAGCACHE_GROUP_ALBUM_ARTIST, filter, ++b);
+        if (skipped++ < offset) continue;
+        tagcache_group_t group;
+        if (tagcache_group_at(TAGCACHE_GROUP_ALBUM, rank, &group)) copy_group(&group, &out_rows[w++]);
     }
     return w;
 }
 
-static pair_node_t ** build_group_album_set(metadata_db_group_kind_t kind, const char * name, int buckets) {
-    pair_node_t ** set = calloc((size_t) buckets, sizeof(*set));
-    if (!set) return NULL;
-    int32_t slots = tagcache_slot_count();
-    for (int32_t s = 0; s < slots; s++) {
-        tagcache_song_t song;
-        if (!tagcache_song_at_slot(s, &song)) continue;
-        /* Artist groups match per split name, so a track tagged "A;B" shows
-         * its albums under both. Album artist is never split. */
-        bool match = kind == METADATA_DB_GROUP_ARTIST
-                         ? tagcache_artist_matches(song.artist, name)
-                         : tagcache_cmp_ascii(song.album_artist, name) == 0;
-        if (!match) continue;
-        pair_set_add(set, buckets, song.album, song.album_artist);
-    }
-    return set;
-}
-
-int64_t metadata_db_count_albums_for_group(metadata_db_group_kind_t kind, const char * name) {
+int64_t metadata_db_count_albums_for_group(metadata_db_group_kind_t kind, const char *name) {
     METADATA_DB_GUARD;
     if (!db_ready || !name || (kind != METADATA_DB_GROUP_ARTIST && kind != METADATA_DB_GROUP_ALBUM_ARTIST)) return 0;
-    const int buckets = 4096;
-    pair_node_t ** set = build_group_album_set(kind, name, buckets);
-    if (!set) return 0;
-    int n = tagcache_group_count(TAGCACHE_GROUP_ALBUM);
-    int64_t count = 0;
-    for (int i = 0; i < n; i++) {
-        tagcache_group_t g;
-        if (!tagcache_group_at(TAGCACHE_GROUP_ALBUM, i, &g)) continue;
-        if (pair_set_has(set, buckets, g.name, g.album_artist)) count++;
-    }
-    pair_set_free(set, buckets);
-    free(set);
-    return count;
+    return tagcache_group_album_count(kind == METADATA_DB_GROUP_ARTIST ? TAGCACHE_GROUP_ARTIST : TAGCACHE_GROUP_ALBUM_ARTIST, name);
 }
 
-int metadata_db_get_albums_for_group(metadata_db_group_kind_t kind, const char * name, int offset, int max_rows,
-                                      group_row_t * out_rows) {
+int metadata_db_get_albums_for_group(metadata_db_group_kind_t kind, const char *name, int offset, int max_rows,
+                                    group_row_t *out_rows) {
     METADATA_DB_GUARD;
     if (!db_ready || !name || max_rows <= 0 ||
-        (kind != METADATA_DB_GROUP_ARTIST && kind != METADATA_DB_GROUP_ALBUM_ARTIST))
-        return 0;
+        (kind != METADATA_DB_GROUP_ARTIST && kind != METADATA_DB_GROUP_ALBUM_ARTIST)) return 0;
     if (offset < 0) offset = 0;
-    const int buckets = 4096;
-    pair_node_t ** set = build_group_album_set(kind, name, buckets);
-    if (!set) return 0;
-    int n = tagcache_group_count(TAGCACHE_GROUP_ALBUM);
-    int skipped = 0;
+    int tc_kind = kind == METADATA_DB_GROUP_ARTIST ? TAGCACHE_GROUP_ARTIST : TAGCACHE_GROUP_ALBUM_ARTIST;
     int w = 0;
-    for (int i = 0; i < n && w < max_rows; i++) {
-        tagcache_group_t g;
-        if (!tagcache_group_at(TAGCACHE_GROUP_ALBUM, i, &g)) continue;
-        if (!pair_set_has(set, buckets, g.name, g.album_artist)) continue;
-        if (skipped < offset) {
-            skipped++;
-            continue;
-        }
-        copy_group(&g, &out_rows[w++]);
+    for (int i = offset; w < max_rows; i++) {
+        int rank = tagcache_group_album_at(tc_kind, name, i);
+        if (rank < 0) break;
+        tagcache_group_t group;
+        if (tagcache_group_at(TAGCACHE_GROUP_ALBUM, rank, &group)) copy_group(&group, &out_rows[w++]);
     }
-    pair_set_free(set, buckets);
-    free(set);
     return w;
+}
+
+int64_t metadata_db_get_album_for_group_offset(metadata_db_group_kind_t kind, const char *name,
+                                               const char *album, const char *album_artist) {
+    METADATA_DB_GUARD;
+    if (!db_ready || !name || (kind != METADATA_DB_GROUP_ARTIST && kind != METADATA_DB_GROUP_ALBUM_ARTIST)) return -1;
+    return tagcache_group_album_offset(kind == METADATA_DB_GROUP_ARTIST ? TAGCACHE_GROUP_ARTIST : TAGCACHE_GROUP_ALBUM_ARTIST,
+                                      name, album, album_artist);
 }
 
 bool metadata_db_song_favorite_is_set(const char * path) {
@@ -744,7 +847,7 @@ void metadata_db_load_favorite_songs(char *** out_paths, int * out_count) {
     bool ok = true;
     for (int32_t i = 0; i < slots; i++) {
         tagcache_song_t song;
-        if (!tagcache_song_at_slot(i, &song)) continue;
+        if (!tagcache_song_fields_by_id(i + 1, 0, &song)) continue;
         if (song.rating == 0) continue;
         if (n >= cap) {
             int next = cap ? cap * 2 : 16;
@@ -755,6 +858,10 @@ void metadata_db_load_favorite_songs(char *** out_paths, int * out_count) {
             }
             paths = p;
             cap = next;
+        }
+        if (!tagcache_song_fields_by_id(i + 1, TAGCACHE_FIELD_PATH, &song)) {
+            ok = false;
+            break;
         }
         paths[n] = strdup(song.path);
         if (!paths[n]) {
@@ -792,22 +899,37 @@ void metadata_db_load_top_played_songs(int limit, char *** out_paths, int * out_
     bool hits_ok = true;
     for (int32_t i = 0; i < slots; i++) {
         tagcache_song_t song;
-        if (!tagcache_song_at_slot(i, &song)) continue;
+        if (!tagcache_song_fields_by_id(i + 1, 0, &song)) continue;
         if (song.playcount <= 0) continue;
-        if (n >= cap) {
-            int next = cap ? cap * 2 : 16;
-            played_hit_t * h = realloc(hits, sizeof(*h) * (size_t) next);
-            if (!h) {
-                hits_ok = false;
-                break;
+        played_hit_t candidate = {
+            .id = song.id,
+            .count = song.playcount,
+            .last_played = song.last_played,
+            .ordinal = i,
+        };
+        if (n < limit) {
+            if (n >= cap) {
+                int next = cap ? (cap > limit / 2 ? limit : cap * 2) : 16;
+                if (next > limit) next = limit;
+                if ((size_t) next > SIZE_MAX / sizeof(*hits)) {
+                    hits_ok = false;
+                    break;
+                }
+                played_hit_t * h = realloc(hits, sizeof(*h) * (size_t) next);
+                if (!h) {
+                    hits_ok = false;
+                    break;
+                }
+                hits = h;
+                cap = next;
             }
-            hits = h;
-            cap = next;
+            hits[n] = candidate;
+            played_hit_heap_sift_up(hits, n);
+            n++;
+        } else if (cmp_hit_played(&candidate, &hits[0]) < 0) {
+            hits[0] = candidate;
+            played_hit_heap_sift_down(hits, n, 0);
         }
-        hits[n].path = song.path;
-        hits[n].count = song.playcount;
-        hits[n].last_played = song.last_played;
-        n++;
     }
     if (!hits_ok) {
         free(hits);
@@ -826,7 +948,9 @@ void metadata_db_load_top_played_songs(int limit, char *** out_paths, int * out_
     }
     int w = 0;
     for (int i = 0; i < n; i++) {
-        paths[w] = strdup(hits[i].path);
+        tagcache_song_t song;
+        if (!tagcache_song_fields_by_id(hits[i].id, TAGCACHE_FIELD_PATH, &song)) break;
+        paths[w] = strdup(song.path);
         if (!paths[w]) break;
         w++;
     }
@@ -853,7 +977,7 @@ void metadata_db_load_recently_added_songs(int limit, char *** out_paths, int * 
     int w = 0;
     for (int32_t i = 0; i < live && w < n; i++) {
         tagcache_song_t song;
-        if (!tagcache_song_at_recency_rank(i, &song)) continue;
+        if (!tagcache_song_fields_at_recency_rank(i, TAGCACHE_FIELD_PATH, &song)) continue;
         paths[w] = strdup(song.path);
         if (!paths[w]) break;
         w++;

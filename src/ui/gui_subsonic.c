@@ -32,7 +32,7 @@ extern int search_remap_index(search_binding_id_t id, int list_index);
 extern void nav_push(lv_obj_t * screen);
 extern void nav_pop(void);
 extern void gui_busy_set_progress(gui_busy_handle_t handle, int percent);
-extern void start_library_rescan(void);
+extern void start_library_auto_rescan(void);
 extern void finalize_screen_navigation(lv_obj_t * screen);
 extern lv_color_t accent_lv_color(void);
 
@@ -366,20 +366,14 @@ void poll_subsonic_library_download(void) {
     pthread_join(subsonic_library_download_thread, NULL);
     http_cancel_token_destroy(&subsonic_library_download_cancel);
 
-    /* Leave this download's own use of the shared "please wait" screen
-     * before either branch below -- start_library_rescan() pushes that same
-     * screen again fresh for its own "Updating music database..." phase,
-     * and would otherwise stack a second copy on top of this one still
-     * sitting there. */
+    /* Close the download's shared busy screen before
+     * start_library_auto_rescan() opens it for the rescan. */
     nav_pop();
 
     if (subsonic_library_download_success_count > 0) {
-        /* start_library_rescan() finishes with nav_reset_to_home(), same as
-         * every other "the library just changed on disk" trigger in this
-         * app (SD import, Wi-Fi import, manual rescan) -- no separate
-         * success toast first, the label just switches straight from this
-         * download's own progress text to the rescan's. */
-        start_library_rescan();
+        /* Automatically rescan downloaded files, preserving recovered
+         * snapshots and libraries that failed to load. */
+        start_library_auto_rescan();
     } else {
         show_error_toast("Download failed");
     }

@@ -92,9 +92,32 @@ jobs:
             cd plugins_examples
             zip -q -r ../release/plugin_examples.zip .
           )
-          sha256sum release/r1.upt release/open_hiby_player \
-            release/plugin_examples.zip \
-            > release/SHA256SUMS
+          (
+            cd release
+            sha256sum r1.upt open_hiby_player plugin_examples.zip > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Validate tracked R1 branding assets in firmware
+        run: |
+          set -euo pipefail
+          verify_dir=$(mktemp -d)
+          trap 'rm -rf "$verify_dir"' EXIT
+          7z x -y release/r1.upt -o"$verify_dir/upt" >/dev/null
+          mapfile -t root_chunks < <(find "$verify_dir/upt/ota_v0" -maxdepth 1 \
+            -type f -name 'rootfs.squashfs.[0-9]*' -print | LC_ALL=C sort)
+          (( ${#root_chunks[@]} > 0 ))
+          cat "${root_chunks[@]}" > "$verify_dir/rootfs.squashfs"
+          unsquashfs -no-xattrs -d "$verify_dir/root" \
+            "$verify_dir/rootfs.squashfs" >/dev/null
+          for asset in \
+            'assets/r1/etc/logo1.jpeg:/etc/logo1.jpeg' \
+            'assets/theme2/boot_animation/en/0.jpg:/usr/resource/litegui/theme2/boot_animation/en/0.jpg' \
+            'assets/theme2/boot_animation/en/0.png:/usr/resource/litegui/theme2/boot_animation/en/0.png'; do
+            source_path=${asset%%:*}
+            image_path=${asset#*:}
+            cmp -- "$source_path" "$verify_dir/root$image_path"
+          done
 
       - name: Prepare release notes
         run: |
@@ -109,10 +132,10 @@ jobs:
             echo "### Downloads"
             echo
             echo "- **r1.upt** — complete firmware update."
-            echo "- **open_hiby_player** — standalone Open Player update."
+            echo "- **open_hiby_player** — standalone Compás Player update."
             echo "- **plugin_examples.zip** — all example and test plugins from the repository."
             echo
-            echo "### Update only Open Player"
+            echo "### Update only Compás Player"
             echo
             echo "Copy **open_hiby_player** to **SD/.open_hiby_player/open_hiby_player**, replacing the existing file, then reboot the R1. The bootloader will use the updated player from the SD card."
             echo

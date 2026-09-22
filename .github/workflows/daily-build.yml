@@ -96,16 +96,119 @@ jobs:
           retention-days: 30
           compression-level: 6
 
+  config-r1:
+    name: Check R1 staging-image configuration
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      enabled: ${{ steps.config.outputs.enabled }}
+    env:
+      STAGING_IMAGE_SHA256: ${{ secrets.STAGING_IMAGE_SHA256 }}
+    steps:
+      - name: Validate R1 staging-image configuration
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$STAGING_IMAGE_SHA256" ]]; then
+            echo 'STAGING_IMAGE_SHA256 is not configured; R1 firmware packaging will be skipped.'
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$STAGING_IMAGE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
+            echo 'STAGING_IMAGE_SHA256 is present but invalid.' >&2
+            exit 1
+          }
+          echo 'enabled=true' >> "$GITHUB_OUTPUT"
+
+  package-r1:
+    # This is deliberately a workflow artifact, not a GitHub release. The
+    # R1 base image is approved and checksum-pinned, but daily builds remain
+    # available for validation before the weekly release publishes one.
+    name: Package R1 firmware (staging artifact)
+    needs: [build, config-r1]
+    if: ${{ needs['config-r1'].outputs.enabled == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      STAGING_IMAGE_SHA256: ${{ secrets.STAGING_IMAGE_SHA256 }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install repository-cached MIPS musl toolchain
+        run: |
+          set -euo pipefail
+          toolchain_dir="$(scripts/install_mips_toolchain.sh "$RUNNER_TEMP")"
+          echo "$toolchain_dir/bin" >> "$GITHUB_PATH"
+
+      - name: Install repack tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            file genisoimage p7zip-full squashfs-tools
+
+      - name: Download R1 build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hiby-r1-daily-${{ github.run_number }}-${{ github.sha }}
+          path: r1-build
+
+      - name: Download and verify R1 staging image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p base
+          gh release download staging-image-base \
+            --pattern r1.upt --dir base
+          test -f base/r1.upt
+          echo "$STAGING_IMAGE_SHA256  base/r1.upt" | sha256sum --check
+
+      - name: Repack R1 staging image
+        run: |
+          set -euo pipefail
+          mkdir -p r1-release
+          scripts/repack_upt.sh base/r1.upt \
+            r1-build/open_hiby_player_target \
+            r1-build/open_hiby_bootloader \
+            r1-release/r1.upt
+          cp r1-build/open_hiby_player_target r1-release/open_hiby_player
+          (
+            cd r1-release
+            sha256sum r1.upt open_hiby_player > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+          {
+            echo 'board=r1'
+            echo "commit=${GITHUB_SHA}"
+            echo 'base_asset=r1.upt'
+            echo "upt_sha256=$(sha256sum r1-release/r1.upt | awk '{print $1}')"
+            echo "player_sha256=$(sha256sum r1-release/open_hiby_player | awk '{print $1}')"
+          } > r1-release/BUILD-INFO.txt
+          test -s r1-release/r1.upt
+          test -s r1-release/open_hiby_player
+          test -s r1-release/SHA256SUMS
+          test -s r1-release/BUILD-INFO.txt
+          (cd r1-release && sha256sum --check SHA256SUMS)
+
+      - name: Upload R1 staging package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hiby-r1-staging-${{ github.run_number }}-${{ github.sha }}
+          path: r1-release/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6
+
   build-r3proii:
-    # Compile-regression guard only -- NOT a release channel. The R3 Pro II
-    # port (Makefile's BOARD= parameter, src/core/board_config.h) has no
-    # real hardware validation yet (see README.md's own "Device Support"
-    # section) and there is no R3 Pro II Staging Image/secret to repack
-    # against, unlike the R1 job above and weekly-beta.yml's real release
-    # pipeline. This job catches build regressions and publishes the two
-    # checked binaries as a downloadable workflow artifact. It does not
-    # publish firmware: that requires a separately approved R3 staging image
-    # and checksum secret, and must remain independent of this compile check.
+    # R3 Pro II has not yet been validated on real hardware. Publish the
+    # checked binaries as a workflow artifact; the separate, checksum-gated
+    # packaging job produces a staging artifact, never a public release.
     name: Build player for R3 Pro II (compile check and artifact)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -169,31 +272,24 @@ jobs:
           retention-days: 30
           compression-level: 6
 
-  package-r3proii:
-    # This is deliberately a workflow artifact, not a GitHub release. The
-    # R3 base image must be approved and hardware-tested before it can become
-    # a public firmware release.
-    name: Package R3 Pro II firmware (staging artifact)
-    needs: build-r3proii
+  config-r3proii:
+    name: Check R3 Pro II staging-image configuration
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
     permissions:
       contents: read
+    outputs:
+      enabled: ${{ steps.config.outputs.enabled }}
     env:
       R3PROII_STAGING_IMAGE_SHA256: ${{ secrets.R3PROII_STAGING_IMAGE_SHA256 }}
       R3_BASE_ASSET: ${{ inputs.r3_base_asset || 'r3proii.upt' }}
-
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Check R3 staging-image configuration
+      - name: Validate R3 Pro II staging-image configuration
         id: config
         shell: bash
         run: |
           set -euo pipefail
           if [[ -z "$R3PROII_STAGING_IMAGE_SHA256" ]]; then
-            echo 'R3PROII_STAGING_IMAGE_SHA256 is not configured; skipping R3 firmware packaging.'
+            echo 'R3PROII_STAGING_IMAGE_SHA256 is not configured; R3 firmware packaging will be skipped.'
             echo 'enabled=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -207,29 +303,44 @@ jobs:
           }
           echo 'enabled=true' >> "$GITHUB_OUTPUT"
 
+  package-r3proii:
+    # This is deliberately a workflow artifact, not a GitHub release. The
+    # R3 base image must be approved and hardware-tested before it can become
+    # a public firmware release.
+    name: Package R3 Pro II firmware (staging artifact)
+    needs: [build-r3proii, config-r3proii]
+    if: ${{ needs['config-r3proii'].outputs.enabled == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      R3PROII_STAGING_IMAGE_SHA256: ${{ secrets.R3PROII_STAGING_IMAGE_SHA256 }}
+      R3_BASE_ASSET: ${{ inputs.r3_base_asset || 'r3proii.upt' }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
       - name: Install repository-cached MIPS musl toolchain
-        if: steps.config.outputs.enabled == 'true'
         run: |
           set -euo pipefail
           toolchain_dir="$(scripts/install_mips_toolchain.sh "$RUNNER_TEMP")"
           echo "$toolchain_dir/bin" >> "$GITHUB_PATH"
 
       - name: Install repack tools
-        if: steps.config.outputs.enabled == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             file genisoimage p7zip-full squashfs-tools
 
       - name: Download R3 compile artifact
-        if: steps.config.outputs.enabled == 'true'
         uses: actions/download-artifact@v4
         with:
           name: hiby-r3proii-daily-${{ github.run_number }}-${{ github.sha }}
           path: r3proii-build
 
       - name: Download and verify R3 staging image
-        if: steps.config.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -242,7 +353,6 @@ jobs:
             | sha256sum --check
 
       - name: Repack R3 Pro II staging image
-        if: steps.config.outputs.enabled == 'true'
         run: |
           set -euo pipefail
           mkdir -p r3-release
@@ -253,11 +363,25 @@ jobs:
             r3-release/r3proii.upt
           cp r3proii-build/open_hiby_player_target_r3proii \
             r3-release/open_hiby_player_r3proii
-          sha256sum r3-release/r3proii.upt \
-            r3-release/open_hiby_player_r3proii > r3-release/SHA256SUMS
+          (
+            cd r3-release
+            sha256sum r3proii.upt open_hiby_player_r3proii > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+          {
+            echo 'board=r3proii'
+            echo "commit=${GITHUB_SHA}"
+            echo "base_asset=${R3_BASE_ASSET}"
+            echo "upt_sha256=$(sha256sum r3-release/r3proii.upt | awk '{print $1}')"
+            echo "player_sha256=$(sha256sum r3-release/open_hiby_player_r3proii | awk '{print $1}')"
+          } > r3-release/BUILD-INFO.txt
+          test -s r3-release/r3proii.upt
+          test -s r3-release/open_hiby_player_r3proii
+          test -s r3-release/SHA256SUMS
+          test -s r3-release/BUILD-INFO.txt
+          (cd r3-release && sha256sum --check SHA256SUMS)
 
       - name: Upload R3 Pro II staging package
-        if: steps.config.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: hiby-r3proii-staging-${{ github.run_number }}-${{ github.sha }}

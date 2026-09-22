@@ -5,6 +5,7 @@
 #include "playlist_files.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -58,7 +59,9 @@ static bool request_has_queue_index = false;
 static int64_t request_queue_index = 0;
 static bool request_has_queue_remove = false;
 static int request_queue_remove_offset = 0;
+static uint64_t request_queue_remove_revision = 0;
 static bool request_queue_clear = false;
+static uint64_t request_queue_clear_revision = 0;
 /* Scope filters echoed back by /api/playback/play to build the queue within
  * an album, artist, album-artist, or playlist view. Empty string means entire library. */
 static char request_play_playlist_name[128] = "";
@@ -69,6 +72,7 @@ static char request_play_album_filter[128] = "";
 /* Queue of song IDs (metadata_db song_row_t.id). Guarded by status_mutex. */
 static int64_t * queue_song_ids = NULL;
 static int queue_song_id_count = 0;
+static uint64_t queue_snapshot_revision = 0;
 
 static atomic_bool running = false;
 static int listen_fd = -1;
@@ -158,26 +162,28 @@ bool remote_control_consume_queue_index(int64_t * out_index) {
     return result;
 }
 
-bool remote_control_consume_queue_remove(int * out_offset) {
+bool remote_control_consume_queue_remove(int * out_offset, uint64_t * out_revision) {
     pthread_mutex_lock(&status_mutex);
     bool result = request_has_queue_remove;
     if (result) {
         request_has_queue_remove = false;
         *out_offset = request_queue_remove_offset;
+        *out_revision = request_queue_remove_revision;
     }
     pthread_mutex_unlock(&status_mutex);
     return result;
 }
 
-bool remote_control_consume_queue_clear(void) {
+bool remote_control_consume_queue_clear(uint64_t * out_revision) {
     pthread_mutex_lock(&status_mutex);
     bool result = request_queue_clear;
     request_queue_clear = false;
+    if (result) *out_revision = request_queue_clear_revision;
     pthread_mutex_unlock(&status_mutex);
     return result;
 }
 
-void remote_control_sync_queue(const char * const * paths, int count) {
+void remote_control_sync_queue(const char * const * paths, int count, uint64_t revision) {
     /* metadata_db_get_songs_by_paths() takes its own METADATA_DB_GUARD lock
      * internally -- must not be called while already holding status_mutex,
      * or a UI-thread caller blocked on METADATA_DB_GUARD (e.g. a rescan)
@@ -193,9 +199,7 @@ void remote_control_sync_queue(const char * const * paths, int count) {
         song_row_t * rows = malloc(sizeof(song_row_t) * (size_t) count);
         if (rows) {
             metadata_db_get_songs_by_paths(paths, count, rows);
-            for (int i = 0; i < count; i++) {
-                if (rows[i].id != -1) ids[id_count++] = rows[i].id;
-            }
+            for (int i = 0; i < count; i++) ids[id_count++] = rows[i].id;
             free(rows);
         }
     }
@@ -204,6 +208,7 @@ void remote_control_sync_queue(const char * const * paths, int count) {
     free(queue_song_ids);
     queue_song_ids = ids;
     queue_song_id_count = id_count;
+    queue_snapshot_revision = revision;
     pthread_mutex_unlock(&status_mutex);
 }
 
@@ -461,40 +466,67 @@ static void build_playlists_json(char * out, size_t out_size) {
     free(paths);
 }
 
-static void build_queue_json(char * out, size_t out_size) {
+static void build_queue_json(char * out, size_t out_size, int offset, int limit) {
     /* Snapshot queue_song_ids under status_mutex, then resolve IDs via
      * metadata_db_get_songs_by_ids() outside the lock. */
     pthread_mutex_lock(&status_mutex);
-    int count = queue_song_id_count;
+    int total = queue_song_id_count;
+    uint64_t revision = queue_snapshot_revision;
+    if (offset > total) offset = total;
+    int count = total - offset;
+    if (count > limit) count = limit;
     int64_t * ids = NULL;
     if (count > 0) {
         ids = malloc(sizeof(int64_t) * (size_t) count);
-        if (ids) memcpy(ids, queue_song_ids, sizeof(int64_t) * (size_t) count);
+        if (ids) memcpy(ids, queue_song_ids + offset, sizeof(int64_t) * (size_t) count);
         else count = 0;
     }
     pthread_mutex_unlock(&status_mutex);
 
     song_row_t * rows = count > 0 ? malloc(sizeof(song_row_t) * (size_t) count) : NULL;
     if (count > 0 && !rows) count = 0;
-    if (rows) metadata_db_get_songs_by_ids(ids, count, rows);
+    for (int i = 0; rows && i < count; i++) rows[i].id = -1;
+    int resolved_count = 0;
+    int64_t * resolved_ids = count > 0 ? malloc(sizeof(int64_t) * (size_t) count) : NULL;
+    int * resolved_at = count > 0 ? malloc(sizeof(int) * (size_t) count) : NULL;
+    if (resolved_ids && resolved_at) {
+        for (int i = 0; i < count; i++) if (ids[i] >= 0) {
+            resolved_ids[resolved_count] = ids[i];
+            resolved_at[resolved_count++] = i;
+        }
+        if (resolved_count) {
+            song_row_t * resolved = malloc(sizeof(song_row_t) * (size_t) resolved_count);
+            if (resolved) {
+                metadata_db_get_songs_by_ids(resolved_ids, resolved_count, resolved);
+                for (int i = 0; i < resolved_count; i++) rows[resolved_at[i]] = resolved[i];
+                free(resolved);
+            }
+        }
+    }
 
     /* Build JSON array of queue songs using json_builder_t with bounds checking. */
     json_builder_t json;
     json_builder_init(&json, out, out_size);
-    json_builder_appendf(&json, "{\"songs\":[");
+    json_builder_appendf(&json, "{\"total\":%d,\"offset\":%d,\"revision\":%llu,\"songs\":[", total, offset,
+                         (unsigned long long) revision);
     for (int i = 0; i < count && !json.truncated; i++) {
-        if (rows[i].id == -1) continue;
+        if (ids[i] < 0 || !rows || rows[i].id == -1) {
+            if (!json_builder_appendf(&json, "%s{\"offset\":%d,\"index\":-1,\"title\":\"Unknown track\",\"artist\":\"\"}", i ? "," : "", offset + i)) break;
+            continue;
+        }
         char display_title[128], title[512] = {0}, artist[512] = {0};
         metadata_db_song_display_title(&rows[i], display_title, sizeof(display_title));
         json_escape_append(title, sizeof(title), display_title);
         json_escape_append(artist, sizeof(artist), rows[i].tags.artist);
         if (!json_builder_appendf(&json, "%s{\"offset\":%d,\"index\":%lld,\"title\":\"%s\",\"artist\":\"%s\"}",
-                                  i ? "," : "", i, (long long) rows[i].id, title, artist)) break;
+                                  i ? "," : "", offset + i, (long long) rows[i].id, title, artist)) break;
     }
     json.truncated = false;
     json_builder_appendf(&json, "]}");
     free(rows);
     free(ids);
+    free(resolved_ids);
+    free(resolved_at);
 }
 
 
@@ -645,18 +677,16 @@ static void handle_art_request(int cfd, const char * path) {
 
 /* Fixed whitelist, not an arbitrary caller-supplied filename -- this server
  * has no authentication, so GET /assets/icon?name= must never be able to
- * read anything outside this exact set. Matches build_music_screen()'s own
- * icon choices in gui.c exactly (including reusing category/genre.png for
- * "Playlists", same as the in-app Music menu does -- no dedicated playlist
- * icon exists in the stock theme pack, see that function's own comment). */
+ * read anything outside this exact set. Use the same bundled submenu icons
+ * as build_music_screen() in gui_library.c. */
 static const struct {
     const char * name;
     const char * relative_path;
 } CATEGORY_ICONS[] = {
-    { "all", "category/all.png" },
-    { "artist", "category/artist.png" },
-    { "album_artist", "category/album_artist.png" },
-    { "genre", "category/genre.png" },
+    { "all", "submenu/all_songs.png" },
+    { "artist", "submenu/artists.png" },
+    { "album_artist", "submenu/album_artist.png" },
+    { "genre", "submenu/playlists.png" },
 };
 
 static uint8_t * read_whole_file(const char * path, size_t * out_size) {
@@ -790,24 +820,106 @@ static void handle_playlist_songs_request(int cfd, const char * path) {
  * "bound anything read from a socket" posture (http_client.c's own
  * response parsing does the same). */
 #define REQUEST_LINE_MAX 512
+#define REQUEST_HEADERS_MAX 4096
+#define PLAYLIST_NAME_MAX_BYTES 127
 
 static void handle_connection(int cfd) {
     char buf[REQUEST_LINE_MAX];
-    ssize_t n = read(cfd, buf, sizeof(buf) - 1);
-    if (n <= 0) return; /* listener owns close/active-client cleanup */
+    size_t n = 0;
+    bool line_complete = false;
+    /* Stream transports (including RFCOMM) may deliver the request line in
+     * several reads. Read through LF, bounded by REQUEST_LINE_MAX and an idle
+     * timeout. */
+    while (n + 1 < sizeof(buf)) {
+        struct pollfd pfd = { .fd = cfd, .events = POLLIN, .revents = 0 };
+        int ready = poll(&pfd, 1, 2000);
+        if (ready <= 0) {
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready == 0) send_response(cfd, "408 Request Timeout", "text/plain", "Request Timeout");
+            return;
+        }
+        char c;
+        ssize_t nr = read(cfd, &c, 1);
+        if (nr <= 0) return; /* caller owns fd cleanup */
+        buf[n++] = c;
+        if (c == '\n') {
+            line_complete = true;
+            break;
+        }
+    }
+    if (!line_complete) {
+        send_response(cfd, "414 URI Too Long", "text/plain", "Request line too long");
+        return;
+    }
     buf[n] = '\0';
 
+    /* Consume the headers before replying. Leaving them unread when closing a
+     * TCP socket can reset the connection and discard the response. This API
+     * has no request-body endpoints, so only the bounded header section is
+     * consumed. Accept CRLF or LF line endings. */
+    size_t header_bytes = 0;
+    char tail[4] = {0};
+    bool headers_complete = false;
+    while (header_bytes < REQUEST_HEADERS_MAX) {
+        struct pollfd pfd = { .fd = cfd, .events = POLLIN, .revents = 0 };
+        int ready = poll(&pfd, 1, 2000);
+        if (ready <= 0) {
+            if (ready < 0 && errno == EINTR) continue;
+            send_response(cfd, ready == 0 ? "408 Request Timeout" : "400 Bad Request",
+                          "text/plain", ready == 0 ? "Request Timeout" : "Bad Request");
+            return;
+        }
+        char c;
+        ssize_t nr = read(cfd, &c, 1);
+        if (nr <= 0) return;
+        header_bytes++;
+        tail[0] = tail[1]; tail[1] = tail[2]; tail[2] = tail[3]; tail[3] = c;
+        if ((header_bytes == 1 && c == '\n') ||
+            (header_bytes == 2 && tail[2] == '\r' && tail[3] == '\n') ||
+            (header_bytes >= 2 && tail[2] == '\n' && tail[3] == '\n') ||
+            (header_bytes >= 4 && tail[0] == '\r' && tail[1] == '\n' &&
+             tail[2] == '\r' && tail[3] == '\n')) {
+            headers_complete = true;
+            break;
+        }
+    }
+    if (!headers_complete) {
+        send_response(cfd, "431 Request Header Fields Too Large", "text/plain", "Request headers too large");
+        return;
+    }
+
     char method[8] = {0};
-    char path[256] = {0};
-    sscanf(buf, "%7s %255s", method, path);
+    char path[REQUEST_LINE_MAX] = {0};
+    if (sscanf(buf, "%7s %511s", method, path) != 2) {
+        send_response(cfd, "400 Bad Request", "text/plain", "Bad Request");
+        return;
+    }
 
     /* Path only, no query string, for the exact-match routes below --
      * every GET route is a fixed path, only the POST /api/playback routes
      * ever have a "?...". */
-    char path_only[256];
+    char path_only[REQUEST_LINE_MAX];
     snprintf(path_only, sizeof(path_only), "%s", path);
     char * q = strchr(path_only, '?');
     if (q) *q = '\0';
+
+    /* The v1 namespace is an alias layer over the original routes. Keep
+     * path_only bounded and require the slash after the version so that
+     * similarly named paths (for example /api/v10) never match. */
+    bool api_v1 = strncmp(path_only, "/api/v1/", sizeof("/api/v1/") - 1) == 0;
+    if (api_v1) {
+        if (strcmp(path_only, "/api/v1/capabilities") == 0 && strcmp(method, "GET") == 0) {
+            static const char capabilities[] =
+                "{\"version\":1,\"transports\":[\"wifi\",\"bluetooth_classic_rfcomm\"],\"features\":["
+                "\"status\",\"playback_controls\",\"queue\",\"library_browse\","
+                "\"playlists\",\"album_art\"]}";
+            send_response(cfd, "200 OK", "application/json", capabilities);
+            return;
+        }
+        /* Remove only "/v1" so "/api/v1/status" routes as "/api/status". */
+        memmove(path_only + sizeof("/api") - 1, path_only + sizeof("/api/v1") - 1,
+                strlen(path_only + sizeof("/api/v1") - 1) + 1);
+    }
 
     if (strcmp(method, "GET") == 0) {
         if (strcmp(path_only, "/api/status") == 0) {
@@ -887,8 +999,12 @@ static void handle_connection(int cfd) {
         } else if (strcmp(path_only, "/api/playlists/songs") == 0) {
             handle_playlist_songs_request(cfd, path);
         } else if (strcmp(path_only, "/api/queue") == 0) {
-            char json[16384];
-            build_queue_json(json, sizeof(json));
+            int offset = 0, limit = 25;
+            if (query_param_int(path, "offset", &offset) && offset < 0) offset = 0;
+            if (query_param_int(path, "limit", &limit) && limit < 1) limit = 25;
+            if (limit > 25) limit = 25;
+            char json[65536];
+            build_queue_json(json, sizeof(json), offset, limit);
             send_response(cfd, "200 OK", "application/json", json);
         } else if (strcmp(path_only, "/assets/icon") == 0) {
             handle_icon_request(cfd, path);
@@ -906,9 +1022,20 @@ static void handle_connection(int cfd) {
          * consume calls on the main thread for the duration of that I/O.
          * Only the small "which song, by index" lookup needs the lock. */
         if (strcmp(path_only, "/api/playlists") == 0 || strcmp(path_only, "/api/playlists/add") == 0) {
-            char name[128] = {0};
+            char raw_name[REQUEST_LINE_MAX] = {0};
+            char name[REQUEST_LINE_MAX] = {0};
             int64_t index = -1;
-            bool have_name = query_param_str(path, "name", name, sizeof(name));
+            bool have_name = query_param_str(path, "name", raw_name, sizeof(raw_name));
+            if (have_name) {
+                url_decode(raw_name, name, sizeof(name));
+                /* A decoded NUL would make validation see only a prefix. */
+                for (const char * p = raw_name; p[0] && p[1] && p[2]; p++) {
+                    if (p[0] == '%' && p[1] == '0' && p[2] == '0') {
+                        have_name = false;
+                        break;
+                    }
+                }
+            }
             bool have_index = query_param_int64(path, "index", &index);
 
             char song_path[600] = {0};
@@ -921,7 +1048,8 @@ static void handle_connection(int cfd) {
                 }
             }
 
-            if (!have_name || !playlist_name_is_safe(name) || !have_song) {
+            if (!have_name || strlen(name) > PLAYLIST_NAME_MAX_BYTES ||
+                !playlist_name_is_safe(name) || !have_song) {
                 send_response(cfd, "400 Bad Request", "text/plain", "Bad Request");
             } else if (strcmp(path_only, "/api/playlists") == 0) {
                 char created_path[512];
@@ -931,8 +1059,10 @@ static void handle_connection(int cfd) {
                                created ? "OK" : "Failed to create playlist");
             } else {
                 char m3u_path[512];
-                snprintf(m3u_path, sizeof(m3u_path), "%s/%s.m3u", PLAYLISTS_DIR, name);
-                if (playlist_files_contains(m3u_path, song_path)) {
+                int path_len = snprintf(m3u_path, sizeof(m3u_path), "%s/%s.m3u", PLAYLISTS_DIR, name);
+                if (path_len < 0 || (size_t) path_len >= sizeof(m3u_path)) {
+                    send_response(cfd, "400 Bad Request", "text/plain", "Bad Request");
+                } else if (playlist_files_contains(m3u_path, song_path)) {
                     send_response(cfd, "200 OK", "text/plain", "Song already in playlist");
                 } else {
                     bool added = playlist_files_append(m3u_path, song_path);
@@ -942,6 +1072,7 @@ static void handle_connection(int cfd) {
             }
         } else {
             bool ok = true;
+            bool conflict = false;
             pthread_mutex_lock(&status_mutex);
             if (strcmp(path_only, "/api/playback/toggle") == 0) {
                 request_play_pause = true;
@@ -1003,12 +1134,29 @@ static void handle_connection(int cfd) {
                 }
             } else if (strcmp(path_only, "/api/queue/remove") == 0) {
                 int offset;
-                if (query_param_int(path, "offset", &offset) && offset >= 0) {
-                    request_has_queue_remove = true;
-                    request_queue_remove_offset = offset;
+                int64_t revision;
+                if (query_param_int(path, "offset", &offset) && offset >= 0 &&
+                    query_param_int64(path, "revision", &revision) && revision >= 0) {
+                    if ((uint64_t) revision != queue_snapshot_revision || offset >= queue_song_id_count) {
+                        ok = false;
+                        conflict = true;
+                    } else {
+                        request_has_queue_remove = true;
+                        request_queue_remove_offset = offset;
+                        request_queue_remove_revision = (uint64_t) revision;
+                    }
                 } else ok = false;
             } else if (strcmp(path_only, "/api/queue/clear") == 0) {
-                request_queue_clear = true;
+                int64_t revision;
+                if (query_param_int64(path, "revision", &revision) && revision >= 0) {
+                    if ((uint64_t) revision != queue_snapshot_revision) {
+                        ok = false;
+                        conflict = true;
+                    } else {
+                        request_queue_clear = true;
+                        request_queue_clear_revision = (uint64_t) revision;
+                    }
+                } else ok = false;
             } else {
                 ok = false;
             }
@@ -1016,6 +1164,8 @@ static void handle_connection(int cfd) {
 
             if (ok) {
                 send_response(cfd, "200 OK", "text/plain", "OK");
+            } else if (conflict) {
+                send_response(cfd, "409 Conflict", "text/plain", "Queue changed; reload it and retry");
             } else {
                 send_response(cfd, "404 Not Found", "text/plain", "Not Found");
             }
@@ -1024,6 +1174,12 @@ static void handle_connection(int cfd) {
         send_response(cfd, "405 Method Not Allowed", "text/plain", "Method Not Allowed");
     }
 
+}
+
+/* Handle one HTTP request on an already connected stream socket. The caller
+ * retains ownership of fd and is responsible for closing it. */
+void remote_control_handle_stream(int fd) {
+    if (fd >= 0) handle_connection(fd);
 }
 
 /* Timeout for poll() on listen_fd so listener_thread_func periodically checks

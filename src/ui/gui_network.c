@@ -27,6 +27,9 @@ extern int subprocess_run(char * const argv[], char ** out_output, int timeout_s
 #include "airplay_metadata.h"
 #include "dlna_control.h"
 #include "remote_control.h"
+#ifndef HOST_BUILD
+#include "bt_remote_control.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -166,6 +169,9 @@ static uint32_t wifi_settings_snapshot_tick;
 static bool wifi_settings_snapshot_enabled = false;
 static wifi_info_t wifi_cached_info;
 static bool wifi_cached_info_connected = false;
+#ifndef HOST_BUILD
+static bool remote_control_last_bt_powered;
+#endif
 
 static void populate_wifi_info_screen(void);
 static void populate_import_wifi_screen(void);
@@ -519,6 +525,15 @@ void poll_wifi_scan(void) {
         if (import_wifi_screen && gui_navigation_is_top(import_wifi_screen)) populate_import_wifi_screen();
         if (remote_control_screen && gui_navigation_is_top(remote_control_screen)) remote_control_refresh_address();
     }
+#ifndef HOST_BUILD
+    /* The cache is updated by the regular shell poll after this function.
+     * Refresh once when its value changes; never query bluetoothd here. */
+    if (remote_control_screen && gui_navigation_is_top(remote_control_screen) &&
+        remote_control_last_bt_powered != bt_is_powered_cached) {
+        remote_control_last_bt_powered = bt_is_powered_cached;
+        remote_control_refresh_address();
+    }
+#endif
     if ((wifi_screen && gui_navigation_is_top(wifi_screen)) ||
         (wifi_info_screen && gui_navigation_is_top(wifi_info_screen)) ||
         (import_wifi_screen && gui_navigation_is_top(import_wifi_screen)) ||
@@ -2775,8 +2790,17 @@ static void * network_service_worker_func(void * arg) {
             if (job.start) import_web_start();
             else import_web_stop();
         } else if (job.service == NETWORK_SERVICE_REMOTE) {
-            if (job.start) remote_control_start();
-            else remote_control_stop();
+            if (job.start) {
+                remote_control_start();
+#ifndef HOST_BUILD
+                bt_remote_control_start();
+#endif
+            } else {
+                remote_control_stop();
+#ifndef HOST_BUILD
+                bt_remote_control_stop();
+#endif
+            }
         } else if (job.service == NETWORK_SERVICE_DLNA) {
             if (job.start) dlna_control_start();
             else dlna_control_stop();
@@ -3001,15 +3025,15 @@ static lv_obj_t * build_import_wifi_screen(void) {
     return scr;
 }
 
-/* ---- Shared Wi-Fi dependency guard for AirPlay/DLNA/Remote Control/Import
- * via Wi-Fi -- all four require the Wi-Fi radio/interface to be enabled
+/* ---- Shared Wi-Fi dependency guard for AirPlay/DLNA/Import via Wi-Fi --
+ * these require the Wi-Fi radio/interface to be enabled
  * (NOT association with an access point; individual screens keep showing
  * their own existing "connect first" state for that). Checks gui_shell.c's
  * effective state (an in-flight disable counts as already off, see that
  * function's own comment) rather than wifi_control_is_enabled() directly,
  * shows the exact required toast, and returns false -- callers must bail
  * out without navigating, touching a setting, or starting anything. Shared
- * by both the tile taps below (screen not open yet) and each feature's own
+ * by the tile taps below (screen not open yet) and each feature's own
  * enable/toggle path (screen may already be open when Wi-Fi goes away). */
 static bool wifi_feature_guard(void) {
     if (gui_shell_wifi_effective_enabled()) return true;
@@ -3398,9 +3422,9 @@ static void open_dlna_screen(void) {
     nav_push(dlna_screen);
 }
 
-/* ---- Remote Control screen (Wireless -> "Open Link") -- see
- * remote_control.h for the Phase 1 (read-only Now Playing web page, no
- * playback control yet, no auth) scope. Toggle row styled like
+/* ---- Remote Control screen (Wireless -> "Open Link") -- exposes the
+ * HTTP address over Wi-Fi and the RFCOMM service name over Bluetooth.
+ * Toggle row styled like
  * build_dlna_screen()'s own row; the IP/QR/URL display below it is styled
  * exactly like build_import_wifi_screen()'s (same colors, sizes, and even
  * the same 20px QR-to-URL-label gap) -- this is the same "here's an
@@ -3410,6 +3434,7 @@ static void open_dlna_screen(void) {
 static lv_obj_t * remote_control_toggle_img;
 static lv_obj_t * remote_control_status_label;
 static lv_obj_t * remote_control_url_label;
+static lv_obj_t * remote_control_bluetooth_label;
 #if LV_USE_QRCODE
 static lv_obj_t * remote_control_qrcode;
 #endif
@@ -3427,10 +3452,14 @@ static lv_obj_t * remote_control_qrcode;
 static void remote_control_relayout_below_status(void) {
     lv_obj_t * last = remote_control_status_label;
 #if LV_USE_QRCODE
-    lv_obj_align_to(remote_control_qrcode, last, LV_ALIGN_OUT_BOTTOM_MID, 0, BOARD_SCALE_PX(20));
-    last = remote_control_qrcode;
+    if (!lv_obj_has_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN)) {
+        lv_obj_align_to(remote_control_qrcode, last, LV_ALIGN_OUT_BOTTOM_MID, 0, BOARD_SCALE_PX(20));
+        last = remote_control_qrcode;
+    }
 #endif
     lv_obj_align_to(remote_control_url_label, last, LV_ALIGN_OUT_BOTTOM_MID, 0, BOARD_SCALE_PX(20));
+    last = remote_control_url_label;
+    lv_obj_align_to(remote_control_bluetooth_label, last, LV_ALIGN_OUT_BOTTOM_MID, 0, BOARD_SCALE_PX(12));
 }
 
 static void remote_control_refresh_address(void) {
@@ -3438,6 +3467,7 @@ static void remote_control_refresh_address(void) {
         lv_label_set_text(remote_control_status_label,
                            "Turn this on to see the address here.");
         lv_label_set_text(remote_control_url_label, "");
+        lv_label_set_text(remote_control_bluetooth_label, "");
 #if LV_USE_QRCODE
         lv_obj_add_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
 #endif
@@ -3446,9 +3476,16 @@ static void remote_control_refresh_address(void) {
     }
 
     wifi_settings_snapshot_start();
-    if (!wifi_cached_info_is_current() || !wifi_cached_info_connected || wifi_cached_info.ip[0] == '\0') {
-        lv_label_set_text(remote_control_status_label, "Connect to Wi-Fi first");
+    bool wifi_available = gui_shell_wifi_effective_enabled() && wifi_cached_info_is_current() &&
+                          wifi_cached_info_connected && wifi_cached_info.ip[0] != '\0';
+    bool bluetooth_available = false;
+#ifndef HOST_BUILD
+    bluetooth_available = bt_is_powered_cached;
+#endif
+    if (!wifi_available && !bluetooth_available) {
+        lv_label_set_text(remote_control_status_label, "Enable Wi-Fi or Bluetooth to connect.");
         lv_label_set_text(remote_control_url_label, "");
+        lv_label_set_text(remote_control_bluetooth_label, "");
 #if LV_USE_QRCODE
         lv_obj_add_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
 #endif
@@ -3456,13 +3493,25 @@ static void remote_control_refresh_address(void) {
         return;
     }
 
-    char url[64];
-    snprintf(url, sizeof(url), "http://%s:8899", wifi_cached_info.ip);
-    lv_label_set_text(remote_control_status_label, "Open this address on your phone or computer:");
-    lv_label_set_text(remote_control_url_label, url);
+    lv_label_set_text(remote_control_status_label, "Connect using either available route:");
+    if (wifi_available) {
+        char url[64];
+        snprintf(url, sizeof(url), "Wi-Fi: http://%s:8899", wifi_cached_info.ip);
+        lv_label_set_text(remote_control_url_label, url);
+    } else {
+        lv_label_set_text(remote_control_url_label, "");
+    }
+    if (bluetooth_available) lv_label_set_text(remote_control_bluetooth_label, "Bluetooth: Compas Remote Control");
+    else lv_label_set_text(remote_control_bluetooth_label, "");
 #if LV_USE_QRCODE
-    lv_obj_remove_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
-    lv_qrcode_update(remote_control_qrcode, url, strlen(url));
+    if (wifi_available) {
+        char url[64];
+        snprintf(url, sizeof(url), "http://%s:8899", wifi_cached_info.ip);
+        lv_obj_remove_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
+        lv_qrcode_update(remote_control_qrcode, url, strlen(url));
+    } else {
+        lv_obj_add_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
+    }
 #endif
     remote_control_relayout_below_status();
 }
@@ -3476,12 +3525,6 @@ static void refresh_remote_control_screen_if_built(void) {
  * the full name. */
 bool gui_network_toggle_remote_control(void) {
     bool turning_on = !current_settings.remote_control_enabled;
-    /* Same defensive enable guard as airplay_toggle_cb()/dlna_toggle_cb() --
-     * this screen can already be open when Wi-Fi is disabled elsewhere. */
-    if (turning_on && !wifi_feature_guard()) {
-        refresh_remote_control_screen_if_built(); /* nothing changed, but keeps the address text/QR state honest */
-        return current_settings.remote_control_enabled;
-    }
     if (network_service_is_busy(NETWORK_SERVICE_REMOTE) ||
         !network_service_enqueue(NETWORK_SERVICE_REMOTE, turning_on, false)) {
         show_info_toast("Service is busy");
@@ -3549,8 +3592,8 @@ static lv_obj_t * build_remote_control_screen(void) {
 
     lv_obj_t * explanation = lv_label_create(scr);
     lv_label_set_text(explanation,
-                       "Lets anyone on your Wi-Fi network who opens the address below see what's playing, "
-                       "control playback, and browse your library -- no password.");
+                       "Connect over Wi-Fi or Bluetooth to see what's playing, control playback, and browse "
+                       "your library. Wi-Fi has no app password; Bluetooth requires pairing.");
     lv_obj_set_width(explanation, lv_pct(90));
     lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(explanation, LV_TEXT_ALIGN_CENTER, 0);
@@ -3578,8 +3621,17 @@ static lv_obj_t * build_remote_control_screen(void) {
 #endif
 
     remote_control_url_label = lv_label_create(scr);
+    lv_obj_set_width(remote_control_url_label, lv_pct(90));
+    lv_label_set_long_mode(remote_control_url_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(remote_control_url_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(remote_control_url_label, accent_lv_color(), 0);
     lv_obj_set_style_text_font(remote_control_url_label, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
+    remote_control_bluetooth_label = lv_label_create(scr);
+    lv_obj_set_width(remote_control_bluetooth_label, lv_pct(90));
+    lv_label_set_long_mode(remote_control_bluetooth_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(remote_control_bluetooth_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_style(remote_control_bluetooth_label, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(remote_control_bluetooth_label, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
     /* Positions qrcode/url_label below remote_control_status_label for the
      * first time -- open_remote_control_screen() calls remote_control_
      * refresh_address() (which calls this same helper again) every time
@@ -3600,7 +3652,6 @@ static void open_remote_control_screen(void) {
 
 static void remote_control_tile_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (!wifi_feature_guard()) return;
     open_remote_control_screen();
 }
 
@@ -3610,11 +3661,11 @@ static void dlna_tile_cb(lv_event_t * e) {
     open_dlna_screen();
 }
 
-/* Centralized Wi-Fi-disabled cleanup for all four Wi-Fi-dependent features
+/* Centralized Wi-Fi-disabled cleanup for Wi-Fi-dependent features
  * -- called by gui_shell.c's poll_wifi_toggle() only once a Wi-Fi disable is
  * authoritatively confirmed (see that call site's own comment). Stops
- * whichever of AirPlay/DLNA/Remote Control/Import via Wi-Fi is actually
- * running and corrects their persisted settings, refreshing any of their
+ * whichever of AirPlay/DLNA/Import via Wi-Fi is actually running and
+ * corrects their persisted settings, refreshing any of their
  * screens/toggles already built so nothing shows stale "on" state. A single
  * settings_save() at the end covers every flag this pass touched, rather
  * than one write per feature. */
@@ -3639,15 +3690,6 @@ void gui_network_handle_wifi_disabled(void) {
             current_settings.dlna_renderer_enabled = false;
             settings_changed = true;
             populate_dlna_screen();
-        }
-    }
-
-    if (current_settings.remote_control_enabled) {
-        if (network_service_enqueue(NETWORK_SERVICE_REMOTE, false, true)) {
-            current_settings.remote_control_enabled = false;
-            settings_changed = true;
-            lv_obj_clear_state(remote_control_toggle_img, LV_STATE_CHECKED);
-            remote_control_refresh_address();
         }
     }
 
@@ -3849,7 +3891,17 @@ void gui_network_cancel_background_work(void) {
         if (job.service == NETWORK_SERVICE_IMPORT) {
             if (job.start) import_web_start(); else import_web_stop();
         } else if (job.service == NETWORK_SERVICE_REMOTE) {
-            if (job.start) remote_control_start(); else remote_control_stop();
+            if (job.start) {
+                remote_control_start();
+#ifndef HOST_BUILD
+                bt_remote_control_start();
+#endif
+            } else {
+                remote_control_stop();
+#ifndef HOST_BUILD
+                bt_remote_control_stop();
+#endif
+            }
         } else if (job.service == NETWORK_SERVICE_DLNA) {
             if (job.start) dlna_control_start(); else dlna_control_stop();
         }

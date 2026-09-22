@@ -60,9 +60,11 @@ Support for other HiBy devices may be possible, but should not be assumed withou
 
 - 🎵 **Playback** — local files (FLAC, MP3, WAV, AIFF, DSD, AAC, ALAC, APE, Opus, and others), gapless by default, crossfade, ReplayGain, 10-band PEQ with SD-card presets, hardware buttons, Bluetooth (including Bluetooth DAC), USB DAC, queue / Up Next
 - 📚 **Library** — file browser, artists / albums / playlists (including M3U/M3U8), Rockbox tagcache, incremental scans, synced lyrics, SD hotplug, plain-text book reader; audiobooks via plugin
-- 🌐 **Network** — Subsonic-compatible streaming (HTTPS), downloads, DLNA renderer, AirPlay via stock protocols where possible, LAN web remote, Wi-Fi music import
+- 🌐 **Network** — Subsonic-compatible streaming (HTTPS), downloads, DLNA renderer, AirPlay via stock protocols where possible, Wi-Fi and Bluetooth remote control, Wi-Fi music import
 - 🔌 **Device** — charge limiter and Safe Charging, idle shutdown or suspend, car mode, USB Storage / DAC / ADB selector, timezone, configurable charge LEDs
 - 🎨 **Interface** — stock assets and fonts, swipe navigation, pull-down quick controls, `.theme` files, customizable Home screen, non-Latin text (Cyrillic, Japanese, Korean, Thai)
+
+Android client developers can use the [Remote Control API v1 contract](docs/REMOTE_CONTROL_API.md).
 
 ---
 

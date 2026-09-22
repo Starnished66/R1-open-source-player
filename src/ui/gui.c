@@ -585,9 +585,11 @@ static void update_timer_cb(lv_timer_t * timer) {
         if (metadata_db_get_song_by_id(remote_queue_id, &remote_queue_row)) queue_add_song(remote_queue_row.path);
     }
     int remote_queue_remove_offset;
-    if (remote_control_consume_queue_remove(&remote_queue_remove_offset))
-        queue_remove_song_at_offset(remote_queue_remove_offset);
-    if (remote_control_consume_queue_clear()) queue_clear_pending();
+    uint64_t remote_queue_revision;
+    if (remote_control_consume_queue_remove(&remote_queue_remove_offset, &remote_queue_revision))
+        gui_player_remote_queue_remove(remote_queue_remove_offset, remote_queue_revision);
+    if (remote_control_consume_queue_clear(&remote_queue_revision))
+        gui_player_remote_queue_clear(remote_queue_revision);
     int64_t remote_play_id;
     char remote_play_playlist[128], remote_play_artist[128], remote_play_album_artist[128], remote_play_album[128];
     if (remote_control_consume_play_index(&remote_play_id, remote_play_playlist, sizeof(remote_play_playlist),
@@ -944,6 +946,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     headphone_status_refresh_earpods_adc();
 
     if (current_settings.remote_control_enabled) {
+        gui_player_sync_remote_queue();
         /* No separate now-playing metadata cache exists in this app beyond
          * what's already on screen -- song_title_label/artist_label
          * are this app's own single source of truth for title/artist (see
@@ -1453,10 +1456,10 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     safe_charging_poll(current_settings.safe_charging_enabled, true);
     if (current_settings.timezone[0] != '\0') timezone_apply(current_settings.timezone);
 
-    /* Network receiver/server modes are session-only:
+    /* Receiver/server modes are session-only:
      * Never restore AirPlay, DLNA, or Remote Control automatically after a
      * process start to avoid unintentional listener exposure and resource usage.
-     * Require explicit user activation while Wi-Fi is connected. */
+     * Remote Control can use either Wi-Fi or Bluetooth after explicit activation. */
     bool network_modes_changed = current_settings.wifi_dac_mode_enabled ||
                                  current_settings.dlna_renderer_enabled ||
                                  current_settings.remote_control_enabled;

@@ -169,12 +169,10 @@ typedef struct {
      * decoder/playback pipeline, same as any other track. */
     bool dlna_renderer_enabled;
 
-    /* Phone remote-control (Now Playing web page) -- see remote_control.h.
-     * Same lifecycle shape as dlna_renderer_enabled: a background listener
-     * thread started/stopped on toggle and re-applied once at startup if
-     * already on. Default false -- this exposes now-playing state (title/
-     * artist/album/position, no auth) to anything on the same Wi-Fi
-     * network, so it stays opt-in rather than silently on for every user. */
+    /* Phone remote-control over Wi-Fi HTTP and paired Bluetooth RFCOMM -- see
+     * remote_control.h. Session-only: startup clears a previously saved true
+     * value. Default false, since Wi-Fi access has no app authentication and
+     * exposes playback state and library browsing to the local network. */
     bool remote_control_enabled;
 
     /* Auto screen-timeout (gui.c's update_timer_cb, backed by

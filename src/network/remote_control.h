@@ -7,6 +7,11 @@
 
 /* Phone remote-control server: serves a static Now Playing web page and a JSON
  * API (status polling, playback control, library browsing, playlist creation/addition).
+ * Existing API routes are also available under the /api/v1/ prefix; GET
+ * /api/v1/capabilities describes the API version and currently available
+ * features and supported transports (Wi-Fi HTTP and Bluetooth Classic RFCOMM).
+ * Transport support is advertised independently of whether its radio is
+ * currently enabled. Playback remains local to the player.
  * Playback requests set flags that are polled and consumed by update_timer_cb. */
 
 /* Starts the HTTP listener thread on REMOTE_CONTROL_PORT. Idempotent. */
@@ -14,6 +19,10 @@ void remote_control_start(void);
 
 /* Stops the listener thread and its socket. Idempotent. */
 void remote_control_stop(void);
+
+/* Handles one HTTP request on a connected byte-stream socket (for example an
+ * RFCOMM connection). The caller retains ownership of fd and must close it. */
+void remote_control_handle_stream(int fd);
 
 /* Push a fresh now-playing snapshot for /api/status. Thread-safe snapshot copy.
  * path is the currently-playing file on disk. play_mode is gui.c's play_mode_t
@@ -38,11 +47,11 @@ bool remote_control_consume_volume(int * out_percent);
 
 /* POST /api/playback/queue?index=N -- enqueue one library song by metadata_db id. */
 bool remote_control_consume_queue_index(int64_t * out_index);
-bool remote_control_consume_queue_remove(int * out_offset);
-bool remote_control_consume_queue_clear(void);
+bool remote_control_consume_queue_remove(int * out_offset, uint64_t * out_revision);
+bool remote_control_consume_queue_clear(uint64_t * out_revision);
 
 /* Snapshot the live playback queue for GET /api/queue. */
-void remote_control_sync_queue(const char * const * paths, int count);
+void remote_control_sync_queue(const char * const * paths, int count, uint64_t revision);
 
 /* Consume requested song id to play. Scope strings (playlist, artist,
  * album_artist, album) narrow the context for building the playback queue. */

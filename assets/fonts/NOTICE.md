@@ -1,3 +1,27 @@
+# default.otf -- R1 packaged font
+
+This file is an exact copy of the HiBy R1 stock firmware's
+`/usr/resource/fonts/default.otf`. It is the **1,124-codepoint packaged
+subset** of **Noto Sans S Chinese DemiLight** (`NotoSansHans-DemiLight`),
+copyright (c) 2014 Adobe Systems Incorporated and contributors. The font's
+embedded metadata identifies the **Apache License, Version 2.0**:
+http://www.apache.org/licenses/LICENSE-2.0.html
+
+The R1 copy uses **CFF** outlines (the `CFF ` table), as shipped. It is
+bundled byte-for-byte so the R3 Pro II repack receives the same font resource
+as the R1 image.
+
+# Thai.ttf -- R1 packaged font
+
+This file is an exact copy of the HiBy R1 stock firmware's
+`/usr/resource/fonts/Thai.ttf`. It is **CS ChatThaiUI** by Chanok Samiti
+(BoonUni), copyright (c) 2014. The font's embedded metadata identifies the
+**Creative Commons Attribution 4.0 International** license (CC BY 4.0):
+http://creativecommons.org/licenses/by/4.0/
+
+This copy is bundled byte-for-byte from the R1 image so the R3 Pro II repack
+receives the same Thai font resource.
+
 # cjk_cyrillic.ttf -- provenance and license
 
 This font is a derivative of **Noto Sans CJK SC** ("Noto Sans S Chinese
@@ -88,8 +112,7 @@ directory as part of a full firmware repack -- the same mechanism this
 project already uses to ship other files it owns that aren't in stock
 (e.g. `usr/bin/sync_ntp.sh`). A standalone player-binary update (SD-card
 `.open_hiby_player/open_hiby_player` swap, or `adb push`) does not carry
-this file; on a device that never received a full repack (or the R3 Pro
-II, which has no staging-image/repack step at all), the emoji fallback
+this file; on a device that never received a full repack, the emoji fallback
 face is simply absent and every other font/rendering behavior is
 unaffected -- see `src/ui/fallback_font.c`'s own comment on why loading
 this face is optional, not required, unlike CJK/Korean/Thai.

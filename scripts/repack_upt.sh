@@ -196,6 +196,19 @@ if [[ -d "$overlay" ]]; then
     cp -a "$overlay"/. "$work/root/"
 fi
 
+# Keep the two board packages on the same known-good font set. The manifest
+# contains hashes extracted from the approved R1 package and is checked after
+# every stock asset and overlay has been applied.
+font_manifest="$repo/scripts/r1_firmware_fonts.sha256"
+[[ -s "$font_manifest" ]] || {
+    echo "Missing font parity manifest: $font_manifest" >&2
+    exit 1
+}
+if ! (cd "$work/root" && sha256sum -c "$font_manifest"); then
+    echo "Firmware font parity check failed; R1 and R3 packages must use the same font files" >&2
+    exit 1
+fi
+
 mksquashfs "$work/root" "$work/new-rootfs.squashfs" \
     -comp lzo -all-root -noappend -no-xattrs >/dev/null
 

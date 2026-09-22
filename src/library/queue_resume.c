@@ -8,6 +8,8 @@
 #include <math.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #define MAX_ENTRIES 1000000
 static const char magic[8] = {'H','I','B','Y','Q','0','0','1'};
@@ -37,14 +39,21 @@ static bool permutation(const int * order, int count) {
     free(seen); return ok;
 }
 
-bool queue_resume_write(const char * path, const queue_resume_t * s) {
+bool queue_resume_write_at(int dirfd, const char * name, const queue_resume_t * s) {
     if (!valid(s) || !s->paths || !permutation(s->order, s->count) || !permutation(s->continuation, s->count)) return false;
-    char temp[PATH_MAX];
-    if (snprintf(temp, sizeof(temp), "%s.XXXXXX", path) >= (int) sizeof(temp)) return false;
-    int fd = mkstemp(temp);
+    if (dirfd < 0 || !name || !name[0] || strchr(name, '/')) return false;
+    char temp[NAME_MAX];
+    int fd = -1;
+    for (unsigned int attempt = 0; attempt < 100; attempt++) {
+        int n = snprintf(temp, sizeof(temp), ".%s.%ld.%u.tmp", name, (long) getpid(), attempt);
+        if (n < 0 || (size_t) n >= sizeof(temp)) return false;
+        fd = openat(dirfd, temp, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, 0600);
+        if (fd >= 0) break;
+        if (errno != EEXIST) return false;
+    }
     if (fd < 0) return false;
     FILE * f = fdopen(fd, "wb");
-    if (!f) { close(fd); unlink(temp); return false; }
+    if (!f) { close(fd); unlinkat(dirfd, temp, 0); return false; }
     int32_t header[] = {s->count, s->current, s->pending, s->mode, s->shuffle_pos, s->order != NULL, s->continuation != NULL};
     bool ok = fwrite(magic, 1, sizeof(magic), f) == sizeof(magic) &&
         fwrite(header, sizeof(header), 1, f) == 1 && fwrite(&s->position, sizeof(double), 1, f) == 1;
@@ -57,14 +66,30 @@ bool queue_resume_write(const char * path, const queue_resume_t * s) {
     if (ok && s->continuation) ok = fwrite(s->continuation, sizeof(int), (size_t) s->count, f) == (size_t) s->count;
     if (ok) ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
     if (fclose(f) != 0) ok = false;
-    if (ok) ok = rename(temp, path) == 0;
-    if (!ok) unlink(temp);
-    else {
-        char dir[PATH_MAX]; snprintf(dir, sizeof(dir), "%s", path);
-        char * slash = strrchr(dir, '/');
-        if (slash) *slash = 0; else snprintf(dir, sizeof(dir), ".");
-        (void) library_fsync_dir(dir);
+    if (ok) ok = renameat(dirfd, temp, dirfd, name) == 0;
+    if (!ok) unlinkat(dirfd, temp, 0);
+    else (void) fsync(dirfd);
+    return ok;
+}
+
+bool queue_resume_write(const char * path, const queue_resume_t * s) {
+    if (!path || !path[0]) return false;
+    char dir[PATH_MAX], name[NAME_MAX];
+    const char * slash = strrchr(path, '/');
+    if (slash) {
+        size_t n = (size_t) (slash - path);
+        if (n >= sizeof(dir)) return false;
+        if (n == 0) { dir[0] = '/'; dir[1] = 0; }
+        else { memcpy(dir, path, n); dir[n] = 0; }
+        if (snprintf(name, sizeof(name), "%s", slash + 1) >= (int) sizeof(name)) return false;
+    } else {
+        snprintf(dir, sizeof(dir), ".");
+        if (snprintf(name, sizeof(name), "%s", path) >= (int) sizeof(name)) return false;
     }
+    int dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dirfd < 0) return false;
+    bool ok = queue_resume_write_at(dirfd, name, s);
+    close(dirfd);
     return ok;
 }
 

@@ -159,22 +159,20 @@ static void queue_start(lv_event_t * e, bool shuffle) {
     int * order = NULL, count, current;
     uint64_t revision;
     if (!gui_player_queue_snapshot(&order, &count, &current, &revision)) return;
-    if (!count) { free(order); return; }
-    char ** paths = calloc((size_t) count, sizeof(*paths));
-    if (!paths) { free(order); return; }
-    bool ok = true;
-    for (int i = 0; i < count; i++) {
-        const char * path = gui_player_get_track_path_at(order[i]);
-        paths[i] = path ? strdup(path) : NULL;
-        if (!paths[i]) { ok = false; break; }
-    }
     free(order);
-    if (!ok) { for (int i = 0; i < count; i++) free(paths[i]); free(paths); return; }
-    gui_player_set_play_mode(shuffle ? PLAY_MODE_SHUFFLE : PLAY_MODE_SEQUENTIAL);
+    if (!count) return;
     unsigned int seed = (unsigned int) time(NULL) ^ lv_tick_get();
     int selected = shuffle ? (int) (rand_r(&seed) % (unsigned int) count) : 0;
+    /* Snapshot while the current mode still defines display order, then
+     * switch mode. Ranks stay integers; paths that are already resolved
+     * keep their existing pointers. */
+    if (!gui_player_queue_restart_displayed(selected)) {
+        show_error_toast("Cannot start queue");
+        return;
+    }
     clear_player_source();
-    on_file_selected(paths, count, selected);
+    gui_player_set_play_mode(shuffle ? PLAY_MODE_SHUFFLE : PLAY_MODE_SEQUENTIAL);
+    play_track_at(selected);
 }
 static void queue_start_sequential(lv_event_t * e) { queue_start(e, false); }
 static void queue_start_shuffle(lv_event_t * e) { queue_start(e, true); }
@@ -183,7 +181,8 @@ static void queue_clear_cb(lv_event_t * e) {
 }
 static void queue_save_done(const char * name, void * data) {
     (void) data;
-    show_info_toast(gui_player_queue_save_as(name) ? "Playlist saved" : "Cannot save: name exists, invalid, or streaming entries");
+    if (gui_player_queue_save_as(name)) show_info_toast("Saving playlist…");
+    else show_error_toast("Cannot save playlist");
 }
 static void queue_save_cb(lv_event_t * e) {
     queue_actions_hide(e);
@@ -236,6 +235,10 @@ void open_queue_screen(void) {
 }
 
 void gui_queue_poll(void) {
+    bool save_done = false, save_ok = false;
+    if (gui_player_queue_save_as_poll(&save_done, &save_ok) && save_done) {
+        show_info_toast(save_ok ? "Playlist saved" : "Cannot save: invalid or streaming entries");
+    }
     static uint64_t saved_revision;
     static uint32_t last_checkpoint;
     uint32_t now = lv_tick_get();

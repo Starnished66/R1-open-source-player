@@ -59,11 +59,16 @@ bool gui_player_queue_snapshot(int ** order, int * count, int * current, uint64_
 bool gui_player_queue_edit(uint64_t revision, int from, int to);
 bool gui_player_queue_select(uint64_t revision, int index);
 void gui_player_queue_clear_all(void);
+/* Reorder the current queue into its displayed order and select one row.
+ * Lazy ranks and explicit path pointers are moved, not copied. */
+bool gui_player_queue_restart_displayed(int selected_index);
 bool gui_player_queue_save_as(const char * name);
+bool gui_player_queue_save_as_poll(bool *done, bool *ok);
 void gui_player_queue_checkpoint(void);
 void gui_player_queue_checkpoint_urgent(void);
 void gui_player_queue_poll_urgent(void);
 bool gui_player_queue_write_busy(void);
+bool gui_player_queue_checkpoint_failed(void);
 void gui_player_queue_flush(void);
 void gui_player_play_at(int index);
 void gui_player_play_at_from(int index, double start_seconds);

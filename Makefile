@@ -867,6 +867,13 @@ sd_ready_test:
 	    -o $(BUILD_TARGET_DIR)/sd_ready_test
 	./$(BUILD_TARGET_DIR)/sd_ready_test
 
+# Pure hotplug identity rules (sd_card_identity.h). Not part of `all`.
+.PHONY: sd-card-identity-selftest
+sd-card-identity-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -Isrc/ui src/ui/sd_card_identity_test.c -o $(BUILD_TARGET_DIR)/sd_card_identity_test
+	./$(BUILD_TARGET_DIR)/sd_card_identity_test
+
 .PHONY: wifi-status-selftest subprocess-timeout-selftest
 wifi-status-selftest:
 	@mkdir -p $(BUILD_TARGET_DIR)

@@ -30,8 +30,15 @@
 #define MIGRATION_COMPLETE METADATA_DB_DIR "/migration.complete"
 
 static bool db_ready;
+static int migration_db_fd = -1;
+static int migration_root_fd = -1;
+static int migration_old_fd = -1;
 static bool migration_pending;
 static bool migration_cleanup;
+static bool migration_archive_retained;
+static bool migration_replayed;
+static bool migration_applied;
+static size_t migration_unmatched;
 static tagcache_stats_snapshot_t * migration_stats;
 static pthread_once_t metadata_db_mutex_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t metadata_db_mutex;
@@ -78,9 +85,12 @@ static bool database_file_name(const char * name) {
 }
 
 /* Returns -1 on an inspection error, 0 when absent, and 1 when present. */
-static int database_files_present(const char * dir) {
-    DIR * d = opendir(dir);
-    if (!d) return errno == ENOENT ? 0 : -1;
+static int database_files_present_fd(int fd) {
+    if (fd < 0) return 0;
+    int scan_fd = openat(fd, ".", O_RDONLY | O_DIRECTORY);
+    if (scan_fd < 0) return errno == ENOENT ? 0 : -1;
+    DIR * d = fdopendir(scan_fd);
+    if (!d) { close(scan_fd); return -1; }
     int result = 0;
     for (;;) {
         errno = 0;
@@ -95,64 +105,79 @@ static int database_files_present(const char * dir) {
     return result;
 }
 
-static int migration_marker_present(const char * path) {
+static int migration_marker_present_fd(const char *path) {
+    if (migration_db_fd < 0) return -1;
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
     struct stat st;
-    if (lstat(path, &st) != 0) return errno == ENOENT ? 0 : -1;
+    if (fstatat(migration_db_fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return errno == ENOENT ? 0 : -1;
     return S_ISREG(st.st_mode) ? 1 : -1;
 }
 
+static bool migration_pin_dirs(void) {
+    if (migration_db_fd >= 0) close(migration_db_fd);
+    if (migration_root_fd >= 0) close(migration_root_fd);
+    if (migration_old_fd >= 0) close(migration_old_fd);
+    migration_db_fd = tagcache_dup_directory_fd();
+    migration_root_fd = migration_db_fd >= 0 ? openat(migration_db_fd, "..", O_RDONLY | O_DIRECTORY) : -1;
+    migration_old_fd = migration_root_fd >= 0 ? openat(migration_root_fd, ".open_hiby_player", O_RDONLY | O_DIRECTORY) : -1;
+    if (migration_db_fd < 0 || migration_root_fd < 0) return false;
+    if (migration_old_fd < 0 && errno != ENOENT) return false;
+    return true;
+}
+
+static void migration_unpin_dirs(void) {
+    if (migration_old_fd >= 0) close(migration_old_fd);
+    if (migration_root_fd >= 0) close(migration_root_fd);
+    if (migration_db_fd >= 0) close(migration_db_fd);
+    migration_old_fd = migration_root_fd = migration_db_fd = -1;
+}
+
 static bool migration_detect(void) {
-    migration_pending = migration_cleanup = false;
-    int complete = migration_marker_present(MIGRATION_COMPLETE);
-    int pending = migration_marker_present(MIGRATION_PENDING);
+    migration_pending = migration_cleanup = migration_archive_retained = migration_applied = false;
+    migration_replayed = false;
+    uint32_t stored_state = tagcache_migration_state();
+    if (stored_state & TAGCACHE_MIGRATION_APPLIED) {
+        migration_applied = true;
+        migration_archive_retained = (stored_state & TAGCACHE_MIGRATION_ARCHIVE) != 0;
+        return true;
+    }
+    int complete = migration_marker_present_fd(MIGRATION_COMPLETE);
+    int pending = migration_marker_present_fd(MIGRATION_PENDING);
     if (complete < 0 || pending < 0) return false;
     if (complete) {
-        int old = database_files_present(METADATA_DB_OLD_DIR);
+        int old = database_files_present_fd(migration_old_fd);
         if (old < 0) return false;
-        migration_cleanup = old != 0 || pending != 0;
+        migration_archive_retained = old != 0;
+        migration_cleanup = false;
         return true;
     }
     if (pending) {
         migration_pending = true;
         return true;
     }
-    int current = database_files_present(METADATA_DB_DIR);
+    int current = database_files_present_fd(migration_db_fd);
     if (current < 0) return false;
     if (current) return true;
-    int old = database_files_present(METADATA_DB_OLD_DIR);
+    int old = database_files_present_fd(migration_old_fd);
     if (old < 0) return false;
     migration_pending = old != 0;
     return true;
 }
 
 static bool migration_write_marker(const char * path) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    int fd = openat(migration_db_fd, name, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) {
-        if (errno != EEXIST || migration_marker_present(path) != 1) return false;
-        fd = open(path, O_RDONLY);
+        if (errno != EEXIST || migration_marker_present_fd(path) != 1) return false;
+        fd = openat(migration_db_fd, name, O_RDONLY);
         if (fd < 0) return false;
     }
     bool ok = fsync(fd) == 0;
     if (close(fd) != 0) ok = false;
-    return ok && library_fsync_dir(METADATA_DB_DIR) && library_fsync_dir(METADATA_DB_ROOT);
-}
-
-static bool migration_delete_old_files(void) {
-    DIR * d = opendir(METADATA_DB_OLD_DIR);
-    if (!d) return errno == ENOENT;
-    bool ok = true;
-    for (;;) {
-        errno = 0;
-        struct dirent * de = readdir(d);
-        if (!de) {
-            if (errno) ok = false;
-            break;
-        }
-        if (!database_file_name(de->d_name)) continue;
-        if (unlinkat(dirfd(d), de->d_name, 0) != 0 && errno != ENOENT) ok = false;
-    }
-    if (closedir(d) != 0) ok = false;
-    return library_fsync_dir(METADATA_DB_OLD_DIR) && ok;
+    return ok && fsync(migration_db_fd) == 0 && fsync(migration_root_fd) == 0;
 }
 
 bool metadata_db_migration_needed(void) {
@@ -165,11 +190,18 @@ bool metadata_db_migration_cleanup_pending(void) {
     return migration_cleanup;
 }
 
+bool metadata_db_migration_archive_retained(void) {
+    METADATA_DB_GUARD;
+    return migration_archive_retained;
+}
+
 void metadata_db_migration_cancel(void) {
     METADATA_UPDATE_GUARD;
     METADATA_DB_GUARD;
     tagcache_free_stats(migration_stats);
     migration_stats = NULL;
+    migration_replayed = false;
+    migration_unmatched = 0;
 }
 
 bool metadata_db_migration_prepare(void) {
@@ -178,7 +210,10 @@ bool metadata_db_migration_prepare(void) {
     metadata_db_migration_cancel();
     if (!db_ready) return false;
     if (!migration_pending) return true;
-    if (!tagcache_extract_stats(METADATA_DB_OLD_DIR, &migration_stats)) return false;
+    if (migration_old_fd < 0) return false;
+    char old_dir[64];
+    snprintf(old_dir, sizeof(old_dir), "/proc/self/fd/%d", migration_old_fd);
+    if (!tagcache_extract_stats(old_dir, &migration_stats)) return false;
     if (!migration_write_marker(MIGRATION_PENDING)) {
         metadata_db_migration_cancel();
         return false;
@@ -191,21 +226,35 @@ bool metadata_db_migration_finish(void) {
     METADATA_DB_GUARD;
     if (!db_ready || metadata_db_get_load_outcome() != METADATA_DB_LOAD_SUCCESS_NORMAL) return false;
     if (migration_pending) {
-        if (!migration_stats || !tagcache_replay_stats(migration_stats)) return false;
-        if (!metadata_db_end_update() || metadata_db_get_load_outcome() != METADATA_DB_LOAD_SUCCESS_NORMAL) return false;
-        if (!library_fsync_dir(METADATA_DB_DIR) || !library_fsync_dir(METADATA_DB_ROOT) ||
-            !migration_write_marker(MIGRATION_COMPLETE)) return false;
+        /* Replay occurs in metadata_db_end_update(), before the first
+         * generation pointer publication.  If finish is called before that
+         * boundary, leave the pending migration untouched. */
+        if (!migration_replayed || !migration_applied) return false;
+        if (!migration_write_marker(MIGRATION_COMPLETE)) {
+            /* The new generation and its applied state are already durable;
+             * completion is cleanup bookkeeping and must not report the old
+             * database as still active. */
+            migration_pending = false;
+            migration_cleanup = true;
+            migration_archive_retained = true;
+            tagcache_free_stats(migration_stats);
+            migration_stats = NULL;
+            return true;
+        }
         migration_pending = false;
-        migration_cleanup = true;
+        migration_cleanup = false;
+        migration_archive_retained = true;
         metadata_db_migration_cancel();
     }
     if (migration_cleanup) {
-        if (!library_fsync_dir(METADATA_DB_DIR) || !library_fsync_dir(METADATA_DB_ROOT) ||
-            !migration_write_marker(MIGRATION_COMPLETE)) return false;
-        if (unlink(MIGRATION_PENDING) != 0 && errno != ENOENT) return false;
-        if (!library_fsync_dir(METADATA_DB_DIR)) return false;
-        migration_cleanup = !migration_delete_old_files();
+        if (!migration_write_marker(MIGRATION_COMPLETE)) return true;
+        migration_cleanup = false;
+        migration_archive_retained = true;
+        tagcache_free_stats(migration_stats);
+        migration_stats = NULL;
     }
+    if (migration_applied && !migration_pending && migration_marker_present_fd(MIGRATION_COMPLETE) == 0)
+        migration_write_marker(MIGRATION_COMPLETE);
     return true;
 }
 
@@ -327,13 +376,63 @@ metadata_db_load_outcome_t metadata_db_open(void) {
 #endif
 
     struct stat directory_stat;
-    if ((stat(METADATA_DB_DIR, &directory_stat) != 0 &&
-         (errno != ENOENT || mkdir(METADATA_DB_DIR, 0755) != 0)) || !migration_detect()) {
+    if (stat(METADATA_DB_DIR, &directory_stat) != 0 &&
+        (errno != ENOENT || mkdir(METADATA_DB_DIR, 0755) != 0)) {
         last_outcome = METADATA_DB_LOAD_FAILED;
         return last_outcome;
     }
-    tagcache_open(METADATA_DB_DIR);
+    if (!tagcache_open(METADATA_DB_DIR) || !migration_pin_dirs() || !migration_detect()) {
+        tagcache_close();
+        migration_unpin_dirs();
+        last_outcome = METADATA_DB_LOAD_FAILED;
+        return last_outcome;
+    }
     return capture_tagcache_outcome(true);
+}
+
+bool metadata_db_storage_current(void) {
+    METADATA_DB_GUARD;
+    return db_ready && tagcache_storage_current();
+}
+
+int metadata_db_dup_directory_fd(void) {
+    METADATA_DB_GUARD;
+    return migration_db_fd >= 0 ? dup(migration_db_fd) : -1;
+}
+
+bool metadata_db_numeric_write_failed(void) {
+    METADATA_DB_GUARD;
+    return tagcache_numeric_write_failed();
+}
+
+metadata_db_snapshot_t *metadata_db_snapshot_open(bool recency) {
+    METADATA_DB_GUARD;
+    return db_ready ? tagcache_snapshot_open(recency) : NULL;
+}
+
+int metadata_db_snapshot_count(const metadata_db_snapshot_t *snapshot) {
+    METADATA_DB_GUARD;
+    return tagcache_snapshot_count(snapshot);
+}
+
+bool metadata_db_snapshot_path_at(const metadata_db_snapshot_t *snapshot, int rank, char *out, size_t out_size) {
+    METADATA_DB_GUARD;
+    return tagcache_snapshot_path_at(snapshot, rank, out, out_size);
+}
+
+void metadata_db_snapshot_close(metadata_db_snapshot_t *snapshot) {
+    METADATA_DB_GUARD;
+    tagcache_snapshot_close(snapshot);
+}
+
+metadata_db_snapshot_t *metadata_db_snapshot_retain(metadata_db_snapshot_t *snapshot) {
+    METADATA_DB_GUARD;
+    return tagcache_snapshot_retain(snapshot);
+}
+
+int metadata_db_snapshot_dup_directory_fd(const metadata_db_snapshot_t *snapshot) {
+    METADATA_DB_GUARD;
+    return tagcache_snapshot_dup_directory_fd(snapshot);
 }
 
 metadata_db_load_outcome_t metadata_db_reload(void) {
@@ -363,9 +462,14 @@ bool metadata_db_prepare_rebuild(void) {
         return db_ready;
     if (outcome == METADATA_DB_LOAD_UNMOUNTED) return false;
 
-    if (!migration_detect()) return false;
     mkdir(METADATA_DB_DIR, 0755);
     bool prepared = tagcache_open_for_rebuild(METADATA_DB_DIR);
+    if (prepared) prepared = migration_pin_dirs();
+    if (prepared) prepared = migration_detect();
+    if (!prepared) {
+        tagcache_close();
+        migration_unpin_dirs();
+    }
     capture_tagcache_outcome(false);
     db_ready = prepared;
     return db_ready;
@@ -411,6 +515,7 @@ void metadata_db_close(void) {
     metadata_db_migration_cancel();
     migration_pending = migration_cleanup = false;
     tagcache_close();
+    migration_unpin_dirs();
     db_ready = false;
     last_outcome = METADATA_DB_LOAD_UNMOUNTED;
     path_cache_drop();
@@ -459,8 +564,20 @@ bool metadata_db_end_update(void) {
     METADATA_UPDATE_GUARD;
     METADATA_DB_GUARD;
     if (!db_ready) return false;
+    if (migration_pending && migration_stats && !migration_replayed) {
+        if (!tagcache_replay_stats_allow_missing(migration_stats, &migration_unmatched)) {
+            tagcache_abort_update();
+            return false;
+        }
+        migration_replayed = true;
+        migration_archive_retained = migration_unmatched != 0;
+        tagcache_set_staged_migration_state(TAGCACHE_MIGRATION_APPLIED |
+                                            (migration_archive_retained ? TAGCACHE_MIGRATION_ARCHIVE : 0));
+    }
     bool ok = tagcache_end_update_with_lock(metadata_query_unlock, metadata_query_lock);
     capture_tagcache_outcome(true);
+    if (ok && migration_pending) migration_applied = true;
+    if (!ok) { migration_replayed = false; migration_unmatched = 0; }
     return ok;
 }
 
@@ -469,6 +586,8 @@ void metadata_db_abort_update(void) {
     METADATA_DB_GUARD;
     if (!db_ready) return;
     tagcache_abort_update();
+    migration_replayed = false;
+    migration_unmatched = 0;
     capture_tagcache_outcome(true);
 }
 
@@ -694,7 +813,20 @@ void metadata_db_get_az_table(metadata_db_az_kind_t kind, int out_table[27]) {
     for (int i = 24; i >= 0; i--) {
         if (out_table[i] == -1) out_table[i] = out_table[i + 1];
     }
-    out_table[26] = out_table[0] > 0 ? 0 : -1;
+    /* The first row may itself be a digit or punctuation.  Checking the
+     * offset of A misses that case when A is present at offset zero. */
+    out_table[26] = -1;
+    if (count > 0) {
+        unsigned char first = 0;
+        if (group_kind >= 0) {
+            tagcache_group_t group;
+            if (tagcache_group_at(group_kind, 0, &group)) first = (unsigned char)group.name[0];
+        } else {
+            tagcache_song_t song;
+            if (tagcache_song_fields_at_title_rank(0, TAGCACHE_FIELD_TITLE, &song)) first = (unsigned char)song.title[0];
+        }
+        if (!((first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z'))) out_table[26] = 0;
+    }
 }
 
 int metadata_db_search_names(metadata_db_az_kind_t kind, const char *needle, int max_rows,

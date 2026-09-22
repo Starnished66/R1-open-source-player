@@ -78,8 +78,15 @@ static bool reader_open(int32_t gen) {
 
 static bool reader_index(int32_t slot, struct index_entry *out) {
     if (!reader_fds_ready || reader_master_fd < 0 || !out || slot < 0 || slot >= ent_count) return false;
-    return reader_read_at(reader_master_fd, out, sizeof(*out),
-                          (off_t)sizeof(struct master_header) + (off_t)slot * sizeof(*out));
+    for (int attempt = 0; attempt < 8; attempt++) {
+        unsigned epoch = atomic_load_explicit(&numeric_epoch, memory_order_acquire);
+        if (!reader_read_at(reader_master_fd, out, sizeof(*out),
+                            (off_t)sizeof(struct master_header) + (off_t)slot * sizeof(*out))) return false;
+        if (READER == &committed_reader) numeric_overlay(slot, out);
+        if (READER != &committed_reader ||
+            epoch == atomic_load_explicit(&numeric_epoch, memory_order_acquire)) return true;
+    }
+    return false;
 }
 
 static bool reader_string(int tag, int32_t seek, int32_t slot, char *out, size_t out_size) {

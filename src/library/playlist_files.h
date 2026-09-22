@@ -21,6 +21,13 @@ bool playlist_files_rename(const char * path, const char * name, char * out, siz
 bool playlist_files_edit_entry(const char * path, int from, int to);
 bool playlist_files_write_new(const char * dir, const char * name,
                               const char * const * paths, int count, char * out, size_t size);
+typedef bool (*playlist_files_path_provider)(void * context, int index, const char ** path);
+bool playlist_files_write_new_stream(const char * dir, const char * name,
+                                     int count, playlist_files_path_provider provider,
+                                     void * context, char * out, size_t size);
+bool playlist_files_write_new_stream_at(int dirfd, const char * name, int count,
+                                        playlist_files_path_provider provider, void * context,
+                                        char * out_leaf, size_t size);
 
 /* Appends song_path as a new line to the M3U file at m3u_path, creating the
  * file (but not its parent directory) if it doesn't already exist. Returns

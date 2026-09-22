@@ -1006,6 +1006,20 @@ static void update_timer_cb(lv_timer_t * timer) {
         gui_player_handle_track_finished();
     }
     gui_player_poll_confirmed_playback();
+    static bool queue_checkpoint_failure_notified;
+    if (gui_player_queue_checkpoint_failed()) {
+        if (!queue_checkpoint_failure_notified) {
+            show_error_toast("Queue checkpoint failed; storage may be read-only");
+            queue_checkpoint_failure_notified = true;
+        }
+    } else queue_checkpoint_failure_notified = false;
+    static bool numeric_failure_notified;
+    if (metadata_db_numeric_write_failed()) {
+        if (!numeric_failure_notified) {
+            show_error_toast("Playback history could not be saved");
+            numeric_failure_notified = true;
+        }
+    } else numeric_failure_notified = false;
     gui_queue_poll();
     gui_network_poll_airplay_overlay();
     gui_track_info_poll();
@@ -1670,6 +1684,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 
 
 void gui_deinit(void) {
+    gui_library_cancel_scan();
     gui_library_cancel_background_work();
     gui_subsonic_cancel_background_work();
     gui_network_cancel_background_work();

@@ -11,6 +11,9 @@
 #include "src/draw/snapshot/lv_snapshot.h"
 
 extern void on_file_browser_selected(char ** new_playlist, int count, int selected_index);
+typedef struct file_browser_index file_browser_index_t;
+extern void on_file_browser_index_selected(file_browser_index_t *index, unsigned playable_count,
+                                           unsigned selected_playable);
 extern void open_queue_screen(void);
 extern void nav_remove_stack_slot(int depth);
 extern void mount_sd_card_if_needed(void);
@@ -30,6 +33,7 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include "metadata_db.h"
 #include "tagcache.h"
 #include "file_browser.h"
+#include "sd_card_identity.h"
 #include "playlist_files.h"
 #include "cue_parser.h"
 #include "cover_decode.h"
@@ -84,6 +88,8 @@ static gui_busy_handle_t library_rescan_token = 0;
 static gui_busy_handle_t sd_format_token = 0;
 static atomic_int library_scan_progress_total = 0;
 static atomic_int library_scan_progress_done = 0;
+static atomic_bool library_scan_cancel_requested = false;
+void gui_library_cancel_scan(void);
 
 static uint64_t albums_page_open_requested_ms;
 static uint64_t album_lazy_job_started_ms;
@@ -292,6 +298,7 @@ static lv_obj_t * build_files_screen(void) {
     build_screen_header(scr, "Files", generic_back_cb, NULL, NULL);
 
     file_browser_init(scr, MUSIC_ROOT_DIR, on_file_browser_selected, on_cue_file_selected);
+    file_browser_set_index_select_cb(on_file_browser_index_selected);
 
     finalize_screen_navigation(scr);
     return scr;
@@ -4079,6 +4086,7 @@ static void start_library_rescan_with_repair(bool allow_rebuild) {
      * cancellation is cooperative and bounded by the artwork timeout. */
     quiesce_album_artwork_workers();
     library_rescan_allow_rebuild = allow_rebuild;
+    atomic_store_explicit(&library_scan_cancel_requested, false, memory_order_release);
     library_operation_outcome = !allow_rebuild && library_cache_load_pending ? library_cache_load_outcome
                                                                            : METADATA_DB_LOAD_SUCCESS_NORMAL;
     atomic_store_explicit(&library_rescan_done_flag, false, memory_order_relaxed);
@@ -4252,7 +4260,14 @@ void poll_library_rescan(void) {
     }
 
     library_rescan_active = false;
+    bool scan_cancelled = atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire);
     pthread_join(library_rescan_thread, NULL);
+
+    if (scan_cancelled) {
+        gui_busy_hide(library_rescan_token);
+        nav_reset_to_home();
+        return;
+    }
 
     refresh_library_screens_after_reload();
 
@@ -4309,6 +4324,7 @@ void poll_library_rescan(void) {
  * see them regardless of which one is defined first. */
 static void show_sd_mount_failed_popup(void); /* defined below, alongside its popup */
 static bool sd_mount_fail_notified = false;
+static bool sd_handoff_pending = false;
 
 #ifndef HOST_BUILD
 /* Periodic polling for SD card mount state changes.
@@ -4336,42 +4352,73 @@ static bool sd_card_mount_attached(dev_t * mounted_device) {
     return true;
 }
 
-static bool sd_kernel_device_matches(dev_t mounted_device, const char * node) {
+static sd_probe_result_t sd_kernel_device_probe(dev_t mounted_device, const char * node) {
     char path[96];
     snprintf(path, sizeof(path), "/sys/class/block/%s/dev", node);
+    errno = 0;
     FILE * file = fopen(path, "r");
-    if (!file) return false;
+    if (!file) return errno == ENOENT ? SD_PROBE_ABSENT : SD_PROBE_UNKNOWN;
     unsigned major_number, minor_number;
-    bool matches = fscanf(file, "%u:%u", &major_number, &minor_number) == 2 &&
-                   mounted_device == makedev(major_number, minor_number);
+    int parsed = fscanf(file, "%u:%u", &major_number, &minor_number);
     fclose(file);
-    return matches;
+    if (parsed != 2) return SD_PROBE_UNKNOWN;
+    return mounted_device == makedev(major_number, minor_number) ? SD_PROBE_MATCH : SD_PROBE_DIFFERENT;
 }
 
-bool sd_card_root_is_mounted(void) {
+static bool sd_card_root_is_mounted_observed(bool * attached_observed) {
     dev_t mounted_device;
-    if (!sd_card_mount_attached(&mounted_device)) return false;
+    bool attached = sd_card_mount_attached(&mounted_device);
+    if (attached_observed) *attached_observed = attached;
+    if (!attached) return false;
     /* ntfs-3g uses a FUSE filesystem device rather than the underlying MMC
      * device. Its identity is checked by the card CID in the hotplug poll;
      * presence in sysfs still catches a removed card. */
     if (major(mounted_device) != 179) {
         struct stat st;
-        return stat("/sys/class/block/mmcblk0", &st) == 0;
+        if (stat("/sys/class/block/mmcblk0", &st) == 0) return true;
+        /* A failed stat that is not "node missing" is not a pulled card. */
+        return errno != ENOENT;
     }
     /* The kernel can leave an exFAT mount attached after the card is pulled.
      * /dev/mmcblk0p1 can also be stale if mdev missed the replacement event.
      * Compare the mount's actual device with sysfs, which follows the newly
-     * inserted card even when its /dev node has not been recreated. */
-    return sd_kernel_device_matches(mounted_device, "mmcblk0p1") ||
-           sd_kernel_device_matches(mounted_device, "mmcblk0");
+     * inserted card even when its /dev node has not been recreated. A sysfs
+     * read error is not that comparison and must not look like removal. */
+    return !sd_card_probes_confirm_removed(
+        sd_kernel_device_probe(mounted_device, "mmcblk0p1"),
+        sd_kernel_device_probe(mounted_device, "mmcblk0"));
+}
+
+bool sd_card_root_is_mounted(void) {
+    return sd_card_root_is_mounted_observed(NULL);
+}
+
+static int sd_card_sysfs_node_stat(const char * node, int * err) {
+    char path[96];
+    struct stat st;
+    snprintf(path, sizeof(path), "/sys/class/block/%s", node);
+    if (stat(path, &st) == 0) {
+        *err = 0;
+        return 0;
+    }
+    *err = errno;
+    return -1;
 }
 
 static bool sd_card_device_node_present(void) {
-    struct stat st;
+    int ignored = 0;
     /* Query sysfs rather than /dev: mdev may have left stale nodes behind.
      * A partition-less card has only the whole-disk entry. */
-    return stat("/sys/class/block/mmcblk0p1", &st) == 0 ||
-           stat("/sys/class/block/mmcblk0", &st) == 0;
+    return sd_card_sysfs_node_stat("mmcblk0p1", &ignored) == 0 ||
+           sd_card_sysfs_node_stat("mmcblk0", &ignored) == 0;
+}
+
+/* Both nodes missing. A read error on either one is not confirmation. */
+static bool sd_card_device_nodes_confirmed_absent(void) {
+    int partition_errno = 0, disk_errno = 0;
+    int partition_rc = sd_card_sysfs_node_stat("mmcblk0p1", &partition_errno);
+    int disk_rc = sd_card_sysfs_node_stat("mmcblk0", &disk_errno);
+    return sd_card_sysfs_stats_confirm_absent(partition_rc, partition_errno, disk_rc, disk_errno);
 }
 
 /* Whole-disk sysfs entry -- present whenever a card is physically inserted
@@ -4416,6 +4463,7 @@ void poll_sd_card_hotplug(void) {
      * state to debounce brief transient unmounts. */
     static int unmount_confirm_streak = 0;
     static dev_t last_mounted_device;
+    static bool have_last_mounted_device;
     static char last_card_cid[64];
     static bool have_last_card_identity;
 #define SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD 2
@@ -4424,16 +4472,26 @@ void poll_sd_card_hotplug(void) {
     if (last_check != 0 && now - last_check < SD_CARD_MOUNT_POLL_SECONDS) return;
     last_check = now;
 
-    bool mounted = sd_card_root_is_mounted();
-    bool stale_mount = !mounted && sd_card_mount_attached(NULL);
+    bool mount_observed = false;
+    bool mounted = sd_card_root_is_mounted_observed(&mount_observed);
+    /* Only an attached mount that the kernel probes proved stale may bypass
+     * the normal two-poll absence debounce. If the initial mount stat was
+     * inconclusive, a successful retry is not evidence of a stale mount. */
+    bool stale_mount = sd_card_stale_mount_confirmed(mount_observed, mounted);
     dev_t current_mounted_device = 0;
+    /* The mount check above already stat'd this card. This reread can fail
+     * on its own; a leftover 0 is not a different device number. */
+    bool have_current_device = mounted && sd_card_mount_attached(&current_mounted_device);
     char current_card_cid[64];
-    if (mounted) sd_card_mount_attached(&current_mounted_device);
     sd_card_read_cid(current_card_cid);
-    bool replaced_between_polls = mounted && was_mounted && have_last_card_identity &&
-        (last_mounted_device != current_mounted_device ||
-         (last_card_cid[0] && current_card_cid[0] && strcmp(last_card_cid, current_card_cid) != 0));
-    if (replaced_between_polls && !library_rescan_active) {
+    bool replaced_between_polls = sd_card_identity_replaced(
+        mounted, was_mounted, have_last_card_identity, have_last_mounted_device, last_mounted_device,
+        have_current_device, current_mounted_device, last_card_cid, current_card_cid);
+    /* Unconfirmed absence still cancels a scan and, below, blocks writes.
+     * It does not latch sd_handoff_pending; that waits for confirmation. */
+    if (sd_card_sample_cancels_scan(mounted, replaced_between_polls, library_rescan_active))
+        gui_library_cancel_scan();
+    if (replaced_between_polls && !library_rescan_active && current_card_cid[0]) {
         /* An old card may have been unmounted and a new one mounted wholly
          * between polls. The mount is valid, but the in-memory library and
          * queue still belong to the previous card. */
@@ -4443,7 +4501,10 @@ void poll_sd_card_hotplug(void) {
         clear_removed_sd_library();
         was_mounted = false;
     }
-    if (stale_mount || (mounted && !sd_card_device_node_present())) {
+    /* Node-missing is decided before umount changes `mounted`. A sysfs
+     * read error is not node-missing; only ENOENT on both nodes is. */
+    bool forced_removal = mounted && sd_card_device_nodes_confirmed_absent();
+    if (stale_mount || forced_removal) {
         /* -l (lazy): the node's already gone, so there's no real device
          * left to flush to, and a plain umount would fail with EBUSY if
          * this app (or anything else) still has an fd open on a file under
@@ -4453,6 +4514,7 @@ void poll_sd_card_hotplug(void) {
         char * argv[] = { (char *) "umount", (char *) "-l", (char *) MUSIC_ROOT_DIR, NULL };
         subprocess_run(argv, NULL, 0);
         mounted = false;
+        if (library_rescan_active) gui_library_cancel_scan();
     }
 
     group_probe_storage_available = mounted;
@@ -4460,6 +4522,8 @@ void poll_sd_card_hotplug(void) {
         if (group_probe_job && group_probe_job_generation == group_probe_generation)
             cancel_group_song_probes();
         gui_player_notify_sd_unmounted_immediate();
+        bool removal_confirmed = sd_card_absence_confirmed(
+            stale_mount || forced_removal, 0, SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD);
         if (was_mounted) {
             /* Stop post-scan artwork reads/writes as soon as removal is
              * observed. Joining is deliberately deferred to the next
@@ -4468,23 +4532,28 @@ void poll_sd_card_hotplug(void) {
             cancel_album_thumbnail_generation();
             atomic_store(&album_thumb_gen_retry_pending, false);
             unmount_confirm_streak++;
-            if ((stale_mount || unmount_confirm_streak >= SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD) &&
-                !library_rescan_active) {
+            removal_confirmed = sd_card_absence_confirmed(
+                stale_mount || forced_removal, unmount_confirm_streak,
+                SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD);
+            if (removal_confirmed && !library_rescan_active) {
                 /* Close old handles before loading the next card. */
                 clear_removed_sd_library();
                 was_mounted = false;
                 unmount_confirm_streak = 0;
                 have_last_card_identity = false;
+                have_last_mounted_device = false;
+                last_card_cid[0] = '\0';
             }
             /* Else: not yet confirmed (or a rescan from something else,
              * e.g. Settings > Update Music Database, is already running)
              * -- was_mounted deliberately stays true, so a flicker that
-             * remounts before reaching the threshold below is
-             * indistinguishable from nothing having happened at all: the
-             * mounted branch's own streak reset plus its own
-             * `!was_mounted` reinsertion check (still false) mean neither
-             * edge ever fires. */
+             * remounts before reaching the threshold is not a handoff.
+             * The latch below follows removal_confirmed, which was sampled
+             * before the streak reset, so a confirmed removal stays pending
+             * while the scan still holds the database. */
         }
+        sd_handoff_pending = sd_card_handoff_after_sample(
+            sd_handoff_pending, removal_confirmed, replaced_between_polls);
 
         /* Tear down state tied to the old card before mounting a replacement.
          * Otherwise a rapid swap can hide the unmounted edge from the next
@@ -4525,7 +4594,20 @@ void poll_sd_card_hotplug(void) {
     mount_fail_streak = 0;
     sd_mount_fail_notified = false;
     unmount_confirm_streak = 0; /* seeing "mounted" again cancels any not-yet-confirmed removal */
-    if (library_rescan_active && (!was_mounted || replaced_between_polls)) {
+    /* Same card again does not drop a latch. Only confirmation or a real
+     * replacement sets one; passing a cleared streak here leaves a real
+     * pending handoff untouched. */
+    sd_handoff_pending = sd_card_handoff_after_sample(
+        sd_handoff_pending,
+        sd_card_absence_confirmed(false, 0, SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD),
+        replaced_between_polls);
+    if (have_last_card_identity && !current_card_cid[0]) {
+        /* A transient CID read failure is an uncertain identity, never a
+         * license to restore the old card's queue or cache. */
+        gui_player_notify_sd_unmounted_immediate();
+        return;
+    }
+    if (library_rescan_active && (sd_handoff_pending || !was_mounted || replaced_between_polls)) {
         /* Keep the old identity until the scan worker releases its database
          * handles; the next poll must still perform the card handoff. */
         gui_player_notify_sd_unmounted_immediate();
@@ -4537,11 +4619,14 @@ void poll_sd_card_hotplug(void) {
     gui_player_notify_sd_mounted();
     /* Reset file browser and reload fallback fonts before triggering the
      * rescan screen switch. */
-    if (!was_mounted && !library_rescan_active) {
+    if (sd_handoff_pending && !library_rescan_active) {
+        if (was_mounted) clear_removed_sd_library();
+        was_mounted = false;
         file_browser_reset_to_root();
         fallback_font_on_sd_mounted();
         reload_library_on_sd_reinsert();
         gui_player_restore_sd_queue(false);
+        sd_handoff_pending = false;
     } else if (!boot_library_recheck_done) {
         boot_library_recheck_done = true;
         fallback_font_on_sd_mounted();
@@ -4559,10 +4644,17 @@ void poll_sd_card_hotplug(void) {
          * most once per run. */
         gui_player_restore_sd_queue(true);
     }
+    /* Handoff above may have cleared was_mounted. A missed reread must not
+     * be stored as device 0, or the next poll looks like a different card. */
+    have_last_mounted_device = sd_card_remember_mounted_device(
+        have_current_device, current_mounted_device, replaced_between_polls, was_mounted,
+        &last_mounted_device, have_last_mounted_device);
     was_mounted = true;
-    last_mounted_device = current_mounted_device;
-    snprintf(last_card_cid, sizeof(last_card_cid), "%s", current_card_cid);
-    have_last_card_identity = true;
+    if (current_card_cid[0]) snprintf(last_card_cid, sizeof(last_card_cid), "%s", current_card_cid);
+    /* An empty CID after a handoff must not resurrect the previous card's
+     * CID. A known device number remains a valid identity baseline, so a
+     * later device change is still detected while CID reads recover. */
+    have_last_card_identity = sd_card_identity_is_known(have_last_mounted_device, current_card_cid);
 }
 #else
 bool sd_card_root_is_mounted(void) {
@@ -5818,7 +5910,10 @@ void gui_library_reset_drag_state(void) {
 
 typedef struct {
     char root[600];
-    char spool_path[PATH_MAX];
+    int root_fd;
+    int spool_fd;
+    atomic_int refs;
+    atomic_bool cancel;
     atomic_bool done;
     bool ok;
     int count;
@@ -5826,16 +5921,44 @@ typedef struct {
     atomic_int progress;
 } scan_walk_work_t;
 
+static void scan_walk_release(scan_walk_work_t * w) {
+    if (atomic_fetch_sub_explicit(&w->refs, 1, memory_order_acq_rel) == 1) {
+        close(w->root_fd);
+        close(w->spool_fd);
+        free(w);
+    }
+}
+
+typedef struct {
+    FILE *spool;
+    int root_fd;
+    atomic_bool *cancel;
+} scan_spool_context_t;
+
+void gui_library_cancel_scan(void) {
+    atomic_store_explicit(&library_scan_cancel_requested, true, memory_order_release);
+}
+
 /* Binary length-prefixed spool: paths can contain whitespace and, unlike a
  * newline-delimited temporary file, this remains correct even for odd names.
  * The spool lives on the SD card, so discovery storage scales with library
  * size without consuming the device's RAM. */
 static bool scan_spool_visit_cb(const char * path, void * user) {
-    FILE * f = (FILE *) user;
-    size_t n = strlen(path);
+    scan_spool_context_t * ctx = user;
+    FILE * f = ctx->spool;
+    if (atomic_load_explicit(ctx->cancel, memory_order_acquire)) return false;
+    char logical[PATH_MAX];
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "/proc/self/fd/%d", ctx->root_fd);
+    const char * p = path;
+    if (strncmp(path, prefix, strlen(prefix)) == 0) {
+        snprintf(logical, sizeof(logical), "%s%s", MUSIC_ROOT_DIR, path + strlen(prefix));
+        p = logical;
+    }
+    size_t n = strlen(p);
     if (n > UINT32_MAX) return false;
     uint32_t len = (uint32_t) n;
-    return fwrite(&len, sizeof(len), 1, f) == 1 && fwrite(path, 1, n, f) == n;
+    return fwrite(&len, sizeof(len), 1, f) == 1 && fwrite(p, 1, n, f) == n;
 }
 
 
@@ -5844,28 +5967,40 @@ static bool scan_spool_visit_cb(const char * path, void * user) {
 
 static void * scan_walk_worker(void * arg) {
     scan_walk_work_t * w = (scan_walk_work_t *) arg;
-    FILE * spool = fopen(w->spool_path, "wb");
+    int writer_fd = dup(w->spool_fd);
+    FILE * spool = writer_fd >= 0 ? fdopen(writer_fd, "wb") : NULL;
     if (!spool) {
+        if (writer_fd >= 0) close(writer_fd);
         w->ok = false;
         w->done = true;
+        atomic_store_explicit(&w->done, true, memory_order_release);
+        scan_walk_release(w);
         return NULL;
     }
+    scan_spool_context_t context = { spool, w->root_fd, &w->cancel };
     w->ok = file_browser_walk_all_songs_excluding_top_level(
-        w->root, AUDIOBOOKS_LIBRARY_DIR_NAME, scan_spool_visit_cb, spool, &w->count, &w->progress,
+        w->root, AUDIOBOOKS_LIBRARY_DIR_NAME, scan_spool_visit_cb, &context, &w->count, &w->progress,
         &w->skipped);
     if (fclose(spool) != 0) w->ok = false;
     atomic_store_explicit(&w->done, true, memory_order_release);
+    scan_walk_release(w);
     return NULL;
 }
 
 #define SCAN_WALK_THREAD_STACK_SIZE (1024 * 1024)
-static bool scan_all_songs_with_timeout(const char * root, char * out_spool_path, size_t out_spool_size,
+static bool scan_all_songs_with_timeout(const char * root, int * out_spool_fd,
+                                        scan_walk_work_t ** out_owner,
                                         int * out_count, int * out_skipped) {
     scan_walk_work_t * w = calloc(1, sizeof(*w));
     if (!w) return false;
-    snprintf(w->root, sizeof(w->root), "%s", root);
-    snprintf(w->spool_path, sizeof(w->spool_path), "%s/.open_hiby_scan_%ld_%p.tmp",
-             root, (long) getpid(), (void *) w);
+    w->root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (w->root_fd < 0) { free(w); return false; }
+    snprintf(w->root, sizeof(w->root), "/proc/self/fd/%d", w->root_fd);
+    w->spool_fd = openat(w->root_fd, ".open_hiby_scan.tmp", O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (w->spool_fd < 0) { close(w->root_fd); free(w); return false; }
+    unlinkat(w->root_fd, ".open_hiby_scan.tmp", 0);
+    atomic_store(&w->refs, 2);
+    atomic_store(&w->cancel, false);
 
     pthread_attr_t attr;
     pthread_attr_t * attr_ptr = NULL;
@@ -5877,6 +6012,7 @@ static bool scan_all_songs_with_timeout(const char * root, char * out_spool_path
     bool created = pthread_create(&thread, attr_ptr, scan_walk_worker, w) == 0;
     if (attr_ptr) pthread_attr_destroy(&attr);
     if (!created) {
+        close(w->spool_fd); close(w->root_fd);
         free(w);
         return false;
     }
@@ -5888,15 +6024,18 @@ static bool scan_all_songs_with_timeout(const char * root, char * out_spool_path
         if (atomic_load_explicit(&w->done, memory_order_acquire)) {
             bool ok = w->ok;
             if (ok) {
-                snprintf(out_spool_path, out_spool_size, "%s", w->spool_path);
+                *out_spool_fd = w->spool_fd;
+                *out_owner = w;
                 *out_count = w->count;
                 if (out_skipped) *out_skipped = w->skipped;
             } else {
-                remove(w->spool_path);
+                /* The worker has already released its owner on done. */
             }
-            free(w);
+            if (!ok) scan_walk_release(w);
             return ok;
         }
+        if (atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire))
+            atomic_store_explicit(&w->cancel, true, memory_order_release);
         int progress = w->progress;
         if (progress != last_seen_progress) {
             last_seen_progress = progress;
@@ -5913,18 +6052,17 @@ static bool scan_all_songs_with_timeout(const char * root, char * out_spool_path
      * maintenance pass; critically, it owns no tagcache lock or GUI memory. */
     fprintf(stderr, "Warning: scan of %s stalled with no progress for %ds (possible filesystem corruption)\n",
             root, LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS / 1000);
+    atomic_store_explicit(&w->cancel, true, memory_order_release);
+    scan_walk_release(w);
     return false;
 }
 
 static bool scan_spool_read_path(FILE * f, char * path, size_t path_size) {
     uint32_t len = 0;
     if (fread(&len, sizeof(len), 1, f) != 1) return false;
-    if (len == 0 || len >= path_size) {
-        if (fseek(f, (long) len, SEEK_CUR) != 0) return false;
-        path[0] = '\0';
-        return true;
-    }
+    if (len == 0 || len >= path_size) return false;
     if (fread(path, 1, len, f) != len) return false;
+    if (memchr(path, '\0', len) != NULL) return false;
     path[len] = '\0';
     return true;
 }
@@ -5932,8 +6070,11 @@ static bool scan_spool_read_path(FILE * f, char * path, size_t path_size) {
 /* Prove that discovery still describes the complete unchanged library before
  * entering the staging path. Any malformed or ambiguous spool data falls
  * through to the normal update so the existing recovery semantics remain. */
-static bool library_scan_unchanged_fast_path(const char * spool_path, int discovered_count) {
-    FILE * spool = fopen(spool_path, "rb");
+static bool library_scan_unchanged_fast_path(int spool_fd, int root_fd, int discovered_count) {
+    if (lseek(spool_fd, 0, SEEK_SET) < 0) return false;
+    int read_fd = dup(spool_fd);
+    FILE * spool = read_fd >= 0 ? fdopen(read_fd, "rb") : NULL;
+    if (!spool && read_fd >= 0) close(read_fd);
     if (!spool) return false;
 
     bool unchanged = true;
@@ -5941,8 +6082,14 @@ static bool library_scan_unchanged_fast_path(const char * spool_path, int discov
     for (int i = 0; i < discovered_count; i++) {
         struct stat st;
         cached_tags_t cached;
+        char actual[PATH_MAX];
+        size_t root_len = strlen(MUSIC_ROOT_DIR);
         if (!scan_spool_read_path(spool, path, sizeof(path)) || path[0] == '\0' ||
-            stat(path, &st) != 0 ||
+            strncmp(path, MUSIC_ROOT_DIR, root_len) != 0 ||
+            (path[root_len] != '/' && path[root_len] != '\0') ||
+            snprintf(actual, sizeof(actual), "/proc/self/fd/%d%s", root_fd, path + root_len) >= (int) sizeof(actual) ||
+            stat(actual, &st) != 0 || !metadata_db_storage_current() ||
+            atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire) ||
             !metadata_db_get(path, (int64_t) st.st_mtime, (int64_t) st.st_size, &cached)) {
             unchanged = false;
             break;
@@ -5954,8 +6101,6 @@ static bool library_scan_unchanged_fast_path(const char * spool_path, int discov
     if (unchanged && (fgetc(spool) != EOF || ferror(spool))) unchanged = false;
     if (fclose(spool) != 0) unchanged = false;
     if (!unchanged) return false;
-    if (remove(spool_path) != 0) return false;
-
     library_scan_progress_done = discovered_count;
     library_rescan_succeeded = true;
     library_rescan_incomplete = false;
@@ -5971,14 +6116,14 @@ typedef enum {
     SCAN_SONG_NO_STAT,  /* stat() failed -- metadata was parsed but never upserted (no mtime/size to key the row by) */
 } scan_song_result_t;
 
-static scan_song_result_t scan_one_song_into_db(const char * path) {
+static scan_song_result_t scan_one_song_into_db(const char * path, const char * db_path) {
     struct stat st;
     bool have_stat = stat(path, &st) == 0;
     int64_t mtime = have_stat ? (int64_t) st.st_mtime : 0;
     int64_t size = have_stat ? (int64_t) st.st_size : 0;
 
     cached_tags_t cached;
-    if (have_stat && metadata_db_get(path, mtime, size, &cached)) return SCAN_SONG_CACHED;
+    if (have_stat && metadata_db_get(db_path, mtime, size, &cached)) return SCAN_SONG_CACHED;
 
     /* Record breadcrumb path prior to reading metadata so crash diagnostics
      * can report the specific file being parsed if an unhandled signal occurs. */
@@ -6002,7 +6147,7 @@ static scan_song_result_t scan_one_song_into_db(const char * path) {
     free(meta.lyrics); /* always NULL here (metadata_read_isolated() itself already frees/NULLs it before the pipe write), freeing defensively for symmetry */
 
     if (!have_stat) return SCAN_SONG_NO_STAT;
-    metadata_db_put(path, mtime, size, &fresh);
+    metadata_db_put(db_path, mtime, size, &fresh);
     return SCAN_SONG_PARSED;
 }
 
@@ -6080,6 +6225,8 @@ void library_scan_once(void) {
     library_scan_progress_done = 0;
     library_scan_progress_total = 0;
 
+    if (atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire)) return;
+
     DB_LOG("DB", "scan_begin root=%s rss_kb=%ld", MUSIC_ROOT_DIR, db_log_rss_kb());
     metadata_db_load_outcome_t open_outcome = metadata_db_open();
     bool preserve_rebuild = false;
@@ -6111,10 +6258,12 @@ void library_scan_once(void) {
            db_log_rss_kb());
     phase_started_ms = db_logging ? db_log_now_ms() : 0;
     gui_books_rescan();
+    if (atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire)) return;
     DB_LOG("DB", "books_scan_end elapsed_ms=%llu rss_kb=%ld",
            (unsigned long long) (db_log_now_ms() - phase_started_ms), db_log_rss_kb());
     phase_started_ms = db_logging ? db_log_now_ms() : 0;
     rescan_playlists();
+    if (atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire)) return;
     DB_LOG("DB", "playlists_scan_end elapsed_ms=%llu rss_kb=%ld",
            (unsigned long long) (db_log_now_ms() - phase_started_ms), db_log_rss_kb());
 
@@ -6126,26 +6275,32 @@ void library_scan_once(void) {
         return;
     }
 
-    char spool_path[PATH_MAX] = {0};
+    int spool_fd = -1;
+    scan_walk_work_t * spool_owner = NULL;
     int discovered_count = 0;
     int skipped_count = 0;
     phase_started_ms = db_logging ? db_log_now_ms() : 0;
-    if (!scan_all_songs_with_timeout(MUSIC_ROOT_DIR, spool_path, sizeof(spool_path), &discovered_count,
+    if (!scan_all_songs_with_timeout(MUSIC_ROOT_DIR, &spool_fd, &spool_owner, &discovered_count,
                                      &skipped_count)) {
         DB_LOG("DB", "discover_failed elapsed_ms=%llu rss_kb=%ld",
                (unsigned long long) (db_log_now_ms() - phase_started_ms), db_log_rss_kb());
         library_operation_outcome = combine_load_outcomes(library_operation_outcome, METADATA_DB_LOAD_FAILED);
         return;
     }
+    if (atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire)) {
+        scan_walk_release(spool_owner);
+        metadata_db_abort_update();
+        return;
+    }
     DB_LOG("DB", "discover_end files=%d skipped=%d elapsed_ms=%llu spool=%s rss_kb=%ld",
            discovered_count, skipped_count, (unsigned long long) (db_log_now_ms() - phase_started_ms),
-           spool_path, db_log_rss_kb());
+           "fd-backed", db_log_rss_kb());
 
     if (preserve_rebuild && discovered_count == 0) {
         DB_LOG("DB", "rebuild_rejected reason=no_files");
         metadata_db_abort_update();
         library_operation_outcome = combine_load_outcomes(library_operation_outcome, METADATA_DB_LOAD_FAILED);
-        remove(spool_path);
+        scan_walk_release(spool_owner);
         return;
     }
 
@@ -6153,20 +6308,29 @@ void library_scan_once(void) {
     if (open_outcome == METADATA_DB_LOAD_SUCCESS_NORMAL && !preserve_rebuild &&
         !library_rescan_migrating && skipped_count == 0 && discovered_count >= 0 &&
         metadata_db_get_song_count() == (int64_t) discovered_count &&
-        library_scan_unchanged_fast_path(spool_path, discovered_count))
+        library_scan_unchanged_fast_path(spool_fd, spool_owner->root_fd, discovered_count)) {
+        scan_walk_release(spool_owner);
         return;
+    }
 
     phase_started_ms = db_logging ? db_log_now_ms() : 0;
     metadata_db_begin_update();
     DB_LOG("DB", "update_begin files=%d rss_kb=%ld", discovered_count, db_log_rss_kb());
 
-    FILE * spool = fopen(spool_path, "rb");
+    if (lseek(spool_fd, 0, SEEK_SET) < 0) {
+        metadata_db_abort_update();
+        scan_walk_release(spool_owner);
+        return;
+    }
+    int spool_read_fd = dup(spool_fd);
+    FILE * spool = spool_read_fd >= 0 ? fdopen(spool_read_fd, "rb") : NULL;
     if (!spool) {
-        DB_LOG("DB", "spool_open_failed rss_kb=%ld path=%s", db_log_rss_kb(), spool_path);
+        if (spool_read_fd >= 0) close(spool_read_fd);
+        DB_LOG("DB", "spool_open_failed rss_kb=%ld", db_log_rss_kb());
         metadata_db_abort_update();
         library_operation_outcome = combine_load_outcomes(library_operation_outcome, metadata_db_get_load_outcome());
         library_operation_outcome = combine_load_outcomes(library_operation_outcome, METADATA_DB_LOAD_FAILED);
-        remove(spool_path);
+        scan_walk_release(spool_owner);
         return;
     }
 
@@ -6181,11 +6345,32 @@ void library_scan_once(void) {
      * only way a 10,000+ song scan doesn't pay two syscalls per file even
      * with logging disabled (the default). */
     while (done < discovered_count) {
+        if (atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire)) {
+            complete = false;
+            break;
+        }
         if (!scan_spool_read_path(spool, path, sizeof(path))) {
             complete = false;
             break;
         }
+        if (path[0] == '\0') {
+            complete = false;
+            break;
+        }
         if (path[0] != '\0') {
+            if (!metadata_db_storage_current() || atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire)) {
+                complete = false;
+                break;
+            }
+            char actual_path[PATH_MAX];
+            size_t root_len = strlen(MUSIC_ROOT_DIR);
+            if (strncmp(path, MUSIC_ROOT_DIR, root_len) != 0 ||
+                (path[root_len] != '/' && path[root_len] != '\0') ||
+                snprintf(actual_path, sizeof(actual_path), "/proc/self/fd/%d%s", spool_owner->root_fd,
+                         path + root_len) >= (int) sizeof(actual_path)) {
+                complete = false;
+                break;
+            }
             uint64_t file_started_ms = db_logging ? db_log_now_ms() : 0;
             /* No rss_kb here -- see db_log_rss_kb()'s own comment; RSS is
              * only worth the /proc read at phase boundaries, progress
@@ -6198,7 +6383,7 @@ void library_scan_once(void) {
              * (metadata_read_isolated()), so a malformed file yields
              * SCAN_SONG_FAILED below rather than crashing this process. */
             if (db_logging) DB_LOG("DB_FILE", "file_begin index=%d total=%d path=%s", done, discovered_count, path);
-            scan_song_result_t result = scan_one_song_into_db(path);
+            scan_song_result_t result = scan_one_song_into_db(actual_path, path);
             if (db_logging) {
                 uint64_t file_ms = db_log_now_ms() - file_started_ms;
                 static const char * const scan_song_result_name[] = { "cached", "parsed", "failed", "no_stat" };
@@ -6215,8 +6400,12 @@ void library_scan_once(void) {
                    done, discovered_count, (unsigned long long) (db_log_now_ms() - phase_started_ms),
                    db_log_rss_kb());
     }
+    if (complete && (fgetc(spool) != EOF || ferror(spool))) complete = false;
     fclose(spool);
-    remove(spool_path);
+    scan_walk_release(spool_owner);
+
+    if (!metadata_db_storage_current() || atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire))
+        complete = false;
 
     if (!complete || (library_rescan_migrating && !library_rescan_migration_cleanup && skipped_count > 0)) {
         DB_LOG("DB", "spool_read_incomplete done=%d total=%d rss_kb=%ld", done, discovered_count, db_log_rss_kb());
@@ -6227,8 +6416,14 @@ void library_scan_once(void) {
     }
 
     DB_LOG("DB", "update_end skipped=%d", skipped_count);
+    if (!metadata_db_storage_current() || atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire)) {
+        metadata_db_abort_update();
+        return;
+    }
     bool committed = metadata_db_end_update();
-    if (committed && library_rescan_migrating) committed = metadata_db_migration_finish();
+    if (committed && library_rescan_migrating && metadata_db_storage_current() &&
+        !atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire))
+        committed = metadata_db_migration_finish();
     if (committed && library_rescan_migrating) library_rescan_migration_cleanup = true;
     metadata_db_load_outcome_t commit_outcome = metadata_db_get_load_outcome();
     library_rescan_saved = committed && !preserve_rebuild;
@@ -6244,7 +6439,9 @@ void library_scan_once(void) {
            (long long) metadata_db_get_song_count(), db_log_rss_kb());
 
     phase_started_ms = db_logging ? db_log_now_ms() : 0;
-    metadata_db_load_outcome_t reload_outcome = reload_library_cache();
+    metadata_db_load_outcome_t reload_outcome = (!atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire) &&
+                                                 metadata_db_storage_current()) ? reload_library_cache()
+                                                                                : METADATA_DB_LOAD_UNMOUNTED;
     library_rescan_saved = library_rescan_saved && reload_outcome == METADATA_DB_LOAD_SUCCESS_NORMAL;
     library_operation_outcome = combine_load_outcomes(library_operation_outcome, reload_outcome);
     DB_LOG("DB", "reload_end songs=%lld elapsed_ms=%llu total_ms=%llu rss_kb=%ld",

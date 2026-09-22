@@ -105,3 +105,4 @@ bool gui_library_navigation_blocked(void);
 /* Joins UI-pointer-bearing artwork/search jobs before a soft screen rebuild. */
 void gui_library_prepare_for_ui_reload(void);
 void gui_library_cancel_background_work(void);
+void gui_library_cancel_scan(void);

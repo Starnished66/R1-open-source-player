@@ -35,6 +35,18 @@ typedef enum {
 /* Opens the on-disk tagcache at its fixed path (the SD-card root on target,
  * ./ on host). If it is already open, returns its existing load outcome. */
 metadata_db_load_outcome_t metadata_db_open(void);
+typedef struct tagcache_snapshot metadata_db_snapshot_t;
+metadata_db_snapshot_t *metadata_db_snapshot_open(bool recency);
+int metadata_db_snapshot_count(const metadata_db_snapshot_t *snapshot);
+bool metadata_db_snapshot_path_at(const metadata_db_snapshot_t *snapshot, int rank, char *out, size_t out_size);
+void metadata_db_snapshot_close(metadata_db_snapshot_t *snapshot);
+metadata_db_snapshot_t *metadata_db_snapshot_retain(metadata_db_snapshot_t *snapshot);
+int metadata_db_snapshot_dup_directory_fd(const metadata_db_snapshot_t *snapshot);
+/* True while the currently open database still belongs to the mounted
+ * directory captured at open time. */
+bool metadata_db_storage_current(void);
+int metadata_db_dup_directory_fd(void);
+bool metadata_db_numeric_write_failed(void);
 void metadata_db_close(void);
 
 /* Reopens the database after an unmount or interrupted operation. A saved
@@ -53,6 +65,7 @@ metadata_db_load_outcome_t metadata_db_get_load_outcome(void);
  * must commit successfully before finish replays and commits statistics. */
 bool metadata_db_migration_needed(void);
 bool metadata_db_migration_cleanup_pending(void);
+bool metadata_db_migration_archive_retained(void);
 bool metadata_db_migration_prepare(void);
 bool metadata_db_migration_finish(void);
 void metadata_db_migration_cancel(void);

@@ -79,8 +79,22 @@ typedef enum {
 } tagcache_load_outcome_t;
 
 typedef struct tagcache_stats_snapshot tagcache_stats_snapshot_t;
+typedef struct tagcache_snapshot tagcache_snapshot_t;
+#define TAGCACHE_MIGRATION_APPLIED 0x1u
+#define TAGCACHE_MIGRATION_ARCHIVE 0x2u
 
 bool tagcache_open(const char * dir);
+tagcache_snapshot_t *tagcache_snapshot_open(bool recency);
+int tagcache_snapshot_count(const tagcache_snapshot_t *snapshot);
+bool tagcache_snapshot_path_at(const tagcache_snapshot_t *snapshot, int rank, char *out, size_t out_size);
+void tagcache_snapshot_close(tagcache_snapshot_t *snapshot);
+tagcache_snapshot_t *tagcache_snapshot_retain(tagcache_snapshot_t *snapshot);
+int tagcache_snapshot_dup_directory_fd(const tagcache_snapshot_t *snapshot);
+/* True while the logical database path still names the directory pinned at
+ * open time.  Callers use this to cancel work spanning card removal. */
+bool tagcache_storage_current(void);
+bool tagcache_numeric_write_failed(void);
+int tagcache_dup_directory_fd(void);
 /* Opens an existing library, or an empty writable database for explicit
  * rebuild when no usable generation can be loaded. */
 bool tagcache_open_for_rebuild(const char * dir);
@@ -161,7 +175,11 @@ bool tagcache_extract_stats(const char * dir, tagcache_stats_snapshot_t ** out);
 /* Returns false when an interesting source path is present on disk but absent
  * from the current database. Matching rows are overlaid before returning. */
 bool tagcache_replay_stats(const tagcache_stats_snapshot_t * snapshot);
+bool tagcache_replay_stats_allow_missing(const tagcache_stats_snapshot_t * snapshot, size_t * unmatched);
 void tagcache_free_stats(tagcache_stats_snapshot_t * snapshot);
+int32_t tagcache_generation(void);
+uint32_t tagcache_migration_state(void);
+void tagcache_set_staged_migration_state(uint32_t state);
 
 int32_t tagcache_title_rank_of_path(const char * path);
 int32_t tagcache_recency_rank_of_path(const char * path);

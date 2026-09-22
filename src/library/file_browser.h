@@ -4,6 +4,7 @@
 
 #include "lvgl/lvgl.h"
 #include <stdbool.h>
+#include <stddef.h>
 
 /* Called when the user taps a playable file. `playlist` holds `count`
  * heap-allocated absolute paths -- every playable file in the same
@@ -93,5 +94,31 @@ void file_browser_go_up(void);
  * Playlists screen (Music submenu) to open a user-created .m3u without
  * going through the interactive browser UI. */
 bool file_browser_build_playlist_from_m3u(const char * m3u_path, char *** out_playlist, int * out_count);
+
+/* Directory index. Writable folders use unlinked disk-backed runs; read-only
+ * folders use a bounded 4096-entry in-memory index and fail explicitly when
+ * that bound is exceeded. The index pins its source directory FD. Handles
+ * may be duplicated for the queue worker; each owner closes its own handle. */
+typedef struct file_browser_index file_browser_index_t;
+typedef void (*file_browser_index_select_cb_t)(file_browser_index_t *index,
+                                               unsigned playable_count,
+                                               unsigned selected_playable);
+void file_browser_set_index_select_cb(file_browser_index_select_cb_t callback);
+bool file_browser_index_open(const char * directory, file_browser_index_t ** out, unsigned * out_count);
+bool file_browser_index_retain(const file_browser_index_t * source, file_browser_index_t ** out);
+bool file_browser_index_path_at(const file_browser_index_t * index, unsigned ordinal,
+                                char * out_path, size_t out_size);
+unsigned file_browser_index_playable_count(const file_browser_index_t * index);
+bool file_browser_index_playable_path_at(const file_browser_index_t * index, unsigned ordinal,
+                                         char * out_path, size_t out_size);
+int file_browser_index_dup_directory_fd(const file_browser_index_t * index);
+const char * file_browser_index_directory(const file_browser_index_t * index);
+void file_browser_index_close(file_browser_index_t * index);
+bool file_browser_index_entry_name(const file_browser_index_t * index, unsigned ordinal,
+                                   char * name, size_t name_size, bool * is_dir);
+/* Opens the track's parent directory index and reports its playable ordinal.
+ * The caller owns *out_index. No per-file path array is allocated. */
+bool file_browser_open_lazy_directory(const char * track_path, file_browser_index_t ** out_index,
+                                      unsigned * out_playable, unsigned * out_selected);
 
 #endif /* FILE_BROWSER_H */

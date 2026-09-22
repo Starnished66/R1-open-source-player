@@ -12,6 +12,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <stdatomic.h>
 
 /* Process-wide mutex serializing mutating operations (append, remove, create, delete)
@@ -411,9 +414,17 @@ bool playlist_files_create(const char * dir, const char * name, const char * son
                                     out_path, out_path_size);
 }
 
-bool playlist_files_write_new(const char * dir, const char * name,
-                              const char * const * paths, int count, char * out, size_t size) {
-    if (!valid_playlist_name(name) || count < 0) return false;
+typedef struct { const char * const * paths; } array_path_provider_t;
+static bool array_path_provider(void * context, int index, const char ** path) {
+    array_path_provider_t * a = context;
+    *path = a->paths[index];
+    return *path != NULL;
+}
+
+bool playlist_files_write_new_stream(const char * dir, const char * name,
+                                     int count, playlist_files_path_provider provider,
+                                     void * context, char * out, size_t size) {
+    if (!valid_playlist_name(name) || count < 0 || !provider) return false;
     char path[PATH_MAX], temp[PATH_MAX];
     if (snprintf(path, sizeof(path), "%s/%s%s", dir, name, library_is_m3u_file(name) ? "" : ".m3u") >= (int) sizeof(path) ||
         (out && strlen(path) >= size) ||
@@ -430,8 +441,9 @@ bool playlist_files_write_new(const char * dir, const char * name,
         ok = fputs("#EXTM3U\n", f) >= 0;
         for (int i = 0; ok && i < count; i++) {
             char rel[PATH_MAX];
-            if (!paths[i] || strchr(paths[i], '\n') || strchr(paths[i], '\r')) { ok = false; break; }
-            const char * line = make_relative_path(dir, paths[i], rel, sizeof(rel)) ? rel : paths[i];
+            const char * path = NULL;
+            if (!provider(context, i, &path) || !path || strchr(path, '\n') || strchr(path, '\r')) { ok = false; break; }
+            const char * line = make_relative_path(dir, path, rel, sizeof(rel)) ? rel : path;
             ok = fprintf(f, "%s\n", line) >= 0;
         }
         if (ok) ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
@@ -440,6 +452,57 @@ bool playlist_files_write_new(const char * dir, const char * name,
     if (ok) ok = rename(temp, path) == 0;
     if (!ok) { if (fd >= 0) unlink(temp); if (reserved >= 0) unlink(path); }
     if (ok) { fsync_dir(dir); if (out) snprintf(out, size, "%s", path); }
+    pthread_mutex_unlock(&playlist_files_mutex);
+    return ok;
+}
+
+bool playlist_files_write_new(const char * dir, const char * name,
+                              const char * const * paths, int count, char * out, size_t size) {
+    array_path_provider_t provider = { paths };
+    return playlist_files_write_new_stream(dir, name, count, array_path_provider,
+                                           &provider, out, size);
+}
+
+bool playlist_files_write_new_stream_at(int dirfd, const char * name, int count,
+                                        playlist_files_path_provider provider, void * context,
+                                        char * out_leaf, size_t size) {
+    if (dirfd < 0 || !valid_playlist_name(name) || count < 0 || !provider || strchr(name, '/')) return false;
+    char leaf[NAME_MAX];
+    if (snprintf(leaf, sizeof(leaf), "%s%s", name, library_is_m3u_file(name) ? "" : ".m3u") >= (int) sizeof(leaf) ||
+        (out_leaf && strlen(leaf) >= size)) return false;
+    pthread_mutex_lock(&playlist_files_mutex);
+    char temp[NAME_MAX];
+    int fd = -1;
+    bool created = false;
+    temp[0] = '\0';
+    for (unsigned attempt = 0; attempt < 100; attempt++) {
+        if (snprintf(temp, sizeof(temp), ".playlist.%ld.%u.tmp", (long) getpid(), attempt) >= (int) sizeof(temp)) break;
+        fd = openat(dirfd, temp, O_CREAT | O_EXCL | O_WRONLY, 0600);
+        if (fd >= 0) { created = true; break; }
+        if (errno != EEXIST) break;
+    }
+    FILE * f = fd >= 0 ? fdopen(fd, "w") : NULL;
+    if (!f && fd >= 0) { close(fd); fd = -1; }
+    bool ok = f && fputs("#EXTM3U\n", f) >= 0;
+    for (int i = 0; ok && i < count; i++) {
+        const char * path = NULL;
+        if (!provider(context, i, &path) || !path || strchr(path, '\n') || strchr(path, '\r')) { ok = false; break; }
+        ok = fprintf(f, "%s\n", path) >= 0;
+    }
+    if (f) {
+        if (ok) ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+        if (fclose(f) != 0) ok = false;
+    }
+#ifdef SYS_renameat2
+    if (ok) ok = syscall(SYS_renameat2, dirfd, temp, dirfd, leaf, 1 /* RENAME_NOREPLACE */) == 0;
+#else
+    ok = false;
+#endif
+    if (!ok && created) unlinkat(dirfd, temp, 0);
+    else {
+        (void) fsync(dirfd);
+        if (out_leaf) snprintf(out_leaf, size, "%s", leaf);
+    }
     pthread_mutex_unlock(&playlist_files_mutex);
     return ok;
 }

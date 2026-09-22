@@ -151,8 +151,9 @@ The GitHub **Daily build** workflow also packages both board images as separate
 staging artifacts. It reads `r1.upt` and the selected R3 `.upt` from the
 `staging-image-base` release and requires their corresponding checksum secrets
 (`STAGING_IMAGE_SHA256` and `R3PROII_STAGING_IMAGE_SHA256`). A package job is
-shown as skipped when its secret is absent. The weekly public beta remains
-R1-only until R3 Pro II hardware validation is complete.
+shown as skipped when its secret is absent. The weekly beta packages both R1
+and R3 Pro II and requires both approved base images and checksum secrets;
+R3 Pro II still needs validation on real hardware.
 
 ---
 

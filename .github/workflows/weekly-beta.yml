@@ -17,12 +17,13 @@ env:
   # The checksum is a repository secret so no Staging Image fingerprint or
   # other internal build detail is committed to the public source tree.
   STAGING_IMAGE_SHA256: ${{ secrets.STAGING_IMAGE_SHA256 }}
+  R3PROII_STAGING_IMAGE_SHA256: ${{ secrets.R3PROII_STAGING_IMAGE_SHA256 }}
 
 jobs:
   weekly-beta:
     name: Build, repack, and publish weekly beta
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 120
 
     steps:
       - name: Check out source
@@ -55,16 +56,25 @@ jobs:
           make -j2 target RELEASE_LABEL="$RELEASE_LABEL"
           make bootloader
           make sd_ready_test
-          file open_hiby_player_target open_hiby_bootloader
+          make -j2 target BOARD=r3proii RELEASE_LABEL="$RELEASE_LABEL"
+          make bootloader BOARD=r3proii
+          file open_hiby_player_target open_hiby_bootloader \
+            open_hiby_player_target_r3proii open_hiby_bootloader_r3proii
           mipsel-linux-musl-readelf -h open_hiby_player_target \
             | grep 'Machine:.*MIPS' >/dev/null
           mipsel-linux-musl-readelf -h open_hiby_bootloader \
             | grep 'Machine:.*MIPS' >/dev/null
-          if strings open_hiby_player_target | grep -Eq \
-              'TEST BUILD|TEST_BUILD_TAG|UI_PERF_TRACE|UI_GESTURE_TRACE|UI_HITBOX_DEBUG'; then
-            echo 'Diagnostic flags were found in the production player.' >&2
-            exit 1
-          fi
+          mipsel-linux-musl-readelf -h open_hiby_player_target_r3proii \
+            | grep 'Machine:.*MIPS' >/dev/null
+          mipsel-linux-musl-readelf -h open_hiby_bootloader_r3proii \
+            | grep 'Machine:.*MIPS' >/dev/null
+          for player in open_hiby_player_target open_hiby_player_target_r3proii; do
+            if strings "$player" | grep -Eq \
+                'TEST BUILD|TEST_BUILD_TAG|UI_PERF_TRACE|UI_GESTURE_TRACE|UI_HITBOX_DEBUG'; then
+              echo "Diagnostic flags were found in $player." >&2
+              exit 1
+            fi
+          done
           find plugins_examples -maxdepth 1 -type f -name '*.lua' -print0 \
             | xargs -0 -r -n1 luac5.4 -p
 
@@ -77,9 +87,15 @@ jobs:
             echo 'STAGING_IMAGE_SHA256 secret is missing or invalid.' >&2
             exit 1
           }
+          [[ "$R3PROII_STAGING_IMAGE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
+            echo 'R3PROII_STAGING_IMAGE_SHA256 secret is missing or invalid.' >&2
+            exit 1
+          }
           mkdir -p base
           gh release download staging-image-base --pattern r1.upt --dir base
+          gh release download staging-image-base --pattern r3proii.upt --dir base
           echo "$STAGING_IMAGE_SHA256  base/r1.upt" | sha256sum --check
+          echo "$R3PROII_STAGING_IMAGE_SHA256  base/r3proii.upt" | sha256sum --check
 
       - name: Repack Staging Image
         run: |
@@ -88,13 +104,18 @@ jobs:
           scripts/repack_upt.sh base/r1.upt open_hiby_player_target \
             open_hiby_bootloader release/r1.upt
           cp open_hiby_player_target release/open_hiby_player
+          BOARD=r3proii scripts/repack_upt.sh base/r3proii.upt \
+            open_hiby_player_target_r3proii open_hiby_bootloader_r3proii \
+            release/r3proii.upt
+          cp open_hiby_player_target_r3proii release/open_hiby_player_r3proii
           (
             cd plugins_examples
             zip -q -r ../release/plugin_examples.zip .
           )
           (
             cd release
-            sha256sum r1.upt open_hiby_player plugin_examples.zip > SHA256SUMS
+            sha256sum r1.upt r3proii.upt open_hiby_player \
+              open_hiby_player_r3proii plugin_examples.zip > SHA256SUMS
             sha256sum --check SHA256SUMS
           )
 
@@ -119,6 +140,27 @@ jobs:
             cmp -- "$source_path" "$verify_dir/root$image_path"
           done
 
+      - name: Validate tracked R3 Pro II branding assets in firmware
+        run: |
+          set -euo pipefail
+          verify_dir=$(mktemp -d)
+          trap 'rm -rf "$verify_dir"' EXIT
+          7z x -y release/r3proii.upt -o"$verify_dir/upt" >/dev/null
+          mapfile -t root_chunks < <(find "$verify_dir/upt/ota_v0" -maxdepth 1 \
+            -type f -name 'rootfs.squashfs.[0-9]*' -print | LC_ALL=C sort)
+          (( ${#root_chunks[@]} > 0 ))
+          cat "${root_chunks[@]}" > "$verify_dir/rootfs.squashfs"
+          unsquashfs -no-xattrs -d "$verify_dir/root" \
+            "$verify_dir/rootfs.squashfs" >/dev/null
+          for asset in \
+            'assets/r3proii/etc/logo1.jpeg:/etc/logo1.jpeg' \
+            'assets/r3proii/theme2/boot_animation/en/0.jpg:/usr/resource/litegui/theme2/boot_animation/en/0.jpg' \
+            'assets/r3proii/theme2/boot_animation/en/0.png:/usr/resource/litegui/theme2/boot_animation/en/0.png'; do
+            source_path=${asset%%:*}
+            image_path=${asset#*:}
+            cmp -- "$source_path" "$verify_dir/root$image_path"
+          done
+
       - name: Prepare release notes
         run: |
           set -euo pipefail
@@ -131,13 +173,17 @@ jobs:
             echo
             echo "### Downloads"
             echo
-            echo "- **r1.upt** — complete firmware update."
-            echo "- **open_hiby_player** — standalone Compás Player update."
+            echo "- **r1.upt** — complete R1 firmware update; use only on the HiBy R1."
+            echo "- **r3proii.upt** — complete R3 Pro II firmware update; use only on the HiBy R3 Pro II."
+            echo "- **open_hiby_player** — standalone Compás Player update for the R1."
+            echo "- **open_hiby_player_r3proii** — standalone Compás Player update for the R3 Pro II."
             echo "- **plugin_examples.zip** — all example and test plugins from the repository."
+            echo
+            echo "R3 Pro II packaging uses the approved staging image and matching board binaries. This weekly prerelease has not been tested on an R3 Pro II device; validate it on hardware before broader deployment."
             echo
             echo "### Update only Compás Player"
             echo
-            echo "Copy **open_hiby_player** to **SD/.open_hiby_player/open_hiby_player**, replacing the existing file, then reboot the R1. The bootloader will use the updated player from the SD card."
+            echo "Copy **open_hiby_player** to **SD/.open_hiby_player/open_hiby_player** for the R1, or **open_hiby_player_r3proii** to **SD/.open_hiby_player/open_hiby_player** for the R3 Pro II, replacing the existing file, then reboot the matching device."
             echo
             echo "Checksums are attached in **SHA256SUMS**."
           } > release/RELEASE_NOTES.md
@@ -150,7 +196,8 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release/r1.upt release/open_hiby_player \
+            gh release upload "$TAG" release/r1.upt release/r3proii.upt \
+              release/open_hiby_player release/open_hiby_player_r3proii \
               release/plugin_examples.zip release/SHA256SUMS --clobber
             for legacy_asset in plugins_examples.zip Test-Plugins.zip; do
               if gh release view "$TAG" --json assets --jq '.assets[].name' \
@@ -161,7 +208,8 @@ jobs:
             gh release edit "$TAG" --prerelease --title "$TITLE" \
               --notes-file release/RELEASE_NOTES.md
           else
-            gh release create "$TAG" release/r1.upt release/open_hiby_player \
+            gh release create "$TAG" release/r1.upt release/r3proii.upt \
+              release/open_hiby_player release/open_hiby_player_r3proii \
               release/plugin_examples.zip release/SHA256SUMS \
               --prerelease --target "$GITHUB_SHA" --title "$TITLE" \
               --notes-file release/RELEASE_NOTES.md
@@ -173,7 +221,9 @@ jobs:
           name: ${{ steps.release.outputs.tag }}
           path: |
             release/r1.upt
+            release/r3proii.upt
             release/open_hiby_player
+            release/open_hiby_player_r3proii
             release/plugin_examples.zip
             release/SHA256SUMS
             release/RELEASE_NOTES.md

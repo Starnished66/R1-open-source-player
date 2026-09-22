@@ -167,6 +167,10 @@ database.
 
 ## Before updating
 
+**R3 Pro II pre-production warning:** The R3 Pro II firmware image is still
+pre-production. Please report anything unusual you notice, including boot,
+Bluetooth, playback, or library problems, with steps to reproduce when possible.
+
 Speex resampling and the Bluetooth boot-script fix need the full firmware
 package; replacing only the player executable will not install them.
 Updated plugin features also require the corresponding plugin files.

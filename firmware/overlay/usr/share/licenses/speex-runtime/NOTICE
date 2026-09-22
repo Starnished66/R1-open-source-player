@@ -1,0 +1,24 @@
+Speex ALSA runtime
+
+This directory contains target libraries built from the following upstream
+sources by scripts/build_base_audio_deps.sh:
+
+  SpeexDSP 1.2.1
+    https://downloads.xiph.org/releases/speex/speexdsp-1.2.1.tar.gz
+    SHA-256: 8c777343e4a6399569c72abc38a95b24db56882c83dbdb6c6424a5f4aeb54d3d
+    License: BSD-style; see the SpeexDSP COPYING file.
+
+  alsa-plugins 1.2.12 (rate-speexrate module only)
+    https://www.alsa-project.org/files/pub/plugins/alsa-plugins-1.2.12.tar.bz2
+    SHA-256: 7bd8a83d304e8e2d86a25895d8dcb0ef0245a8df32e271959cdbdc6af39b66f2
+    License: LGPL-2.1-or-later; see the alsa-plugins COPYING file.
+
+The committed ELF files are MIPS32r2, little-endian, o32 hard-float target
+builds. They are stripped for the device image. The generated ALSA module's
+build-directory RPATH was removed before it was committed.
+
+Committed runtime hashes:
+  libasound_module_rate_speexrate.so
+    5cc8870d0841952c67ee067fd42ca2b93ed7a19baf389b4091694d8bfff1eeab
+  libspeexdsp.so.1.5.2
+    300dd86d4b96b0ca708fa8ebe5a761067506f5189f984ac37f743d1373601db4

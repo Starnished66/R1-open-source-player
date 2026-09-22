@@ -154,6 +154,7 @@ copy_tracked_assets() {
 }
 if [[ $board == r1 ]]; then
     copy_tracked_assets assets/theme2 "$work/root/usr/resource/litegui/theme2"
+    copy_tracked_assets assets/r1/etc "$work/root/etc"
 else
     copy_tracked_assets assets/r3proii/theme2 "$work/root/usr/resource/litegui/theme2"
     copy_tracked_assets assets/r3proii/etc "$work/root/etc"

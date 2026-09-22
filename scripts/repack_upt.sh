@@ -31,7 +31,7 @@ for file in "$base_upt" "$player" "$bootloader"; do
     [[ -s "$file" ]] || { echo "Missing or empty input: $file" >&2; exit 1; }
 done
 
-for command in 7z unsquashfs mksquashfs genisoimage md5sum split; do
+for command in 7z unsquashfs mksquashfs genisoimage md5sum split file; do
     command -v "$command" >/dev/null || {
         echo "Required command is unavailable: $command" >&2
         exit 1
@@ -133,6 +133,32 @@ done
 fi
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
+
+# These boot images are part of each board's identity. Require the exact
+# tracked files and panel dimensions before building a firmware package.
+require_boot_image() {
+    local path=$1 type=$2 width=$3 height=$4 description
+    git -C "$repo" ls-files --error-unmatch "$path" >/dev/null 2>&1 || {
+        echo "Boot image is not tracked in git: $path" >&2
+        exit 1
+    }
+    [[ -s "$repo/$path" ]] || { echo "Missing boot image: $path" >&2; exit 1; }
+    description=$(file -b "$repo/$path")
+    [[ $description == *"$type image data"* &&
+       $description =~ (^|[^0-9])${width}[[:space:]]*x[[:space:]]*${height}([^0-9]|$) ]] || {
+        echo "Wrong boot image format or size ($type ${width}x${height} required): $path" >&2
+        exit 1
+    }
+}
+if [[ $board == r1 ]]; then
+    require_boot_image assets/theme2/boot_animation/en/0.jpg JPEG 480 800
+    require_boot_image assets/theme2/boot_animation/en/0.png PNG 480 800
+    require_boot_image assets/r1/etc/logo1.jpeg JPEG 480 800
+else
+    require_boot_image assets/r3proii/theme2/boot_animation/en/0.jpg JPEG 480 720
+    require_boot_image assets/r3proii/theme2/boot_animation/en/0.png PNG 480 720
+    require_boot_image assets/r3proii/etc/logo1.jpeg JPEG 480 720
+fi
 
 # UI assets and fonts we own, kept under assets/ in the tree the device itself
 # uses: assets/theme2/<dir>/<file> lands at /usr/resource/litegui/theme2/, and

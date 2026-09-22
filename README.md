@@ -137,6 +137,23 @@ Build the R1 binaries with `make target BOARD=r1` and `make bootloader BOARD=r1`
 
 This needs a base image, which is not in the repository — download the *Base image for new releases* from the releases page. It has to be that approved staging image: the packer checks the base's `hiby_player.sh` and refuses an arbitrary stock `.upt` or an older public beta. It also rejects images over 45 MiB and will not mix R1 and R3 binaries.
 
+To build both board images in one run, provide the approved R1 and R3 Pro II
+base images and an output directory:
+
+```sh
+scripts/build_both_upt.sh /path/to/r1-base.upt /path/to/r3proii-base.upt output/
+```
+
+This builds each board's player and bootloader, then writes `output/r1.upt` and
+`output/r3proii.upt` without modifying either base image.
+
+The GitHub **Daily build** workflow also packages both board images as separate
+staging artifacts. It reads `r1.upt` and the selected R3 `.upt` from the
+`staging-image-base` release and requires their corresponding checksum secrets
+(`STAGING_IMAGE_SHA256` and `R3PROII_STAGING_IMAGE_SHA256`). A package job is
+shown as skipped when its secret is absent. The weekly public beta remains
+R1-only until R3 Pro II hardware validation is complete.
+
 ---
 
 # Acknowledgments

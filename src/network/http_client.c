@@ -144,7 +144,7 @@ static bool do_get_ex(const char * url, bool verify_tls, int * out_status, body_
 
     char request[2560];
     int req_len = snprintf(request, sizeof(request),
-                            "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: open_hiby_player\r\nConnection: close\r\n\r\n",
+                            "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Compas/compas_player\r\nConnection: close\r\n\r\n",
                             path, host);
     if (req_len < 0 || (size_t) req_len >= sizeof(request)) {
         DBG_LOG("http_client: request too long for path='%s'\n", path);
@@ -191,7 +191,7 @@ static bool do_post(const char * url, bool verify_tls, const char * content_type
 
     char request[2560];
     int req_len = snprintf(request, sizeof(request),
-                            "POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: open_hiby_player\r\n"
+                            "POST %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Compas/compas_player\r\n"
                             "Content-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
                             path, host, content_type, body_size);
     if (req_len < 0 || (size_t) req_len >= sizeof(request)) {
@@ -614,7 +614,7 @@ static bool send_request_ex(http_conn_t * conn, const http_request_t * req, cons
     } while (0)
 
     if (!has_host) APPEND_HDR("Host: %s\r\n", host);
-    if (!has_ua) APPEND_HDR("User-Agent: open_hiby_player\r\n");
+    if (!has_ua) APPEND_HDR("User-Agent: Compas/compas_player\r\n");
     if (!has_conn) APPEND_HDR("Connection: close\r\n");
     if (!has_ct && req->content_type && req->content_type[0]) APPEND_HDR("Content-Type: %s\r\n", req->content_type);
     if (!has_cl && req->body && req->body_len > 0) APPEND_HDR("Content-Length: %zu\r\n", req->body_len);

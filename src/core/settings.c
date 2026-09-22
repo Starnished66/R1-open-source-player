@@ -3,6 +3,7 @@
 player_settings_t current_settings;
 #include "subprocess.h"
 #include "subsonic_saved_servers.h"
+#include "storage_paths.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -17,15 +18,14 @@ player_settings_t current_settings;
 #ifndef HOST_BUILD
 #include <sys/reboot.h>
 #endif
+#include <sys/stat.h>
 
 #ifdef HOST_BUILD
-  #define SETTINGS_FILE_PATH "./open_hiby_player_settings.txt"
   #define SETTINGS_DIR_PATH "."
 #else
   /* /usr/data is the device's persistent ubifs partition (survives reboots,
    * unlike /tmp) -- the same place the stock firmware keeps its own small
    * settings files (theme_id, region, etc). */
-  #define SETTINGS_FILE_PATH "/usr/data/open_hiby_player_settings.txt"
   #define SETTINGS_DIR_PATH "/usr/data"
 #endif
 
@@ -182,12 +182,19 @@ static void import_legacy_subsonic_list_file(player_settings_t * out, const char
 
 static void import_legacy_subsonic_servers(player_settings_t * out) {
     if (out->subsonic_saved_count == 0) {
-        import_legacy_subsonic_list_file(out, "./open_hiby_player_subsonic.txt");
+        import_legacy_subsonic_list_file(out,
+#ifdef HOST_BUILD
+            "./open_hiby_player_subsonic.txt"
+#else
+            "/usr/data/open_hiby_player_subsonic.txt"
+#endif
+        );
 #ifndef HOST_BUILD
-        import_legacy_subsonic_list_file(out, "/usr/data/open_hiby_player_subsonic.txt");
+        import_legacy_subsonic_list_file(out, "/data/mnt/sd_0/.compas/subsonic.list");
         import_legacy_subsonic_list_file(out, "/data/mnt/sd_0/.open_hiby_player/subsonic.list");
 #endif
 #ifdef HOST_BUILD
+        import_legacy_subsonic_list_file(out, "./.compas/subsonic.list");
         import_legacy_subsonic_list_file(out, "./.open_hiby_player/subsonic.list");
 #endif
     }
@@ -253,6 +260,7 @@ bool settings_load(player_settings_t * out) {
     set_defaults(out);
 
     FILE * f = fopen(SETTINGS_FILE_PATH, "r");
+    if (!f) f = fopen(SETTINGS_LEGACY_FILE_PATH, "r");
     if (!f) {
         import_legacy_subsonic_servers(out);
         sync_subsonic_saved_sidecar(out);
@@ -480,7 +488,7 @@ bool settings_load(player_settings_t * out) {
 /* Flushes directory metadata changes to flash so the rename survives an unclean
  * shutdown (atomic durable replace: write tmp -> fsync tmp -> rename -> fsync dir). */
 static void fsync_settings_dir(void) {
-    int dir_fd = open(SETTINGS_DIR_PATH, O_RDONLY);
+    int dir_fd = open(INTERNAL_COMPAS_DIR, O_RDONLY | O_DIRECTORY);
     if (dir_fd < 0) return;
     fsync(dir_fd);
     close(dir_fd);
@@ -488,6 +496,7 @@ static void fsync_settings_dir(void) {
 
 static void settings_write_file(const player_settings_t * settings) {
     DBG_LOG("settings_save: called (idle_suspend_enabled=%d)\n", settings->idle_suspend_enabled ? 1 : 0);
+    (void) mkdir(INTERNAL_COMPAS_DIR, 0755);
     FILE * f = fopen(SETTINGS_TMP_FILE_PATH, "w");
     if (!f) return;
 

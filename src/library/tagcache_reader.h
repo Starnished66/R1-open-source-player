@@ -60,7 +60,12 @@ static bool reader_open(int32_t gen) {
     for (size_t i = 0; i < sizeof(reader_persist_tags) / sizeof(reader_persist_tags[0]); ++i) {
         int tag = reader_persist_tags[i];
         char name[80];
-        tag_file_name(name, sizeof(name), tag, gen);
+        int32_t source_gen;
+        if (!resolve_tag_generation(gen, tag, &source_gen)) {
+            reader_close();
+            return false;
+        }
+        tag_file_name(name, sizeof(name), tag, source_gen);
         db_path(path, sizeof(path), name);
         int fd = open(path, O_RDONLY);
         struct tagcache_header th;

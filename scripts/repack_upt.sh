@@ -96,7 +96,11 @@ else
     }
 fi
 
-install -m 0755 "$player" "$work/root/usr/bin/open_hiby_player"
+# A previous Compás image may have left the old standalone name behind.
+# Remove it before installing the renamed player so the update has one
+# unambiguous standalone binary and does not waste space in the rootfs.
+rm -f "$work/root/usr/bin/open_hiby_player"
+install -m 0755 "$player" "$work/root/usr/bin/compas_player"
 install -m 0755 "$bootloader" "$work/root/usr/bin/open_hiby_bootloader"
 
 # The R1 stock boot scripts start the A2DP source daemon without the encoder

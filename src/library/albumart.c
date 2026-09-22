@@ -4,10 +4,11 @@
  * Copyright (C) Open HiBy Player contributors (POSIX host)
  *
  * Search paths and invalid-character folding follow Rockbox. Sized thumbs
- * are stored under .open_hiby_player/albumart, next to tagcache. */
+ * are stored under .compas/albumart, next to tagcache. */
 
 #include "albumart.h"
 #include "library_endian.h"
+#include "storage_paths.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -20,12 +21,8 @@
 #include <limits.h>
 #include <stdint.h>
 
-#ifdef HOST_BUILD
-  #define OPEN_HIBY_DIR "./.open_hiby_player"
-#else
-  #define OPEN_HIBY_DIR "/data/mnt/sd_0/.open_hiby_player"
-#endif
-#define ALBUMART_DIR OPEN_HIBY_DIR "/albumart"
+#define ALBUMART_DIR SD_COMPAS_ROOT "/albumart"
+#define ALBUMART_LEGACY_DIR SD_LEGACY_ROOT "/albumart"
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -83,6 +80,31 @@ static uint64_t thumbnail_key(const albumart_info_t * info) {
         do { hash = (hash ^ *p) * UINT64_C(1099511628211); } while (*p++);
     }
     return hash;
+}
+
+static bool under_directory(const char * path, const char * dir) {
+    size_t len = strlen(dir);
+    return path && strncmp(path, dir, len) == 0 && path[len] == '/';
+}
+
+static bool generated_cache_path(const char * path) {
+    return under_directory(path, ALBUMART_DIR) || under_directory(path, ALBUMART_LEGACY_DIR);
+}
+
+static bool try_exts(char * path, int len);
+
+static bool try_albumart_cache(const char * dir, const albumart_info_t * id3, const char * size_string, char * path) {
+    const char * artist = id3->albumartist[0] ? id3->albumartist : id3->artist;
+    int pathlen;
+    if (!artist[0] || !id3->album[0]) return false;
+    if (size_string[0])
+        pathlen = snprintf(path, PATH_MAX, "%s/v2-%016llx%s.", dir,
+                           (unsigned long long) thumbnail_key(id3), size_string);
+    else
+        pathlen = snprintf(path, PATH_MAX, "%s/%s-%s%s.", dir, artist, id3->album, size_string);
+    if (pathlen < 0 || pathlen >= PATH_MAX) return false;
+    fix_path_part(path, (int) strlen(dir) + 1, PATH_MAX);
+    return try_exts(path, pathlen);
 }
 
 static bool try_exts(char * path, int len) {
@@ -256,7 +278,6 @@ bool albumart_search_files(const albumart_info_t * id3, const char * size_string
     bool found = false;
     bool walked_to_parent = false;
     int track_first = 1;
-    const char * artist;
     int dirlen;
     int albumlen;
     int pathlen;
@@ -286,16 +307,10 @@ bool albumart_search_files(const albumart_info_t * id3, const char * size_string
 
         if (!found) found = try_art_in_dir(dir, dirlen, id3, size_string, albumlen, path);
 
-        artist = id3->albumartist[0] ? id3->albumartist : id3->artist;
-        if (!found && artist[0] && id3->album[0]) {
-            if (size_string[0])
-                pathlen = snprintf(path, sizeof(path), "%s/v2-%016llx%s.", ALBUMART_DIR,
-                                   (unsigned long long) thumbnail_key(id3), size_string);
-            else
-                pathlen = snprintf(path, sizeof(path), "%s/%s-%s%s.", ALBUMART_DIR, artist, id3->album, size_string);
-            fix_path_part(path, (int) strlen(ALBUMART_DIR) + 1, PATH_MAX);
-            found = try_exts(path, pathlen);
-        }
+        if (!found) found = try_albumart_cache(ALBUMART_DIR, id3, size_string, path);
+        /* A destination directory created before the legacy cache is moved
+         * must not hide covers that are still stored under the old name. */
+        if (!found) found = try_albumart_cache(ALBUMART_LEGACY_DIR, id3, size_string, path);
 
         if (!found && dirlen > 1) {
             basename_of_dir(dir, disc_name, sizeof(disc_name));
@@ -385,8 +400,7 @@ bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int hei
     char size_string[24];
     snprintf(size_string, sizeof(size_string), ".%dx%d", width, height);
     if (!albumart_search_files(info, size_string, found, found_size)) return false;
-    size_t dir_len = strlen(ALBUMART_DIR);
-    if (strncmp(found, ALBUMART_DIR, dir_len) != 0 || found[dir_len] != '/') return true;
+    if (!generated_cache_path(found)) return true;
     uint32_t stored = 0;
     /* A false result makes the caller regenerate and atomically replace the
      * cache. Do not unlink by pathname here: another worker may have renamed
@@ -398,6 +412,13 @@ bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int hei
     return true;
 }
 
+static bool generated_cache_file(const char * dir, const albumart_info_t * info, int width, int height,
+                                 char * path, size_t path_size) {
+    int pathlen = snprintf(path, path_size, "%s/v2-%016llx.%dx%d.bmp", dir,
+                           (unsigned long long) thumbnail_key(info), width, height);
+    return pathlen > 0 && (size_t) pathlen < path_size && file_exists(path);
+}
+
 bool albumart_generated_cache_fresh(const albumart_info_t * info, int width, int height,
                                     char * found, size_t found_size) {
     if (!info || !found || found_size == 0 || width <= 0 || height <= 0 ||
@@ -405,10 +426,9 @@ bool albumart_generated_cache_fresh(const albumart_info_t * info, int width, int
         return false;
 
     char path[PATH_MAX];
-    int pathlen = snprintf(path, sizeof(path), "%s/v2-%016llx.%dx%d.bmp", ALBUMART_DIR,
-                           (unsigned long long) thumbnail_key(info), width, height);
-    if (pathlen < 0 || (size_t) pathlen >= sizeof(path) ||
-        (size_t) pathlen >= found_size || !file_exists(path)) return false;
+    bool have = generated_cache_file(ALBUMART_DIR, info, width, height, path, sizeof(path));
+    if (!have) have = generated_cache_file(ALBUMART_LEGACY_DIR, info, width, height, path, sizeof(path));
+    if (!have || strlen(path) >= found_size) return false;
 
     uint32_t stored = 0;
     if (!bmp_source_mtime(path, width, height, &stored)) return false;
@@ -423,7 +443,7 @@ bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, 
     const char * artist = info->albumartist[0] ? info->albumartist : info->artist;
     if (!artist[0] || !info->album[0]) return false;
 
-    mkdir(OPEN_HIBY_DIR, 0755);
+    mkdir(SD_COMPAS_ROOT, 0755);
     mkdir(ALBUMART_DIR, 0755);
 
     char path[PATH_MAX], tmp[PATH_MAX + 16];

@@ -258,8 +258,8 @@ int main(void) {
     assert(albumart_store_rgb565(&info, 0, ALBUMART_PLAYER_CACHE_SIZE, player_pixels) == false);
     free(player_pixels);
     unlink(cached_path);
-    rmdir("./.open_hiby_player/albumart");
-    rmdir("./.open_hiby_player");
+    rmdir("./.compas/albumart");
+    rmdir("./.compas");
     assert(chdir(original_cwd) == 0);
     rmdir(cache_root);
     unlink(source_path);

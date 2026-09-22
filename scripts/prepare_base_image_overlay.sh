@@ -56,8 +56,8 @@ for script in bt_init bt_resume bluealsa_profile; do
     chmod --reference="$stock/usr/bin/$script" "$overlay/usr/bin/$script"
     sh -n "$overlay/usr/bin/$script"
 done
-[[ -f "$repo/open_hiby_player_target" ]] || { echo 'Run make target first' >&2; exit 1; }
-cp "$repo/open_hiby_player_target" "$overlay/usr/bin/open_hiby_player"
+[[ -f "$repo/compas_player_target" ]] || { echo 'Run make target first' >&2; exit 1; }
+cp "$repo/compas_player_target" "$overlay/usr/bin/compas_player"
 # Keep upstream notices with the runtime. Source archives/checkouts stay in
 # scratch for release source bundles; no vendor LDAC binaries enter git.
 licenses="$overlay/usr/share/licenses/base-upgrade"

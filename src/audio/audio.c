@@ -48,16 +48,13 @@
 
 #include "debug_log.h"
 #include "audio_helpers.h"
+#include "storage_paths.h"
 
 /* Persistent cache for MP3 seek-point tables (mp3_seek_cache_load/_save
  * below) -- same on-SD, hidden-directory convention already used by
  * metadata_db.c's METADATA_DB_DIR and albumart.c's ALBUMART_DIR. */
-#ifdef HOST_BUILD
-  #define OPEN_HIBY_DIR "./.open_hiby_player"
-#else
-  #define OPEN_HIBY_DIR "/data/mnt/sd_0/.open_hiby_player"
-#endif
-#define MP3_SEEK_CACHE_DIR OPEN_HIBY_DIR "/mp3seek"
+#define COMPAS_DIR SD_COMPAS_ROOT
+#define MP3_SEEK_CACHE_DIR COMPAS_DIR "/mp3seek"
 
 #ifdef HOST_BUILD
   #include <SDL2/SDL.h>
@@ -964,7 +961,7 @@ static void mp3_seek_cache_save(const char * source_path, const mp3_index_job_t 
     struct stat st;
     if (stat(source_path, &st) != 0) return;
 
-    mkdir(OPEN_HIBY_DIR, 0755);
+    mkdir(COMPAS_DIR, 0755);
     mkdir(MP3_SEEK_CACHE_DIR, 0755);
 
     char path[PATH_MAX], tmp[PATH_MAX + 16];

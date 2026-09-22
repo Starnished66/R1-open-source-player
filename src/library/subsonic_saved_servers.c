@@ -1,5 +1,6 @@
 #include "subsonic_saved_servers.h"
 #include "library_endian.h"
+#include "storage_paths.h"
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -11,14 +12,17 @@
 #include <unistd.h>
 
 #ifdef HOST_BUILD
-  #define SUBSONIC_SAVED_SERVERS_DIR "./.open_hiby_player"
+  #define SUBSONIC_SAVED_SERVERS_DIR SUBSONIC_COMPAS_DIR
+  #define SUBSONIC_SAVED_SERVERS_LEGACY_DIR SUBSONIC_LEGACY_DIR
 #else
   /* Internal ubifs, same partition as settings.c -- Saved Servers must
    * survive an unmounted SD card. */
-  #define SUBSONIC_SAVED_SERVERS_DIR "/usr/data/.open_hiby_player"
+  #define SUBSONIC_SAVED_SERVERS_DIR SUBSONIC_COMPAS_DIR
+  #define SUBSONIC_SAVED_SERVERS_LEGACY_DIR SUBSONIC_LEGACY_DIR
   /* Earlier copy of this file stored the TSV next to tagcache. Imported
    * once if the internal file is missing, then rewritten to DIR. */
   #define SUBSONIC_SAVED_SERVERS_FALLBACK_DIR "/data/mnt/sd_0/.open_hiby_player"
+  #define SUBSONIC_SAVED_SERVERS_COMPAS_FALLBACK_DIR "/data/mnt/sd_0/.compas"
 #endif
 
 #define SUBSONIC_SAVED_SERVERS_FILE "subsonic_servers.tsv"
@@ -122,7 +126,17 @@ static void load_file(void) {
     free_all();
     loaded = true;
     load_from_dir(SUBSONIC_SAVED_SERVERS_DIR);
-#ifdef SUBSONIC_SAVED_SERVERS_FALLBACK_DIR
+#ifdef HOST_BUILD
+    if (entry_n == 0) load_from_dir(SUBSONIC_SAVED_SERVERS_LEGACY_DIR);
+#else
+    if (entry_n == 0) {
+        load_from_dir(SUBSONIC_SAVED_SERVERS_LEGACY_DIR);
+        if (entry_n > 0) save_file();
+    }
+    if (entry_n == 0) {
+        load_from_dir(SUBSONIC_SAVED_SERVERS_COMPAS_FALLBACK_DIR);
+        if (entry_n > 0) save_file();
+    }
     if (entry_n == 0) {
         load_from_dir(SUBSONIC_SAVED_SERVERS_FALLBACK_DIR);
         if (entry_n > 0) save_file();

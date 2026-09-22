@@ -18,7 +18,7 @@
  *
  * Lives on the internal partition (/usr/data), not the SD card, so the
  * list still works with the card unmounted. settings.c also mirrors the
- * same profiles into open_hiby_player_settings.txt for one-file backup. */
+ * same profiles into the settings file for one-file backup. */
 
 typedef struct {
     char url[256];

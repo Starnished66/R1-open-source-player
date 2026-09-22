@@ -97,7 +97,12 @@ bool scanner_read_build_stamp(const char * path, char * out, size_t out_size) {
 }
 
 void scanner_drop_sd_update_cache(void) {
-    int fd = open(SD_UPDATE_PLAYER_PATH, O_RDONLY | O_CLOEXEC);
+    const char * paths[] = { SD_UPDATE_PLAYER_PATH, LEGACY_SD_UPDATE_PLAYER_PATH };
+    int fd = -1;
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        fd = open(paths[i], O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) break;
+    }
     if (fd < 0) return;
 
     /* installer_run() reads this executable in full (for its checksum, and
@@ -136,8 +141,14 @@ void scanner_scan(scan_result_t * out) {
 
     mount_sd_card_if_needed();
 
-    out->sd_stock_present = scanner_path_is_executable(SD_STOCK_PLAYER_PATH);
-    out->sd_update_present = scanner_path_is_executable(SD_UPDATE_PLAYER_PATH);
+    out->sd_stock_path = scanner_path_is_executable(SD_STOCK_PLAYER_PATH) ? SD_STOCK_PLAYER_PATH :
+                         (scanner_path_is_executable(LEGACY_SD_STOCK_PLAYER_PATH) ?
+                              LEGACY_SD_STOCK_PLAYER_PATH : NULL);
+    out->sd_stock_present = out->sd_stock_path != NULL;
+    out->sd_update_path = scanner_path_is_executable(SD_UPDATE_PLAYER_PATH) ? SD_UPDATE_PLAYER_PATH :
+                          (scanner_path_is_executable(LEGACY_SD_UPDATE_PLAYER_PATH) ?
+                               LEGACY_SD_UPDATE_PLAYER_PATH : NULL);
+    out->sd_update_present = out->sd_update_path != NULL;
 
     scanner_read_build_stamp(INTERNAL_PLAYER_PATH, out->internal_build_stamp,
                              sizeof(out->internal_build_stamp));

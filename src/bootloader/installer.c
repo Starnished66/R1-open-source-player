@@ -24,7 +24,7 @@
 #define INSTALL_DIR "/usr/data"
 
 /* Temporary path used during installation before atomic rename. */
-#define INSTALL_TMP_PATH "/usr/data/.open_hiby_player.installing"
+#define INSTALL_TMP_PATH "/usr/data/.compas_player.installing"
 
 /* Table-driven CRC-32 (standard reflected 0xEDB88320 polynomial) used to
  * verify copy integrity and detect truncation or file corruption.
@@ -240,10 +240,12 @@ static void draw_updating_screen(void) {
 void installer_run(const scan_result_t * scan, bool fb_ready) {
     if (!scan->sd_update_present) return;
 
+    const char * source_path = scan->sd_update_path ? scan->sd_update_path : SD_UPDATE_PLAYER_PATH;
+
     uint32_t sd_crc;
     off_t sd_size;
-    if (!file_crc32_and_size(SD_UPDATE_PLAYER_PATH, &sd_crc, &sd_size)) {
-        fprintf(stderr, "installer: could not read %s -- leaving it for a later boot\n", SD_UPDATE_PLAYER_PATH);
+    if (!file_crc32_and_size(source_path, &sd_crc, &sd_size)) {
+        fprintf(stderr, "installer: could not read %s -- leaving it for a later boot\n", source_path);
         return;
     }
 
@@ -262,11 +264,12 @@ void installer_run(const scan_result_t * scan, bool fb_ready) {
                         INSTALLED_PLAYER_PATH);
                 return;
             }
-            if (unlink(SD_UPDATE_PLAYER_PATH) != 0) {
+            if (unlink(source_path) != 0) {
                 fprintf(stderr, "installer: %s is already installed; retrying its SD cleanup failed: %s\n",
                         INSTALLED_PLAYER_PATH, strerror(errno));
             } else {
-                fsync_path(SD_ALT_DIR, true);
+                fsync_path(strncmp(source_path, LEGACY_SD_ALT_DIR, strlen(LEGACY_SD_ALT_DIR)) == 0 ?
+                               LEGACY_SD_ALT_DIR : SD_ALT_DIR, true);
                 fprintf(stderr, "installer: %s already installed; finished deferred SD cleanup\n",
                         INSTALLED_PLAYER_PATH);
             }
@@ -291,7 +294,7 @@ void installer_run(const scan_result_t * scan, bool fb_ready) {
 
     if (fb_ready) draw_updating_screen();
 
-    if (!copy_file(SD_UPDATE_PLAYER_PATH, INSTALL_TMP_PATH)) {
+    if (!copy_file(source_path, INSTALL_TMP_PATH)) {
         fprintf(stderr, "installer: copy failed -- leaving SD update for a later boot\n");
         unlink(INSTALL_TMP_PATH);
         return;
@@ -309,7 +312,7 @@ void installer_run(const scan_result_t * scan, bool fb_ready) {
         fprintf(stderr,
                 "installer: %s is not a valid MIPS executable -- refusing to replace the installed player, leaving "
                 "SD update for a later boot\n",
-                SD_UPDATE_PLAYER_PATH);
+                source_path);
         unlink(INSTALL_TMP_PATH);
         return;
     }
@@ -340,11 +343,12 @@ void installer_run(const scan_result_t * scan, bool fb_ready) {
         return;
     }
 
-    if (unlink(SD_UPDATE_PLAYER_PATH) != 0) {
+    if (unlink(source_path) != 0) {
         fprintf(stderr, "installer: install succeeded but SD cleanup failed: %s -- will retry next boot\n",
                 strerror(errno));
     } else {
-        fsync_path(SD_ALT_DIR, true);
+        fsync_path(strncmp(source_path, LEGACY_SD_ALT_DIR, strlen(LEGACY_SD_ALT_DIR)) == 0 ?
+                       LEGACY_SD_ALT_DIR : SD_ALT_DIR, true);
     }
 
     fprintf(stderr, "installer: installed SD update to %s\n", INSTALLED_PLAYER_PATH);
@@ -391,5 +395,39 @@ const char * installer_select_internal_player(const char * packaged, const char 
 }
 
 const char * installer_internal_player_path(void) {
-    return installer_select_internal_player(INTERNAL_PLAYER_PATH, INSTALLED_PLAYER_PATH);
+    const char * installed = NULL;
+    bool new_present = scanner_path_is_executable(INSTALLED_PLAYER_PATH);
+    bool legacy_present = scanner_path_is_executable(LEGACY_INSTALLED_PLAYER_PATH);
+    if (new_present && legacy_present) {
+        char new_stamp[BOOT_BUILD_STAMP_LEN + 1];
+        char legacy_stamp[BOOT_BUILD_STAMP_LEN + 1];
+        bool new_stamped = scanner_read_build_stamp(INSTALLED_PLAYER_PATH, new_stamp, sizeof(new_stamp));
+        bool legacy_stamped = scanner_read_build_stamp(LEGACY_INSTALLED_PLAYER_PATH, legacy_stamp,
+                                                       sizeof(legacy_stamp));
+        /* If both are trustworthy, keep whichever user-installed build is
+         * newer. Unknown legacy metadata cannot displace a valid new path. */
+        if (legacy_stamped && (!new_stamped || strcmp(legacy_stamp, new_stamp) > 0)) {
+            installed = LEGACY_INSTALLED_PLAYER_PATH;
+        } else {
+            installed = INSTALLED_PLAYER_PATH;
+        }
+    } else if (new_present) {
+        installed = INSTALLED_PLAYER_PATH;
+    } else if (legacy_present) {
+        installed = LEGACY_INSTALLED_PLAYER_PATH;
+    }
+    /* A legacy install without a build stamp has no trustworthy way to outrank
+     * the newly named packaged player. Keep the legacy file intact for manual
+     * recovery, but boot the stamped package so it cannot shadow every future
+     * release indefinitely. The normal new-path override policy below still
+     * preserves unknown stamped state exactly as before. */
+    if (!new_present && legacy_present) {
+        char packaged_stamp[BOOT_BUILD_STAMP_LEN + 1];
+        char legacy_stamp[BOOT_BUILD_STAMP_LEN + 1];
+        if (scanner_read_build_stamp(INTERNAL_PLAYER_PATH, packaged_stamp, sizeof(packaged_stamp)) &&
+            !scanner_read_build_stamp(LEGACY_INSTALLED_PLAYER_PATH, legacy_stamp, sizeof(legacy_stamp))) {
+            return INTERNAL_PLAYER_PATH;
+        }
+    }
+    return installed ? installer_select_internal_player(INTERNAL_PLAYER_PATH, installed) : INTERNAL_PLAYER_PATH;
 }

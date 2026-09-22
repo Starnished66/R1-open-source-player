@@ -27,27 +27,27 @@ Makefile `BOARD` values: `r1` (default), `r3proii`, `r3ii_2025`. R1 binaries kee
 **Status: Supported and actively tested.** Primary development platform. Tested on real hardware (framebuffer, touchscreen, audio, physical buttons, Bluetooth, Wi-Fi).
 
 ```bash
-make target                 # -> open_hiby_player_target
+make target                 # -> compas_player_target
 make bootloader             # -> open_hiby_bootloader
 ```
 
 ## HiBy R3 Pro II
 
 ```bash
-make target BOARD=r3proii   # -> open_hiby_player_target_r3proii
+make target BOARD=r3proii   # -> compas_player_target_r3proii
 make bootloader BOARD=r3proii # -> open_hiby_bootloader_r3proii
 ```
 
 The tree has a 480×720 layout, 4.4 mm balanced-output routing, extra charger-IC handling, and UI scaling. Do not treat an R3 build as an R1 binary. The scheduled GitHub **Daily build** workflow publishes these two R3 binaries as a downloadable workflow artifact. A complete R3 `.upt` release requires a separately approved R3 staging image and checksum secret; the stock image is not used automatically.
 
-For a local R3 firmware candidate, supply your own R3 Pro II `.upt` and run `BOARD=r3proii scripts/repack_upt.sh BASE_R3_UPT open_hiby_player_target_r3proii open_hiby_bootloader_r3proii OUTPUT_R3_UPT`. The repacker checks the stock player for the R3 board marker, adds the bootloader handoff, and installs the 480×720 boot assets. Keep the original base image for recovery; the candidate has not been validated on R3 hardware.
+For a local R3 firmware candidate, supply your own R3 Pro II `.upt` and run `BOARD=r3proii scripts/repack_upt.sh BASE_R3_UPT compas_player_target_r3proii open_hiby_bootloader_r3proii OUTPUT_R3_UPT`. The repacker checks the stock player for the R3 board marker, adds the bootloader handoff, and installs the 480×720 boot assets. Keep the original base image for recovery; the candidate has not been validated on R3 hardware.
 
 When the repository secret `R3PROII_STAGING_IMAGE_SHA256` is configured, the same workflow can verify the R3 base image and publish a second, staging-only workflow artifact containing the repacked `.upt`. The manual workflow's `r3_base_asset` input selects the `.upt` asset from the private `staging-image-base` release. No public GitHub release is created by this path.
 
 ## HiBy R3 II 2025
 
 ```bash
-make target BOARD=r3ii_2025 # -> open_hiby_player_target_r3ii_2025
+make target BOARD=r3ii_2025 # -> compas_player_target_r3ii_2025
 ```
 
 The tree has a 320×480 layout and the same `BOARD` scaling path. Same caution: model-specific, not an R1 drop-in.
@@ -88,7 +88,7 @@ Stock graphics are not redistributed — populate `assets/theme2/` from your own
 
 ```bash
 make
-./open_hiby_player_host
+./compas_player_host
 ```
 
 (`make` is `make host`. Default `BOARD` is `r1`.) Click-and-drag in the SDL2 window simulates touch.
@@ -107,7 +107,7 @@ That builds from source and takes a while. Other distributions are not documente
 make target
 ```
 
-Produces a stripped `open_hiby_player_target` (or `open_hiby_player_target_<board>`). Pass `BOARD` as in Device Support.
+Produces a stripped `compas_player_target` (or `compas_player_target_<board>`). Pass `BOARD` as in Device Support.
 
 ---
 
@@ -117,19 +117,31 @@ Produces a stripped `open_hiby_player_target` (or `open_hiby_player_target_<boar
 
 > **Requires the full `.upt` to have been flashed first.** This method works only because the open-source bootloader is already on the device, and that bootloader arrives with the firmware image below. On stock firmware nothing reads this path and the update is ignored. Flash the `.upt` once, then use this for every update after it.
 
-Download `open_hiby_player` from the **[releases page](https://github.com/Starnished66/R1-open-source-player/releases)**, or build your own with `make target`. Copy it to this exact path (*inside* `.open_hiby_player`; never replace that directory):
+Download `compas_player` from the **[releases page](https://github.com/Starnished66/compas-player/releases)**, or build your own with `make target`. Copy it to this exact path (*inside* `.compas`; never replace that directory):
 
 ```text
-/data/mnt/sd_0/.open_hiby_player/open_hiby_player
+/data/mnt/sd_0/.compas/compas_player
 ```
 
-On the card that is `SD/.open_hiby_player/open_hiby_player`. Use the matching board binary, then reboot — the bootloader copies it to internal storage.
+On the card that is `SD/.compas/compas_player`. Use the matching board binary, then reboot — the bootloader copies it to internal storage.
+
+Devices still running the older bootloader look for
+`SD/.open_hiby_player/open_hiby_player`; flash the current full `.upt` once to
+enable the Compás Player path above.
+
+For the next release, each mount processes up to 256 top-level non-database,
+non-bootloader entries from `SD/.open_hiby_player` into `SD/.compas`; remaining
+entries retry on a later boot or card reinsertion. Existing destination entries
+are preserved for safe retries, and large cache directories are renamed in O(1)
+when the destination is absent. Archived database files and bootloader
+stock/update artifacts remain under the legacy path during the compatibility
+window. This compatibility migration is planned for removal afterward.
 
 ## Full firmware image (`.upt`)
 
 This rewrites the recovery-updatable firmware. Needed once, to put the open-source bootloader on the device, and again only when the bootloader itself changes. After that, player updates go through the SD path above.
 
-Download `r1.upt` from the **[releases page](https://github.com/Starnished66/R1-open-source-player/releases)**. Keep a known-good recovery image first.
+Download `r1.upt` from the **[releases page](https://github.com/Starnished66/compas-player/releases)**. Keep a known-good recovery image first.
 
 ### Building one yourself
 

@@ -8,11 +8,14 @@
 /* The durable, internal-storage copy that an SD update binary gets installed
  * into -- see installer.c's own top comment for why this app must never run
  * straight off the SD card (SD_UPDATE_PLAYER_PATH, scanner.h) and only ever
- * runs from here or from the read-only squashfs INTERNAL_PLAYER_PATH. Same
- * /usr/data root as BOOT_PREF_PATH -- the one writable partition. */
-#define INSTALLED_PLAYER_PATH "/usr/data/open_hiby_player"
+ * runs from here or from the read-only squashfs INTERNAL_PLAYER_PATH. The
+ * legacy path below is retained so an older installed build cannot override
+ * a newer packaged build during the .compas transition. */
+#define INSTALLED_PLAYER_PATH "/usr/data/compas_player"
+#define LEGACY_INSTALLED_PLAYER_PATH "/usr/data/open_hiby_player"
 
-/* If scan->sd_update_present, copies SD_UPDATE_PLAYER_PATH to
+/* If scan->sd_update_present, copies the selected update path (new .compas
+ * preferred, legacy path accepted) to
  * INSTALLED_PLAYER_PATH via a validated, fsync'd temp-file-then-rename
  * sequence, then deletes the SD copy -- only once the install is fully
  * durable. A no-op when scan->sd_update_present is false (the ordinary case

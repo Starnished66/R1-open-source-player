@@ -136,7 +136,7 @@ static int index_make_entry(int directory_fd, const char *name, dir_entry_t *out
 static int index_temp_fd(int directory_fd) {
     char name[64];
     for (unsigned attempt = 0; attempt < 100; attempt++) {
-        snprintf(name, sizeof(name), ".open_hiby_files_%ld_%u", (long)getpid(), attempt);
+        snprintf(name, sizeof(name), ".compas_files_%ld_%u", (long)getpid(), attempt);
         int fd = openat(directory_fd, name, O_RDWR | O_CREAT | O_EXCL, 0600);
         if (fd >= 0) { if (unlinkat(directory_fd, name, 0) != 0) { close(fd); return -1; } return fd; }
         if (errno != EEXIST) return -1;

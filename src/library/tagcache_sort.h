@@ -17,6 +17,13 @@
 #define TC_SORT_RUN_BYTES (64u * 1024u)
 #define TC_SORT_MERGE_BYTES (32u * 1024u)
 #define TC_SORT_OUTPUT_BYTES (64u * 1024u)
+#define TC_SORT_LARGE_TOTAL_BYTES (2u * 1024u * 1024u)
+#define TC_SORT_LARGE_RUN_BYTES (768u * 1024u)
+#define TC_SORT_LARGE_MERGE_BYTES (128u * 1024u)
+#define TC_SORT_LARGE_OUTPUT_BYTES (256u * 1024u)
+#ifndef TC_SORT_AVAILABLE_BYTES
+#define TC_SORT_AVAILABLE_BYTES() 0u
+#endif
 
 static bool tc_sort_io_read(int fd, void *buf, size_t len, off_t off) {
     unsigned char *p = (unsigned char *)buf;
@@ -200,19 +207,38 @@ static bool tc_sort_fd(int fd, size_t record_size, int64_t count,
     int in_fd = fd, out_fd = scratch_fd;
     int64_t run_len;
     bool ok = false;
+    bool large = false;
     off_t total_bytes;
     if (record_size == 0 || count < 0 || cmp == NULL || fd == scratch_fd ||
         !tc_sort_mul_off(count, record_size, &total_bytes)) return false;
-    run_cap = TC_SORT_RUN_BYTES / record_size;
-    merge_cap = TC_SORT_MERGE_BYTES / record_size;
-    out_cap = TC_SORT_OUTPUT_BYTES / record_size;
+    const char *disable_large = getenv("TAGCACHE_DISABLE_LARGE_SORT");
+    large = (!disable_large || disable_large[0] == '\0' || disable_large[0] == '0') &&
+            TC_SORT_AVAILABLE_BYTES() >= (size_t) TC_SORT_LARGE_TOTAL_BYTES + (16u * 1024u * 1024u);
+    run_cap = (large ? TC_SORT_LARGE_RUN_BYTES : TC_SORT_RUN_BYTES) / record_size;
+    merge_cap = (large ? TC_SORT_LARGE_MERGE_BYTES : TC_SORT_MERGE_BYTES) / record_size;
+    out_cap = (large ? TC_SORT_LARGE_OUTPUT_BYTES : TC_SORT_OUTPUT_BYTES) / record_size;
     if (run_cap == 0 || merge_cap == 0 || out_cap == 0) return false;
     run = (unsigned char *)malloc(run_cap * record_size);
     tmp = (unsigned char *)malloc(run_cap * record_size);
     left = (unsigned char *)malloc(merge_cap * record_size);
     right = (unsigned char *)malloc(merge_cap * record_size);
     out = (unsigned char *)malloc(out_cap * record_size);
-    if (run == NULL || tmp == NULL || left == NULL || right == NULL || out == NULL) goto done;
+    if (run == NULL || tmp == NULL || left == NULL || right == NULL || out == NULL) {
+        free(out); free(right); free(left); free(tmp); free(run);
+        out = right = left = tmp = run = NULL;
+        if (!large) goto done;
+        large = false;
+        run_cap = TC_SORT_RUN_BYTES / record_size;
+        merge_cap = TC_SORT_MERGE_BYTES / record_size;
+        out_cap = TC_SORT_OUTPUT_BYTES / record_size;
+        if (run_cap == 0 || merge_cap == 0 || out_cap == 0) goto done;
+        run = (unsigned char *)malloc(run_cap * record_size);
+        tmp = (unsigned char *)malloc(run_cap * record_size);
+        left = (unsigned char *)malloc(merge_cap * record_size);
+        right = (unsigned char *)malloc(merge_cap * record_size);
+        out = (unsigned char *)malloc(out_cap * record_size);
+        if (run == NULL || tmp == NULL || left == NULL || right == NULL || out == NULL) goto done;
+    }
     for (int64_t at = 0; at < count; at += (int64_t)run_cap) {
         size_t n = (size_t)(count - at);
         off_t off;

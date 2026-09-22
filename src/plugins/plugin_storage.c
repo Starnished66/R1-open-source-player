@@ -1,5 +1,6 @@
 #include "plugin_storage.h"
 #include "plugin_internal.h"
+#include "storage_paths.h"
 
 #include "mbedtls/md5.h"
 
@@ -15,11 +16,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#ifdef HOST_BUILD
-  #define PLUGIN_STORAGE_ROOT "./.open_hiby_player/plugins"
-#else
-  #define PLUGIN_STORAGE_ROOT "/usr/data/plugins"
-#endif
 
 #define PLUGIN_STORAGE_VALUE_MAX (256U * 1024U)
 #define PLUGIN_STORAGE_KEYS_MAX 500

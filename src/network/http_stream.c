@@ -141,7 +141,7 @@ static http_stream_t * http_stream_open_internal(const char * url, bool verify_t
      * a server that defaults it on would corrupt dr_mp3's view of the
      * stream, since those blocks aren't valid MP3 frame data. */
     int req_len = snprintf(request, sizeof(request),
-                            "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: open_hiby_player\r\n"
+                            "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Compas/compas_player\r\n"
                             "Icy-MetaData: 0\r\nConnection: close\r\n\r\n",
                             path, host);
     if (req_len < 0 || (size_t) req_len >= sizeof(request)) {

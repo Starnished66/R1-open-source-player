@@ -359,7 +359,7 @@ int main(void) {
             chosen_entry = run_menu(&scan);
             input_close();
         }
-        boot_path = (chosen_entry == BOOT_ENTRY_SD_STOCK) ? SD_STOCK_PLAYER_PATH : internal_path;
+        boot_path = (chosen_entry == BOOT_ENTRY_SD_STOCK) ? scan.sd_stock_path : internal_path;
     }
 
     /* Drop SD update page cache before launching Stock player to free memory. */

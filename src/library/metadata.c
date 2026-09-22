@@ -2234,7 +2234,7 @@ static metadata_artwork_result_t metadata_read_artwork_isolated_impl(const char 
     if (pid == 0) {
         close(pipefd[0]);
         char * const argv[] = {
-            (char *) "open_hiby_player",
+            (char *) "compas_player",
             (char *) "--metadata-artwork-helper",
             output_fd_arg,
             (char *) path,

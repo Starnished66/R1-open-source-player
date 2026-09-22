@@ -31,8 +31,8 @@ case "$component" in
         for binary in bluetoothctl hciconfig hcitool btmon; do
             cp "$stage/usr/bin/$binary" "$overlay/usr/bin/"
         done
-        [[ -f "$repo/open_hiby_player_target" ]] || { echo 'Run make target first' >&2; exit 1; }
-        cp "$repo/open_hiby_player_target" "$overlay/usr/bin/open_hiby_player"
+        [[ -f "$repo/compas_player_target" ]] || { echo 'Run make target first' >&2; exit 1; }
+        cp "$repo/compas_player_target" "$overlay/usr/bin/compas_player"
         ;;
     wifi)
         mkdir -p "$overlay/usr/sbin"

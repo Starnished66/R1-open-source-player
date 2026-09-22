@@ -4,6 +4,7 @@
 #include "debug_log.h"
 
 #include <fcntl.h>
+#include <errno.h>
 #include <linux/i2c-dev.h>
 #include <linux/i2c.h>
 #include <stdint.h>
@@ -50,8 +51,9 @@
 #define MP_VOLTAGE_BASELINE 0xC8u
 
 #ifndef CHARGE_LIMITER_BASELINE_PATH
-#define CHARGE_LIMITER_BASELINE_PATH "/usr/data/open_hiby_charge_baseline.txt"
+#define CHARGE_LIMITER_BASELINE_PATH "/usr/data/.compas/charge_baseline.txt"
 #endif
+#define LEGACY_CHARGE_LIMITER_BASELINE_PATH "/usr/data/open_hiby_charge_baseline.txt"
 /* Bumped from 1: the persisted file used to also carry a captured voltage
  * baseline (removed -- voltage is a known per-board constant now, nothing
  * to capture or persist). A stale v1 file is safely ignored/reset rather
@@ -122,7 +124,12 @@ static bool mp_write(uint8_t r, uint8_t v) { return xfer(MP_BUS, MP_ADDR, r, &v,
  * failure mode BASELINE_VERSION's own bump from 1 to 2 would have
  * triggered on any device that had run the older format. */
 static void load_baseline(void) {
-    FILE *f = fopen(CHARGE_LIMITER_BASELINE_PATH, "r");
+    const char *path = CHARGE_LIMITER_BASELINE_PATH;
+    FILE *f = fopen(path, "r");
+    if (!f && strcmp(CHARGE_LIMITER_BASELINE_PATH, LEGACY_CHARGE_LIMITER_BASELINE_PATH) != 0) {
+        path = LEGACY_CHARGE_LIMITER_BASELINE_PATH;
+        f = fopen(path, "r");
+    }
     if (!f) return;
     unsigned ver, ai;
     bool ok = fscanf(f, "version=%u axp_current=%u", &ver, &ai) == 2 &&
@@ -134,10 +141,19 @@ static void load_baseline(void) {
     if (ok) { baseline.mp.valid = true; baseline.mp.current = (uint8_t)mi; }
 #endif
     fclose(f);
-    if (!ok) { memset(&baseline, 0, sizeof(baseline)); unlink(CHARGE_LIMITER_BASELINE_PATH); }
+    if (!ok) { memset(&baseline, 0, sizeof(baseline)); unlink(path); }
 }
 
 static bool save_baseline(void) {
+    /* The migration target is inside the shared .compas data directory. The
+     * directory may not exist on an upgraded device until this first save. */
+    char parent[sizeof(CHARGE_LIMITER_BASELINE_PATH)];
+    snprintf(parent, sizeof(parent), "%s", CHARGE_LIMITER_BASELINE_PATH);
+    char *parent_slash = strrchr(parent, '/');
+    if (parent_slash) {
+        *parent_slash = '\0';
+        if (mkdir(parent, 0755) != 0 && errno != EEXIST) return false;
+    }
     char tmp[sizeof(CHARGE_LIMITER_BASELINE_PATH) + 32];
     snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", CHARGE_LIMITER_BASELINE_PATH, (long)getpid());
     FILE *f = fopen(tmp, "w"); if (!f) return false;

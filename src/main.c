@@ -19,6 +19,7 @@
 
 #include "gui.h"
 #include "db_log.h"
+#include "storage_migration.h"
 
 #ifdef HOST_BUILD
   #include "src/drivers/sdl/lv_sdl_window.h"
@@ -31,6 +32,7 @@
   #include "hw_buttons.h"
   #include "firmware_update.h"
   #include "subprocess.h"
+  #include "sd_fsck_run.h"
   #include <fcntl.h>
   #include <sys/ioctl.h>
   #include <sys/stat.h>
@@ -247,21 +249,42 @@ static void try_mount_sd_device_node(const char * device_node) {
     subprocess_run(ntfs_argv, NULL, 0);
 }
 
+/* The repair thread asks for this after fsck. It stays on the thread that
+ * already owns mounting, and it does not start another repair. */
+static void finish_sd_repair_remount(void) {
+    const char * device = sd_repair_device();
+    if (device && device[0]) try_mount_sd_device_node(device);
+    bool mounted = sd_mount_point_mounted();
+    bool readonly = false;
+    if (mounted) {
+        bool parsed_readonly = false;
+        if (sd_repair_current_readonly(&parsed_readonly)) readonly = parsed_readonly;
+    }
+    sd_repair_complete(mounted, readonly);
+}
+
 /* Ensures the SD card is mounted at /data/mnt/sd_0. Creates the mount point
  * first (best-effort -- /data/mnt may not exist yet on a fresh boot), then
  * tries the card's partition node, falling back to the whole-disk node for
- * a partition-less ("superfloppy") card. */
+ * a partition-less ("superfloppy") card. A read-only mount is unmounted
+ * and checked in the background; this returns with the card detached until
+ * a later call remounts it. */
 void mount_sd_card_if_needed(void) {
     mkdir("/data/mnt", 0755);
     mkdir("/data/mnt/sd_0", 0755);
-    if (sd_mount_point_mounted()) return;
-
-    sync_sd_device_nodes();
-
-    try_mount_sd_device_node("/dev/mmcblk0p1");
-    if (sd_mount_point_mounted()) return;
-
-    try_mount_sd_device_node("/dev/mmcblk0");
+    if (sd_repair_needs_remount()) {
+        finish_sd_repair_remount();
+        return;
+    }
+    /* fsck still has the block device. Mounting over it would race the check. */
+    if (sd_repair_in_progress()) return;
+    if (!sd_mount_point_mounted()) {
+        sync_sd_device_nodes();
+        try_mount_sd_device_node("/dev/mmcblk0p1");
+        if (!sd_mount_point_mounted()) try_mount_sd_device_node("/dev/mmcblk0");
+    }
+    sd_readonly_repair_kick(NULL);
+    if (sd_repair_needs_remount()) finish_sd_repair_remount();
 }
 
 /* A software-triggered reboot can start this S92 process before the SD
@@ -389,7 +412,7 @@ int main(int argc, char ** argv) {
     }
 
     setvbuf(stdout, NULL, _IOLBF, 0);
-    printf("Starting open_hiby_player...\n");
+    printf("Starting compas_player...\n");
 
 #ifndef HOST_BUILD
     boot_checkpoint("main entered");
@@ -409,6 +432,9 @@ int main(int argc, char ** argv) {
      * both read from the SD card. */
     mount_sd_card_if_needed();
     boot_checkpoint("mount_sd_card_if_needed done");
+    storage_migrate_internal_data();
+    if (sd_card_root_is_mounted()) storage_migrate_legacy_data();
+    boot_checkpoint("storage migration done");
 
     /* Deliberately no startup-time Bluetooth/D-Bus cleanup call here -- see
      * bluetooth_control.h's comment above bt_control_is_powered(): doing

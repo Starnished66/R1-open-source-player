@@ -261,10 +261,11 @@ void mount_sd_card_if_needed(void) {
         .wait_ms = real_wait_ms,
     };
 
-    const char * exec_candidates[] = { SD_STOCK_PLAYER_PATH, SD_UPDATE_PLAYER_PATH };
+    const char * exec_candidates[] = { SD_STOCK_PLAYER_PATH, SD_UPDATE_PLAYER_PATH,
+                                       LEGACY_SD_STOCK_PLAYER_PATH, LEGACY_SD_UPDATE_PLAYER_PATH };
 
     sd_ready_result_t result =
-        wait_for_sd_ready(&probes, SD_DEVICE_NODE_PARTITION, SD_DEVICE_NODE_WHOLE_DISK, exec_candidates, 2,
+        wait_for_sd_ready(&probes, SD_DEVICE_NODE_PARTITION, SD_DEVICE_NODE_WHOLE_DISK, exec_candidates, 4,
                           SD_READY_SHORT_DEADLINE_MS, SD_READY_EXTENDED_DEADLINE_MS, SD_READY_HARD_DEADLINE_MS,
                           SD_READY_POLL_INTERVAL_MS, SD_READY_EXEC_GRACE_MS);
 

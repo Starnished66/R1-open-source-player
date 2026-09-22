@@ -71,6 +71,7 @@ static bool is_sd_card_path(const char *path);
 #include "settings.h"
 #include "assets.h"
 #include "device_config.h"
+#include "storage_paths.h"
 #include "plugin_manager.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -4345,13 +4346,17 @@ void on_file_selected_lazy_recently_added(int selected_index) {
 static bool resume_playlist_needs_lazy_order = false;
 static file_browser_index_t *resume_file_index = NULL;
 #ifdef HOST_BUILD
-#define QUEUE_RESUME_PATH "./open_hiby_player_queue.bin"
-#define SD_QUEUE_RESUME_PATH "./music/.open_hiby_player/queue.bin"
-#define SD_QUEUE_RESUME_DIR "./music/.open_hiby_player"
+#define QUEUE_RESUME_PATH "./.compas/queue.bin"
+#define SD_QUEUE_RESUME_PATH "./music/.compas/queue.bin"
+#define SD_QUEUE_RESUME_DIR "./music/.compas"
+#define QUEUE_RESUME_LEGACY_PATH "./open_hiby_player_queue.bin"
+#define SD_QUEUE_RESUME_LEGACY_PATH "./music/.open_hiby_player/queue.bin"
 #else
-#define QUEUE_RESUME_PATH "/usr/data/open_hiby_player_queue.bin"
-#define SD_QUEUE_RESUME_PATH "/data/mnt/sd_0/.open_hiby_player/queue.bin"
-#define SD_QUEUE_RESUME_DIR "/data/mnt/sd_0/.open_hiby_player"
+#define QUEUE_RESUME_PATH "/usr/data/.compas/queue.bin"
+#define SD_QUEUE_RESUME_PATH "/data/mnt/sd_0/.compas/queue.bin"
+#define SD_QUEUE_RESUME_DIR "/data/mnt/sd_0/.compas"
+#define QUEUE_RESUME_LEGACY_PATH "/usr/data/open_hiby_player_queue.bin"
+#define SD_QUEUE_RESUME_LEGACY_PATH "/data/mnt/sd_0/.open_hiby_player/queue.bin"
 #endif
 
 /* A lazy All-Songs queue has no paths until playlist_path_at() resolves them.
@@ -4388,6 +4393,7 @@ static bool have_restored_queue;
 typedef struct {
     int target_dirfd;
     char target_name[NAME_MAX];
+    bool target_is_sd;
     queue_resume_t queue;
 } checkpoint_worker_ctx_t;
 
@@ -4414,8 +4420,8 @@ static int open_sd_queue_dir(void) {
      * rename/unlink to the new card. */
     int rootfd = open(MUSIC_ROOT_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (rootfd < 0) return -1;
-    (void) mkdirat(rootfd, ".open_hiby_player", 0755);
-    int dirfd = openat(rootfd, ".open_hiby_player", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    (void) mkdirat(rootfd, COMPAS_STORAGE_DIR, 0755);
+    int dirfd = openat(rootfd, COMPAS_STORAGE_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     close(rootfd);
     return dirfd;
 }
@@ -4426,8 +4432,8 @@ static int open_queue_dir_from_snapshot(const metadata_db_snapshot_t *snapshot) 
     int rootfd = openat(dbfd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     close(dbfd);
     if (rootfd < 0) return -1;
-    (void) mkdirat(rootfd, ".open_hiby_player", 0755);
-    int dirfd = openat(rootfd, ".open_hiby_player", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    (void) mkdirat(rootfd, COMPAS_STORAGE_DIR, 0755);
+    int dirfd = openat(rootfd, COMPAS_STORAGE_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     close(rootfd);
     return dirfd;
 }
@@ -4452,8 +4458,8 @@ static int open_queue_dir_from_file_index(const file_browser_index_t *index) {
         if (parent < 0) { close(fd); return -1; }
         close(fd); fd = parent;
     }
-    (void) mkdirat(fd, ".open_hiby_player", 0755);
-    int queuefd = openat(fd, ".open_hiby_player", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    (void) mkdirat(fd, COMPAS_STORAGE_DIR, 0755);
+    int queuefd = openat(fd, COMPAS_STORAGE_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     close(fd);
     return queuefd;
 }
@@ -4471,6 +4477,23 @@ static int open_checkpoint_target_dir(const char * path) {
 
 static void remove_queue_checkpoint_at(int dirfd, const char * name) {
     if (dirfd >= 0 && name) (void) unlinkat(dirfd, name, 0);
+}
+
+static void remove_legacy_sd_checkpoint(int compas_dirfd) {
+    int rootfd = openat(compas_dirfd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (rootfd < 0) return;
+    int legacyfd = openat(rootfd, LEGACY_STORAGE_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (legacyfd >= 0) { (void) unlinkat(legacyfd, "queue.bin", 0); close(legacyfd); }
+    close(rootfd);
+}
+
+static void retire_legacy_checkpoint(const checkpoint_worker_ctx_t * ctx) {
+    if (!ctx) return;
+    if (!ctx->target_is_sd) {
+        (void) unlink(QUEUE_RESUME_LEGACY_PATH);
+        return;
+    }
+    remove_legacy_sd_checkpoint(ctx->target_dirfd);
 }
 
 /* Plain uint64_t, not atomic: this target's toolchain lacks a native 64-bit
@@ -4491,10 +4514,14 @@ static double checkpoint_position_sd = -1;
 
 static void * queue_checkpoint_worker(void * arg) {
     checkpoint_worker_ctx_t * ctx = (checkpoint_worker_ctx_t *) arg;
-    if (!queue_resume_write_at(ctx->target_dirfd, ctx->target_name, &ctx->queue)) {
+    bool wrote = queue_resume_write_at(ctx->target_dirfd, ctx->target_name, &ctx->queue);
+    if (!wrote) {
         /* Retry on the next checkpoint; never replace a valid file on failure. */
         atomic_store(&checkpoint_failure_pending, true);
-    } else atomic_store(&checkpoint_failure_pending, false);
+    } else {
+        atomic_store(&checkpoint_failure_pending, false);
+        retire_legacy_checkpoint(ctx);
+    }
     queue_resume_free(&ctx->queue);
     if (atomic_load(&checkpoint_large_lazy_cleanup_pending)) {
         remove_queue_checkpoint_at(ctx->target_dirfd, ctx->target_name);
@@ -4529,8 +4556,10 @@ void gui_player_queue_checkpoint(void) {
             checkpoint_running = false;
         }
         int internal_dirfd = open_checkpoint_target_dir(QUEUE_RESUME_PATH);
-        if (internal_dirfd >= 0) { remove_queue_checkpoint_at(internal_dirfd, "open_hiby_player_queue.bin"); close(internal_dirfd); }
+        if (internal_dirfd >= 0) { remove_queue_checkpoint_at(internal_dirfd, "queue.bin"); close(internal_dirfd); }
         if (queue_sd_dirfd >= 0) remove_queue_checkpoint_at(queue_sd_dirfd, "queue.bin");
+        (void) unlink(QUEUE_RESUME_LEGACY_PATH);
+        if (queue_sd_dirfd >= 0) remove_legacy_sd_checkpoint(queue_sd_dirfd);
         checkpoint_revision_internal = 0;
         checkpoint_position_internal = -1;
         checkpoint_revision_sd = 0;
@@ -4565,7 +4594,7 @@ void gui_player_queue_checkpoint(void) {
     bool sd_mounted = sd_card_root_is_mounted() && !atomic_load(&sd_card_absent_immediate);
 
     const char * target_path = QUEUE_RESUME_PATH;
-    const char * target_name = "open_hiby_player_queue.bin";
+    const char * target_name = "queue.bin";
     int target_dirfd = open_checkpoint_target_dir(target_path);
     uint64_t * last_rev = &checkpoint_revision_internal;
     double * last_pos = &checkpoint_position_internal;
@@ -4574,6 +4603,11 @@ void gui_player_queue_checkpoint(void) {
         target_name = "queue.bin";
         target_path = SD_QUEUE_RESUME_PATH;
         if (target_dirfd >= 0) close(target_dirfd);
+        /* A restored queue.bin fills playlist[] without going through
+         * on_file_selected(), which is the only place that used to pin this
+         * directory. Leaving it at -1 made every boot checkpoint fail before
+         * any write, and the toast blamed a read-only card. */
+        if (queue_sd_dirfd < 0) queue_sd_dirfd = open_sd_queue_dir();
         target_dirfd = queue_sd_dirfd >= 0 ? dup(queue_sd_dirfd) : -1;
         last_rev = &checkpoint_revision_sd;
         last_pos = &checkpoint_position_sd;
@@ -4610,6 +4644,7 @@ void gui_player_queue_checkpoint(void) {
 
     checkpoint_ctx.target_dirfd = target_dirfd;
     snprintf(checkpoint_ctx.target_name, sizeof(checkpoint_ctx.target_name), "%s", target_name);
+    checkpoint_ctx.target_is_sd = is_sd_persistable && sd_mounted;
     checkpoint_ctx.queue = s;
     *last_rev = queue_revision;
     *last_pos = position;
@@ -4705,7 +4740,8 @@ bool build_sd_card_resume_playlist(char *** out_playlist, int * out_count, int *
     queue_resume_free(&restored_queue);
     have_restored_queue = false;
 
-    if (!queue_resume_read(SD_QUEUE_RESUME_PATH, &restored_queue)) return false;
+    if (!queue_resume_read(SD_QUEUE_RESUME_PATH, &restored_queue) &&
+        !queue_resume_read(SD_QUEUE_RESUME_LEGACY_PATH, &restored_queue)) return false;
 
     if (restored_queue.count <= 0 || restored_queue.current < 0 || restored_queue.current >= restored_queue.count) {
         queue_resume_free(&restored_queue);
@@ -4846,7 +4882,8 @@ bool build_saved_resume_playlist(char *** out_playlist, int * out_count, int * o
     }
     queue_resume_free(&restored_queue);
     have_restored_queue = false;
-    if (queue_resume_read(QUEUE_RESUME_PATH, &restored_queue)) {
+    if (queue_resume_read(QUEUE_RESUME_PATH, &restored_queue) ||
+        queue_resume_read(QUEUE_RESUME_LEGACY_PATH, &restored_queue)) {
         bool local = true;
         for (int i = 0; i < restored_queue.count; i++) {
             const char * path = restored_queue.paths[i];

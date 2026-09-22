@@ -20,7 +20,8 @@
  *   ./<album><size>.{jpeg,jpg,png,bmp}
  *   ./cover<size>.{jpeg,jpg,png,bmp}
  *   ./folder.{jpg,jpeg,png}  (unsized pass only)
- *   <musicroot>/.open_hiby_player/albumart/<artist>-<album><size>.{jpeg,jpg,png,bmp}
+ *   <musicroot>/.compas/albumart/<artist>-<album><size>.{jpeg,jpg,png,bmp}
+ *   the same names under <musicroot>/.open_hiby_player/albumart until moved
  *   same album/cover/folder names in the parent directory
  *   (unsized only) if this directory's name looks like a disc marker
  *   ("CD1", "Disc 2", "disk_03", ...), the same album/cover/folder names
@@ -37,7 +38,7 @@ typedef struct {
 
 bool albumart_search_files(const albumart_info_t * info, const char * size_string, char * buf, size_t buflen);
 
-/* Writes <musicroot>/.open_hiby_player/albumart/<artist>-<album>.WxH.bmp from RGB565.
+/* Writes <musicroot>/.compas/albumart/<artist>-<album>.WxH.bmp from RGB565.
  * Source cover/audio mtime is stored in the BMP reserved field so a later
  * load can detect a replaced cover. */
 bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, const uint16_t * pixels);

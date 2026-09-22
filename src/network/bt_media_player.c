@@ -74,7 +74,7 @@ static bool append_property_value(DBusMessageIter * iter, const char * interface
         return false;
     }
     if (strcmp(interface, "org.mpris.MediaPlayer2") == 0) {
-        if (strcmp(property, "Identity") == 0) { append_variant_string(iter, "open_hiby_player"); return true; }
+        if (strcmp(property, "Identity") == 0) { append_variant_string(iter, "Compás"); return true; }
         if (strcmp(property, "CanQuit") == 0) { append_variant_bool(iter, FALSE); return true; }
         if (strcmp(property, "CanRaise") == 0) { append_variant_bool(iter, FALSE); return true; }
         if (strcmp(property, "HasTrackList") == 0) { append_variant_bool(iter, FALSE); return true; }

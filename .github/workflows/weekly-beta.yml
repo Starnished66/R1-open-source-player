@@ -58,17 +58,17 @@ jobs:
           make sd_ready_test
           make -j2 target BOARD=r3proii RELEASE_LABEL="$RELEASE_LABEL"
           make bootloader BOARD=r3proii
-          file open_hiby_player_target open_hiby_bootloader \
-            open_hiby_player_target_r3proii open_hiby_bootloader_r3proii
-          mipsel-linux-musl-readelf -h open_hiby_player_target \
+          file compas_player_target open_hiby_bootloader \
+            compas_player_target_r3proii open_hiby_bootloader_r3proii
+          mipsel-linux-musl-readelf -h compas_player_target \
             | grep 'Machine:.*MIPS' >/dev/null
           mipsel-linux-musl-readelf -h open_hiby_bootloader \
             | grep 'Machine:.*MIPS' >/dev/null
-          mipsel-linux-musl-readelf -h open_hiby_player_target_r3proii \
+          mipsel-linux-musl-readelf -h compas_player_target_r3proii \
             | grep 'Machine:.*MIPS' >/dev/null
           mipsel-linux-musl-readelf -h open_hiby_bootloader_r3proii \
             | grep 'Machine:.*MIPS' >/dev/null
-          for player in open_hiby_player_target open_hiby_player_target_r3proii; do
+          for player in compas_player_target compas_player_target_r3proii; do
             if strings "$player" | grep -Eq \
                 'TEST BUILD|TEST_BUILD_TAG|UI_PERF_TRACE|UI_GESTURE_TRACE|UI_HITBOX_DEBUG'; then
               echo "Diagnostic flags were found in $player." >&2
@@ -101,21 +101,21 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          scripts/repack_upt.sh base/r1.upt open_hiby_player_target \
+          scripts/repack_upt.sh base/r1.upt compas_player_target \
             open_hiby_bootloader release/r1.upt
-          cp open_hiby_player_target release/open_hiby_player
+          cp compas_player_target release/compas_player
           BOARD=r3proii scripts/repack_upt.sh base/r3proii.upt \
-            open_hiby_player_target_r3proii open_hiby_bootloader_r3proii \
+            compas_player_target_r3proii open_hiby_bootloader_r3proii \
             release/r3proii.upt
-          cp open_hiby_player_target_r3proii release/open_hiby_player_r3proii
+          cp compas_player_target_r3proii release/compas_player_r3proii
           (
             cd plugins_examples
             zip -q -r ../release/plugin_examples.zip .
           )
           (
             cd release
-            sha256sum r1.upt r3proii.upt open_hiby_player \
-              open_hiby_player_r3proii plugin_examples.zip > SHA256SUMS
+            sha256sum r1.upt r3proii.upt compas_player \
+              compas_player_r3proii plugin_examples.zip > SHA256SUMS
             sha256sum --check SHA256SUMS
           )
 
@@ -175,15 +175,15 @@ jobs:
             echo
             echo "- **r1.upt** — complete R1 firmware update; use only on the HiBy R1."
             echo "- **r3proii.upt** — complete R3 Pro II firmware update; use only on the HiBy R3 Pro II."
-            echo "- **open_hiby_player** — standalone Compás Player update for the R1."
-            echo "- **open_hiby_player_r3proii** — standalone Compás Player update for the R3 Pro II."
+            echo "- **compas_player** — standalone Compás Player update for the R1."
+            echo "- **compas_player_r3proii** — standalone Compás Player update for the R3 Pro II."
             echo "- **plugin_examples.zip** — all example and test plugins from the repository."
             echo
             echo "R3 Pro II packaging uses the approved staging image and matching board binaries. This weekly prerelease has not been tested on an R3 Pro II device; validate it on hardware before broader deployment."
             echo
             echo "### Update only Compás Player"
             echo
-            echo "Copy **open_hiby_player** to **SD/.open_hiby_player/open_hiby_player** for the R1, or **open_hiby_player_r3proii** to **SD/.open_hiby_player/open_hiby_player** for the R3 Pro II, replacing the existing file, then reboot the matching device."
+            echo "Copy **compas_player** to **SD/.compas/compas_player** for the R1, or **compas_player_r3proii** to **SD/.compas/compas_player** for the R3 Pro II, replacing the existing file, then reboot the matching device."
             echo
             echo "Checksums are attached in **SHA256SUMS**."
           } > release/RELEASE_NOTES.md
@@ -197,7 +197,7 @@ jobs:
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" release/r1.upt release/r3proii.upt \
-              release/open_hiby_player release/open_hiby_player_r3proii \
+              release/compas_player release/compas_player_r3proii \
               release/plugin_examples.zip release/SHA256SUMS --clobber
             for legacy_asset in plugins_examples.zip Test-Plugins.zip; do
               if gh release view "$TAG" --json assets --jq '.assets[].name' \
@@ -209,7 +209,7 @@ jobs:
               --notes-file release/RELEASE_NOTES.md
           else
             gh release create "$TAG" release/r1.upt release/r3proii.upt \
-              release/open_hiby_player release/open_hiby_player_r3proii \
+              release/compas_player release/compas_player_r3proii \
               release/plugin_examples.zip release/SHA256SUMS \
               --prerelease --target "$GITHUB_SHA" --title "$TITLE" \
               --notes-file release/RELEASE_NOTES.md
@@ -222,8 +222,8 @@ jobs:
           path: |
             release/r1.upt
             release/r3proii.upt
-            release/open_hiby_player
-            release/open_hiby_player_r3proii
+            release/compas_player
+            release/compas_player_r3proii
             release/plugin_examples.zip
             release/SHA256SUMS
             release/RELEASE_NOTES.md

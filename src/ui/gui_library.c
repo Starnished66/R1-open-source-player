@@ -31,6 +31,8 @@ void refresh_artist_albums_now_playing_indicator(void);
 #include "screen_builders.h"
 #include "metadata.h"
 #include "metadata_db.h"
+#include "storage_migration.h"
+#include "sd_fsck_run.h"
 #include "tagcache.h"
 #include "file_browser.h"
 #include "sd_card_identity.h"
@@ -1234,7 +1236,7 @@ static lv_obj_t * build_group_songs_screen(void) {
  * a time reads/decodes a representative song's embedded or Rockbox albumart
  * file, while a 250-entry RGB565 LRU cache keeps the visible window plus
  * scroll headroom bounded at ~2531 KiB. Persistent sized files live in
- * MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.72x72.bmp. */
+ * MUSIC_ROOT_DIR/.compas/albumart/<artist>-<album>.72x72.bmp. */
 #define ALBUM_THUMBNAIL_PX ALBUMART_THUMBNAIL_SIZE
 #define ALBUM_PLAYER_CACHE_PX ALBUMART_PLAYER_CACHE_SIZE
 #define ALBUM_THUMBNAIL_CACHE_SIZE 250
@@ -1755,7 +1757,7 @@ static sibling_art_result_t album_thumbnail_try_embedded_art_from_path(
 }
 
 /* Rockbox albumart search, then embedded picture. A successful decode is
- * written as MUSIC_ROOT_DIR/.open_hiby_player/albumart/<artist>-<album>.72x72.bmp
+ * written as MUSIC_ROOT_DIR/.compas/albumart/<artist>-<album>.72x72.bmp
  * so the next pass is a small BMP load instead of a JPEG/PNG decode.
  * Albums without artist+album tags still decode, but cannot be stored.
  * Checks the negative failure cache first to prevent repeated failed decodes.
@@ -4448,6 +4450,28 @@ static void clear_removed_sd_library(void) {
     file_browser_reset_to_root();
 }
 
+static void show_sd_repair_note(void) {
+    const char * message = NULL;
+    switch (sd_repair_take_note()) {
+    case SD_REPAIR_NOTE_STARTED: message = "Repairing the SD card"; break;
+    case SD_REPAIR_NOTE_REPAIRED: message = "SD card repaired"; break;
+    case SD_REPAIR_NOTE_STILL_READONLY: message = "SD card is still read-only"; break;
+    case SD_REPAIR_NOTE_FAILED: message = "Could not repair the SD card"; break;
+    case SD_REPAIR_NOTE_NONE: break;
+    }
+    if (message) show_error_toast(message);
+}
+
+/* Drop file handles so umount can succeed after the kernel has remounted
+ * a damaged card read-only underneath an open library. */
+static void release_sd_handles_for_repair(void) {
+    if (library_rescan_active) gui_library_cancel_scan();
+    cancel_album_thumbnail_generation();
+    atomic_store(&album_thumb_gen_retry_pending, false);
+    gui_player_notify_sd_unmounted_immediate();
+    clear_removed_sd_library();
+}
+
 void poll_sd_card_hotplug(void) {
     /* Assume already mounted initially since mount_sd_card_if_needed() ran
      * at boot. */
@@ -4471,9 +4495,28 @@ void poll_sd_card_hotplug(void) {
     time_t now = time(NULL);
     if (last_check != 0 && now - last_check < SD_CARD_MOUNT_POLL_SECONDS) return;
     last_check = now;
+    show_sd_repair_note();
 
     bool mount_observed = false;
     bool mounted = sd_card_root_is_mounted_observed(&mount_observed);
+    if (mounted && !sd_repair_in_progress()) {
+        sd_repair_kick_result_t repair = sd_readonly_repair_kick(release_sd_handles_for_repair);
+        if (repair.started || !sd_card_root_is_mounted()) {
+            mounted = false;
+            mount_observed = false;
+            was_mounted = false;
+            sd_handoff_pending = true;
+            have_last_card_identity = false;
+            have_last_mounted_device = false;
+            last_card_cid[0] = '\0';
+        } else if (repair.released_handles) {
+            /* The check could not unmount. Reload the library that was
+             * closed to make the unmount attempt. */
+            was_mounted = false;
+            sd_handoff_pending = true;
+        }
+    }
+    show_sd_repair_note();
     /* Only an attached mount that the kernel probes proved stale may bypass
      * the normal two-poll absence debounce. If the initial mount stat was
      * inconclusive, a successful retry is not evidence of a stale mount. */
@@ -4559,6 +4602,19 @@ void poll_sd_card_hotplug(void) {
          * Otherwise a rapid swap can hide the unmounted edge from the next
          * poll and leave the previous card's library and queue in memory. */
         mount_sd_card_if_needed();
+        if (sd_card_root_is_mounted()) {
+            storage_migrate_legacy_data();
+            mount_fail_streak = 0;
+            sd_mount_fail_notified = false;
+            return;
+        }
+        /* A read-only card is unmounted while fsck runs. That is not a
+         * missing or unmountable card, so it must not offer Format. */
+        if (sd_repair_in_progress()) {
+            mount_fail_streak = 0;
+            sd_mount_fail_notified = false;
+            return;
+        }
 
         /* Card is physically there (the whole-disk node exists) but still
          * won't mount after repeated retries. mount_sd_card_if_needed()
@@ -4725,6 +4781,7 @@ static bool sd_format_card_worker(void) {
     if (!subprocess_run_timeout(mkdosfs_argv, NULL, 0, 120000)) return false;
 
     mount_sd_card_if_needed();
+    if (sd_card_root_is_mounted()) storage_migrate_legacy_data();
     return sd_card_root_is_mounted();
 }
 #else
@@ -4745,6 +4802,10 @@ static void * sd_format_thread_func(void * arg) {
 }
 
 static void start_sd_format(void) {
+    if (sd_repair_in_progress()) {
+        show_error_toast("SD card repair is still running");
+        return;
+    }
     atomic_store_explicit(&sd_format_done_flag, false, memory_order_relaxed);
     sd_format_active = true;
     sd_format_token = gui_busy_show("Formatting\nSD Card...", "");
@@ -5996,9 +6057,9 @@ static bool scan_all_songs_with_timeout(const char * root, int * out_spool_fd,
     w->root_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (w->root_fd < 0) { free(w); return false; }
     snprintf(w->root, sizeof(w->root), "/proc/self/fd/%d", w->root_fd);
-    w->spool_fd = openat(w->root_fd, ".open_hiby_scan.tmp", O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    w->spool_fd = openat(w->root_fd, ".compas_scan.tmp", O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (w->spool_fd < 0) { close(w->root_fd); free(w); return false; }
-    unlinkat(w->root_fd, ".open_hiby_scan.tmp", 0);
+    unlinkat(w->root_fd, ".compas_scan.tmp", 0);
     atomic_store(&w->refs, 2);
     atomic_store(&w->cancel, false);
 

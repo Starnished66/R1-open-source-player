@@ -172,6 +172,10 @@
 /build_host_*/
 /build_target/
 /build_target_*/
+/compas_player_host
+/compas_player_host_*
+/compas_player_target
+/compas_player_target_*
 /open_hiby_player_host
 /open_hiby_player_host_*
 /open_hiby_player_target
@@ -189,10 +193,14 @@
 /release/
 
 # Host-only runtime state (target uses /usr/data instead)
+/compas_player_settings.txt*
+/compas_player_peq.txt*
+/compas_player_music.db
+/.compas/
 /open_hiby_player_settings.txt*
 /open_hiby_player_peq.txt*
 /open_hiby_player_music.db
-/.open_hiby_player/books.list
+/.open_hiby_player/
 
 # Host-only test audio fixtures (generated locally for manual verification,
 # not needed to build or run the project)
@@ -220,6 +228,16 @@
 # gitignore never affects files git already tracks; `git rm --cached` them
 # too if the intent is to stop tracking those as well.
 *_test.c
+!/src/library/path_cache_migration_test.c
+!/src/core/storage_migration_test.c
+!/src/core/sd_fsck_test.c
+!/src/library/albumart_migration_test.c
+!/src/library/metadata_migration_retry_test.c
+!/src/library/tagcache_storage_test.c
+!/src/library/tagcache_write_volume_test.c
+!/src/library/tagcache_incremental_test.c
+!/src/library/tagcache_refs_test.c
+!/src/library/tagcache_commit_failure_test.c
 
 # Local GUI-refactor extraction workspace
 /scratch/
@@ -246,6 +264,7 @@ NEXT_TODO_IMPLEMENTATION_PROMPT.md
 ALBUMS_OVERHEAT_OOM_FIX_PROMPT.md
 SWIPE_HOME_GESTURE_FIX_PROMPT.md
 DRAWER_HIDDEN_TOPBAR_FIX_PROMPT.md
+compas_player
 open_hiby_player
 font_fix.md
 possible_lirary_crash.md
@@ -265,6 +284,7 @@ HARDWARE_DRIVERS.md
 PLUGIN_IDEAS_DRAFT.md
 PLUGIN_SET_HOME_LAYOUT_DRAFT.md
 database_artwork.log
+compas_player_library_scan_crash
 open_hiby_player_library_scan_crash
 plugins_examples-02.zip
 BT_DAC_LONG_SESSION.md
@@ -299,3 +319,4 @@ final_diff.patch
 /scripts/tests/
 /scripts/__pycache__/
 src/library/metadata_artwork_test.c
+docs/INCREMENTAL_DATABASE.md

@@ -1,4 +1,4 @@
-# Makefile for open_hiby_player
+# Makefile for compas_player
 
 # Board selector -- `make target BOARD=r3proii` (default r1 if unset). Gates
 # BOARD_DEFINE (-DBOARD_R1 / -DBOARD_R3PROII, consumed by src/core/
@@ -25,16 +25,15 @@ BUILD_TARGET_DIR = build_target_$(BOARD)
 BUILD_HOST_DIR = build_host_$(BOARD)
 endif
 
-# Target executables -- r1 keeps its exact original unsuffixed names (every
-# downstream consumer -- the Test2 repack workflow, CI, TESTING.md -- expects
-# these exact filenames), other boards get a distinct suffix so a non-r1
-# build can never be mistaken for or silently overwrite an r1 one.
+# Target executables -- r1 keeps the unsuffixed names used by the release
+# scripts, while other boards get a distinct suffix so a non-r1 build can
+# never be mistaken for or silently overwrite an r1 one.
 ifeq ($(BOARD),r1)
-HOST_BIN = open_hiby_player_host
-TARGET_BIN = open_hiby_player_target
+HOST_BIN = compas_player_host
+TARGET_BIN = compas_player_target
 else
-HOST_BIN = open_hiby_player_host_$(BOARD)
-TARGET_BIN = open_hiby_player_target_$(BOARD)
+HOST_BIN = compas_player_host_$(BOARD)
+TARGET_BIN = compas_player_target_$(BOARD)
 endif
 
 # Compiler and Linker configuration
@@ -541,6 +540,7 @@ TARGET_LDFLAGS = -static -no-pie -lpthread -lm
 APP_SRCS = src/main.c src/ui/gui.c src/ui/gui_subsonic.c src/ui/gui_settings.c src/ui/gui_network.c src/ui/gui_theme.c src/ui/gui_notifications.c src/ui/gui_library.c src/ui/gui_queue.c src/ui/gui_player.c src/ui/gui_track_info.c src/ui/gui_plugins.c src/ui/gui_shell.c src/ui/gui_navigation.c src/ui/gui_books.c src/ui/gui_text_input.c src/ui/gui_lyrics.c src/ui/gui_reload.c src/audio/audio.c src/library/file_browser.c src/hardware/hw_buttons.c src/hardware/input_device_utils.c src/library/metadata.c src/library/metadata_db.c src/core/settings.c src/core/app_version.c src/audio/aiff_decoder.c src/audio/dsd_filter.c src/audio/dsd_decoder.c src/audio/aac_decoder.c src/audio/mp4_demux.c src/audio/ape_demux.c src/audio/ape_decoder.c src/audio/peq.c src/ui/assets.c src/ui/screen_builders.c src/hardware/battery.c src/network/wifi_status.c src/network/ca_bundle.c src/network/http_conn.c src/network/http_client.c src/network/http_stream.c src/network/subsonic_client.c src/library/cover_decode.c src/library/lyrics.c src/audio/asf_demux.c src/audio/wma_decoder.c src/audio/ogg_demux.c src/audio/opus_decoder.c src/audio/vorbis_decoder.c src/library/cue_parser.c src/ui/fallback_font.c \
 src/core/subprocess.c src/network/wifi_control.c src/network/bluetooth_control.c src/network/hiby_sys_server.c src/hardware/backlight.c src/network/import_web.c src/network/airplay_control.c src/network/airplay_bridge.c src/network/airplay_metadata.c src/hardware/headphone_status.c src/hardware/device_config.c src/hardware/led_control.c src/hardware/charge_limiter.c src/core/idle_shutdown.c src/hardware/power_suspend.c src/core/text_reader.c src/hardware/usb_mode_control.c src/hardware/usb_dac_bridge.c src/hardware/usb_audio_output.c src/core/firmware_update.c src/library/playlist_files.c src/core/timezone_data.c src/core/timezone_apply.c src/core/hostname_apply.c src/network/dlna_control.c src/network/remote_control.c src/plugins/plugin_manager.c
 APP_SRCS += src/ui/lyrics_layout.c src/ui/transition_compositor.c src/ui/frosted_glass.c src/ui/hw_volume_coalesce.c
+APP_SRCS += src/core/storage_migration.c src/core/sd_fsck.c src/core/sd_fsck_run.c
 APP_SRCS += src/plugins/plugin_json.c src/plugins/plugin_storage.c src/plugins/plugin_disabled_list.c
 APP_SRCS += src/ui/gui_plugin_manage.c src/ui/gui_lock_screen.c
 APP_SRCS += src/library/remote_track.c
@@ -949,6 +949,105 @@ playlist-selftest:
 	    -Wl,--gc-sections -lpthread -lm -o $(BUILD_TARGET_DIR)/playlist_test
 	./$(BUILD_TARGET_DIR)/playlist_test
 
+.PHONY: path-cache-migration-selftest
+path-cache-migration-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -DHOST_BUILD=1 -I. -Isrc/library -Isrc/core \
+	    src/library/path_cache_migration_test.c src/library/path_cache.c \
+	    -o $(BUILD_TARGET_DIR)/path_cache_migration_test
+	./$(BUILD_TARGET_DIR)/path_cache_migration_test
+
+.PHONY: sd-fsck-selftest
+sd-fsck-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -DHOST_BUILD=1 -I. -Isrc/core \
+	    src/core/sd_fsck_test.c src/core/sd_fsck.c \
+	    -o $(BUILD_TARGET_DIR)/sd_fsck_test
+	./$(BUILD_TARGET_DIR)/sd_fsck_test
+
+.PHONY: storage-migration-selftest
+storage-migration-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -DHOST_BUILD=1 -I. -Isrc/core \
+	    src/core/storage_migration_test.c src/core/storage_migration.c \
+	    -o $(BUILD_TARGET_DIR)/storage_migration_test
+	./$(BUILD_TARGET_DIR)/storage_migration_test
+
+.PHONY: albumart-migration-selftest
+albumart-migration-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -DHOST_BUILD=1 -ffunction-sections -fdata-sections \
+	    -I. -Isrc/library -Isrc/core \
+	    src/library/albumart_migration_test.c src/library/albumart.c \
+	    -Wl,--gc-sections -o $(BUILD_TARGET_DIR)/albumart_migration_test
+	./$(BUILD_TARGET_DIR)/albumart_migration_test
+
+# Metadata migration retry regression: a legacy favorite whose file still
+# exists but was omitted by one scan must keep migration pending until retry.
+.PHONY: metadata-migration-retry-selftest
+metadata-migration-retry-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -DHOST_BUILD=1 -ffunction-sections -fdata-sections \
+	    -I. -Isrc -Isrc/library -Isrc/core -Isrc/ui -Ilvgl \
+	    src/library/metadata_migration_retry_test.c src/library/metadata_db.c src/library/tagcache.c src/core/db_log.c \
+	    -Wl,--gc-sections -lpthread -lm -o $(BUILD_TARGET_DIR)/metadata_migration_retry_test
+	./$(BUILD_TARGET_DIR)/metadata_migration_retry_test
+
+# End-to-end tagcache generation, snapshot, remap, numeric and WAV coverage.
+.PHONY: tagcache-storage-selftest
+tagcache-storage-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -DHOST_BUILD=1 -ffunction-sections -fdata-sections \
+	    -I. -Isrc -Isrc/library -Isrc/core -Idr_libs \
+	    src/library/tagcache_storage_test.c src/library/tagcache.c src/core/db_log.c \
+	    -Wl,--gc-sections -lpthread -lm -o $(BUILD_TARGET_DIR)/tagcache_storage_test
+	./$(BUILD_TARGET_DIR)/tagcache_storage_test
+
+# Reports write/pwrite volume for initial, unchanged, changed, appended and
+# deleted scan passes.  Use --wrap so fixture setup can be excluded by reset.
+.PHONY: tagcache-write-volume-selftest
+tagcache-write-volume-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -DHOST_BUILD=1 -ffunction-sections -fdata-sections \
+	    -I. -Isrc -Isrc/library -Isrc/core \
+	    src/library/tagcache_write_volume_test.c src/library/tagcache.c src/core/db_log.c \
+	    -Wl,--gc-sections -Wl,--wrap=write -Wl,--wrap=pwrite -lpthread -lm \
+	    -o $(BUILD_TARGET_DIR)/tagcache_write_volume_test
+	./$(BUILD_TARGET_DIR)/tagcache_write_volume_test
+
+.PHONY: tagcache-write-volume-disk-selftest
+tagcache-write-volume-disk-selftest: tagcache-write-volume-selftest
+	TAGCACHE_DISABLE_RAM_HASH=1 ./$(BUILD_TARGET_DIR)/tagcache_write_volume_test
+
+.PHONY: tagcache-incremental-selftest
+tagcache-incremental-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -DHOST_BUILD=1 -ffunction-sections -fdata-sections \
+	    -I. -Isrc -Isrc/library -Isrc/core \
+	    src/library/tagcache_incremental_test.c src/library/tagcache.c src/core/db_log.c \
+	    -Wl,--gc-sections -Wl,--wrap=write -Wl,--wrap=pwrite -lpthread -lm \
+	    -o $(BUILD_TARGET_DIR)/tagcache_incremental_test
+	./$(BUILD_TARGET_DIR)/tagcache_incremental_test
+
+.PHONY: tagcache-refs-selftest
+tagcache-refs-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -DHOST_BUILD=1 -ffunction-sections -fdata-sections \
+	    -I. -Isrc -Isrc/library -Isrc/core \
+	    src/library/tagcache_refs_test.c src/library/tagcache.c src/core/db_log.c \
+	    -Wl,--gc-sections -lpthread -lm -o $(BUILD_TARGET_DIR)/tagcache_refs_test
+	./$(BUILD_TARGET_DIR)/tagcache_refs_test
+
+.PHONY: tagcache-commit-failure-selftest
+tagcache-commit-failure-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -std=gnu11 -O0 -g -Wall -Wextra -DHOST_BUILD=1 -ffunction-sections -fdata-sections \
+	    -I. -Isrc -Isrc/library -Isrc/core \
+	    src/library/tagcache_commit_failure_test.c src/library/tagcache.c src/core/db_log.c \
+	    -Wl,--gc-sections -Wl,--wrap=write -Wl,--wrap=fsync -Wl,--wrap=rename -lpthread -lm \
+	    -o $(BUILD_TARGET_DIR)/tagcache_commit_failure_test
+	./$(BUILD_TARGET_DIR)/tagcache_commit_failure_test
+
 # Host tests for artwork-only parsing, size admission and helper allocation limits.
 .PHONY: metadata-artwork-selftest
 metadata-artwork-selftest:
@@ -1087,8 +1186,8 @@ compile_commands.json:
 
 clean:
 	rm -rf build_host build_host_* build_target build_target_* build_ui_test \
-	    open_hiby_player_host open_hiby_player_host_* \
-	    open_hiby_player_target open_hiby_player_target_* \
+	    compas_player_host compas_player_host_* \
+	    compas_player_target compas_player_target_* \
 	    compile_commands.json compile_flags.txt
 
 # Focused target-path audio retry regression test. It includes the real

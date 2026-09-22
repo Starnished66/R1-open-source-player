@@ -1,5 +1,6 @@
 #include "peq.h"
 #include "library_endian.h"
+#include "storage_paths.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -9,12 +10,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-#ifdef HOST_BUILD
-  #define PEQ_FILE_PATH "./open_hiby_player_peq.txt"
-#else
-  #define PEQ_FILE_PATH "/usr/data/open_hiby_player_peq.txt"
-#endif
 
 #define PEQ_MAX_CHANNELS 2
 
@@ -500,7 +495,7 @@ bool peq_save_to_path(const char * path) {
 }
 
 void peq_load(void) {
-    peq_load_from_path(PEQ_FILE_PATH);
+    if (!peq_load_from_path(PEQ_FILE_PATH)) peq_load_from_path(PEQ_LEGACY_FILE_PATH);
 }
 
 void peq_save(void) {

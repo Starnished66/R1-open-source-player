@@ -1,0 +1,29 @@
+SD filesystem repair tools
+
+These static checkers are built by scripts/build_sd_fsck_tools.sh and copied
+into both firmware images by scripts/repack_upt.sh. The player runs one of
+them only after a card has mounted read-only.
+
+  dosfstools 4.2 (fsck.fat, also installed as fsck.vfat)
+    https://github.com/dosfstools/dosfstools/releases/download/v4.2/dosfstools-4.2.tar.gz
+    SHA-256: 64926eebf90092dca21b14259a5301b7b98e7b1943e8a201c7d726084809b527
+    License: GPL-3.0-or-later; see dosfstools-COPYING.
+
+  exfatprogs 1.2.6 (fsck.exfat)
+    https://github.com/exfatprogs/exfatprogs/releases/download/1.2.6/exfatprogs-1.2.6.tar.gz
+    SHA-256: 53b74148a1f8c4b67a581497056b32bf3c357e061dc683f6d5bbfa09e44e3e7a
+    License: GPL-2.0-only; see exfatprogs-COPYING.
+
+  ntfs-3g 2022.10.3 (ntfsfix only; the FUSE mount helper is not installed)
+    https://download.tuxera.com/opensource/ntfs-3g_ntfsprogs-2022.10.3.tgz
+    SHA-256: f20e36ee68074b845e3629e6bced4706ad053804cbaf062fbae60738f854170c
+    License: GPL-2.0-only; see ntfs-3g-COPYING and ntfs-3g-COPYING.LIB.
+
+The committed ELF files are MIPS32, little-endian, o32, statically linked
+against musl and stripped. ntfsfix repairs common inconsistencies that make
+ntfs-3g mount a volume read-only. It is not a full Windows chkdsk.
+
+Committed runtime hashes:
+  39cd259a3347ee19e0b69ba1b71288472f3144896dc8fa0e73f3e7990fbdd332  fsck.fat
+  7606465ad12691687adcd179acfc6aef0463009a9670675acc3f84f0a1115cb0  fsck.exfat
+  9cf2e6c95741bc38a3af658244e6453a4d0010df6a1f0075d6b9429ffb599ed2  ntfsfix

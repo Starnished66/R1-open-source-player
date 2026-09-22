@@ -92,14 +92,14 @@ make bootloader BOARD=r1
 The commands must produce these two non-empty files in the repository root:
 
 ```text
-open_hiby_player_target
+compas_player_target
 open_hiby_bootloader
 ```
 
 The repack script installs them as:
 
 ```text
-/usr/bin/open_hiby_player
+/usr/bin/compas_player
 /usr/bin/open_hiby_bootloader
 ```
 
@@ -141,7 +141,7 @@ a real failure mode, not a hypothetical: it is how the Subsonic download icon
 went missing from a release while appearing to be present in the source tree.
 
 The copies happen after the binaries are installed, so do not place
-`usr/bin/open_hiby_player` or `usr/bin/open_hiby_bootloader` under
+`usr/bin/compas_player` or `usr/bin/open_hiby_bootloader` under
 `firmware/overlay/` unless overriding the command-line binaries is deliberate.
 
 ## 4. Create the `.upt` file
@@ -151,7 +151,7 @@ Invoke the script with exactly four arguments, in this order:
 ```sh
 scripts/repack_upt.sh \
   /path/to/base_staging.upt \
-  open_hiby_player_target \
+  compas_player_target \
   open_hiby_bootloader \
   output/r1-custom.upt
 ```
@@ -212,6 +212,6 @@ testing. Before distributing or installing an image, verify it on an R1 and
 keep a known-good recovery image available.
 
 Changing only the player does not require a full `.upt` rebuild: the standalone
-`open_hiby_player` update can be used when appropriate. Changes to the kernel,
+`compas_player` update can be used when appropriate. Changes to the kernel,
 root filesystem, bootloader, fonts, icons, scripts, or other packaged content
 require a complete repack.

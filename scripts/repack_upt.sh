@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
-# Repack an approved R1 Staging Image with freshly built player binaries.
+# Repack a supported HiBy firmware image with freshly built player binaries.
 # The base remains external because it contains stock HiBy firmware assets.
 
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 BASE_R1_UPT PLAYER_BINARY BOOTLOADER_BINARY OUTPUT_R1_UPT" >&2
+    echo "Usage: $0 [--board r1|r3proii] BASE_UPT PLAYER_BINARY BOOTLOADER_BINARY OUTPUT_UPT" >&2
+    echo "       BOARD=r3proii $0 BASE_UPT PLAYER_BINARY BOOTLOADER_BINARY OUTPUT_UPT" >&2
     exit 2
 }
 
+board=${BOARD:-r1}
+if [[ ${1:-} == --board ]]; then
+    [[ $# -ge 2 ]] || usage
+    board=$2
+    shift 2
+fi
+[[ $board == r1 || $board == r3proii ]] || {
+    echo "Unsupported board '$board' (expected r1 or r3proii)" >&2
+    exit 2
+}
 [[ $# -eq 4 ]] || usage
 
 base_upt=$(realpath "$1")
@@ -46,25 +57,53 @@ cat "${root_chunks[@]}" > "$work/rootfs.squashfs"
 cat "${kernel_chunks[@]}" > "$work/xImage"
 unsquashfs -no-xattrs -d "$work/root" "$work/rootfs.squashfs" >/dev/null
 
-# An approved Staging Image must already contain the bootloader handoff.
-# Refuse an older public beta instead of quietly producing a firmware that
-# bypasses the boot menu after the new bootloader binary is copied in.
+if [[ $board == r3proii ]]; then
+    stock_player="$work/root/usr/bin/hiby_player"
+    if [[ ! -s "$stock_player" ]] || ! grep -aFq 'R3PROII' "$stock_player"; then
+        echo "Base OTA does not contain an R3 Pro II stock player; refusing a cross-board image" >&2
+        exit 1
+    fi
+fi
+
 wrapper="$work/root/usr/bin/hiby_player.sh"
-if [[ ! -f "$wrapper" ]] || ! grep -q '/usr/bin/open_hiby_bootloader' "$wrapper"; then
-    echo "Base OTA is not an approved Staging Image (bootloader wrapper missing)" >&2
+if [[ ! -f "$wrapper" ]]; then
+    echo "Base OTA is missing /usr/bin/hiby_player.sh" >&2
     exit 1
+fi
+
+if [[ $board == r1 ]]; then
+    # An approved R1 Staging Image must already contain the bootloader handoff.
+    # Refuse an older public beta instead of quietly producing a firmware that
+    # bypasses the boot menu after the new bootloader binary is copied in.
+    grep -q '/usr/bin/open_hiby_bootloader' "$wrapper" || {
+        echo "Base OTA is not an approved R1 Staging Image (bootloader wrapper missing)" >&2
+        exit 1
+    }
+else
+    # R3 Pro II stock firmware starts the stock player directly. Replace only
+    # the standalone command, preserving /usr/bin/hiby_player as the stock
+    # player that the bootloader can launch when selected from the SD card.
+    if ! grep -q '/usr/bin/open_hiby_bootloader' "$wrapper"; then
+        grep -Eq '^[[:space:]]*/usr/bin/hiby_player[[:space:]]*$' "$wrapper" || {
+            echo "R3 OTA has no standalone /usr/bin/hiby_player launcher to patch" >&2
+            exit 1
+        }
+        sed -i 's|^[[:space:]]*/usr/bin/hiby_player[[:space:]]*$|/usr/bin/open_hiby_bootloader|' "$wrapper"
+    fi
+    grep -q '/usr/bin/open_hiby_bootloader' "$wrapper" || {
+        echo "Failed to patch R3 /usr/bin/hiby_player.sh" >&2
+        exit 1
+    }
 fi
 
 install -m 0755 "$player" "$work/root/usr/bin/open_hiby_player"
 install -m 0755 "$bootloader" "$work/root/usr/bin/open_hiby_bootloader"
 
-# The stock boot scripts start the A2DP source daemon without the encoder
-# arguments the player's default "auto" codec preference expects, so the
-# player would have to restart the daemon on every boot to correct them --
-# tearing down any accessory that connected first. Patched here rather than
-# shipped under firmware/overlay/ because these are HiBy's scripts, not ours
-# to redistribute. Idempotent, so a base image that already carries the
-# argument is left alone.
+# The R1 stock boot scripts start the A2DP source daemon without the encoder
+# arguments the player's default "auto" codec preference expects. Keep this
+# established R1 fix; R3 stock uses a different bluealsa command line and its
+# Bluetooth scripts are deliberately left untouched.
+if [[ $board == r1 ]]; then
 for bt_script in bt_init bt_resume; do
     bt_script_path="$work/root/usr/bin/$bt_script"
     [[ -f "$bt_script_path" ]] || {
@@ -91,6 +130,7 @@ for bt_script in bt_init bt_resume; do
     done
     sh -n "$bt_script_path"
 done
+fi
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -112,7 +152,12 @@ copy_tracked_assets() {
         cp -a "$repo/$f" "$dest/$rel"
     done < <(git -C "$repo" ls-files "$src")
 }
-copy_tracked_assets assets/theme2 "$work/root/usr/resource/litegui/theme2"
+if [[ $board == r1 ]]; then
+    copy_tracked_assets assets/theme2 "$work/root/usr/resource/litegui/theme2"
+else
+    copy_tracked_assets assets/r3proii/theme2 "$work/root/usr/resource/litegui/theme2"
+    copy_tracked_assets assets/r3proii/etc "$work/root/etc"
+fi
 copy_tracked_assets assets/fonts  "$work/root/usr/resource/fonts"
 
 # Non-asset files we own that are not in stock, laid out as squashfs-root-

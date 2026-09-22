@@ -7,6 +7,12 @@ on:
     # top-of-hour window.
     - cron: "17 6 * * *"
   workflow_dispatch:
+    inputs:
+      r3_base_asset:
+        description: Release asset containing the approved R3 Pro II staging image
+        required: false
+        default: r3proii.upt
+        type: string
 
 permissions:
   contents: read
@@ -96,12 +102,11 @@ jobs:
     # real hardware validation yet (see README.md's own "Device Support"
     # section) and there is no R3 Pro II Staging Image/secret to repack
     # against, unlike the R1 job above and weekly-beta.yml's real release
-    # pipeline. This job exists only to catch a future change that breaks
-    # the BOARD=r3proii build path -- it builds and sanity-checks the
-    # binary but never publishes it, so a failure here can't be mistaken
-    # for an R3 Pro II release regressing, and a broken R3 build can't
-    # block the R1 daily artifact above (separate job, independent status).
-    name: Build player for R3 Pro II (unsupported, compile check only)
+    # pipeline. This job catches build regressions and publishes the two
+    # checked binaries as a downloadable workflow artifact. It does not
+    # publish firmware: that requires a separately approved R3 staging image
+    # and checksum secret, and must remain independent of this compile check.
+    name: Build player for R3 Pro II (compile check and artifact)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -139,3 +144,124 @@ jobs:
             | grep 'Machine:.*MIPS' >/dev/null
           mipsel-linux-musl-readelf -h open_hiby_bootloader_r3proii \
             | grep 'Machine:.*MIPS' >/dev/null
+
+      - name: Assemble R3 Pro II compile artifact
+        run: |
+          set -euo pipefail
+          mkdir -p r3proii-build
+          cp open_hiby_player_target_r3proii open_hiby_bootloader_r3proii \
+            r3proii-build/
+          {
+            echo "board=r3proii"
+            echo "commit=${GITHUB_SHA}"
+            echo "built_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "workflow_run=${GITHUB_RUN_ID}"
+            sha256sum open_hiby_player_target_r3proii \
+              open_hiby_bootloader_r3proii
+          } > r3proii-build/BUILD-INFO.txt
+
+      - name: Upload R3 Pro II compile artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hiby-r3proii-daily-${{ github.run_number }}-${{ github.sha }}
+          path: r3proii-build/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6
+
+  package-r3proii:
+    # This is deliberately a workflow artifact, not a GitHub release. The
+    # R3 base image must be approved and hardware-tested before it can become
+    # a public firmware release.
+    name: Package R3 Pro II firmware (staging artifact)
+    needs: build-r3proii
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      R3PROII_STAGING_IMAGE_SHA256: ${{ secrets.R3PROII_STAGING_IMAGE_SHA256 }}
+      R3_BASE_ASSET: ${{ inputs.r3_base_asset || 'r3proii.upt' }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Check R3 staging-image configuration
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$R3PROII_STAGING_IMAGE_SHA256" ]]; then
+            echo 'R3PROII_STAGING_IMAGE_SHA256 is not configured; skipping R3 firmware packaging.'
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$R3PROII_STAGING_IMAGE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
+            echo 'R3PROII_STAGING_IMAGE_SHA256 is present but invalid.' >&2
+            exit 1
+          }
+          [[ "$R3_BASE_ASSET" =~ ^[A-Za-z0-9._-]+\.upt$ ]] || {
+            echo "Invalid R3 base release asset name: $R3_BASE_ASSET" >&2
+            exit 1
+          }
+          echo 'enabled=true' >> "$GITHUB_OUTPUT"
+
+      - name: Install repository-cached MIPS musl toolchain
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          toolchain_dir="$(scripts/install_mips_toolchain.sh "$RUNNER_TEMP")"
+          echo "$toolchain_dir/bin" >> "$GITHUB_PATH"
+
+      - name: Install repack tools
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            file genisoimage p7zip-full squashfs-tools
+
+      - name: Download R3 compile artifact
+        if: steps.config.outputs.enabled == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: hiby-r3proii-daily-${{ github.run_number }}-${{ github.sha }}
+          path: r3proii-build
+
+      - name: Download and verify R3 staging image
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p base
+          gh release download staging-image-base \
+            --pattern "$R3_BASE_ASSET" --dir base
+          test -f "base/$R3_BASE_ASSET"
+          echo "$R3PROII_STAGING_IMAGE_SHA256  base/$R3_BASE_ASSET" \
+            | sha256sum --check
+
+      - name: Repack R3 Pro II staging image
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p r3-release
+          BOARD=r3proii scripts/repack_upt.sh \
+            "base/$R3_BASE_ASSET" \
+            r3proii-build/open_hiby_player_target_r3proii \
+            r3proii-build/open_hiby_bootloader_r3proii \
+            r3-release/r3proii.upt
+          cp r3proii-build/open_hiby_player_target_r3proii \
+            r3-release/open_hiby_player_r3proii
+          sha256sum r3-release/r3proii.upt \
+            r3-release/open_hiby_player_r3proii > r3-release/SHA256SUMS
+
+      - name: Upload R3 Pro II staging package
+        if: steps.config.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hiby-r3proii-staging-${{ github.run_number }}-${{ github.sha }}
+          path: r3-release/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6

@@ -196,6 +196,83 @@ if [[ -d "$overlay" ]]; then
     cp -a "$overlay"/. "$work/root/"
 fi
 
+# A local R3 runtime overlay is opt-in. CI supplies an already-upgraded base
+# image and leaves this unset; never discover or source ignored scratch output
+# implicitly. The overlay is copied before the release gates so local builds
+# can be checked against the same BlueALSA/BlueZ contract as CI.
+if [[ $board == r3proii && -n ${R3_RUNTIME_OVERLAY:-} ]]; then
+    [[ -d "$R3_RUNTIME_OVERLAY" ]] || {
+        echo "R3_RUNTIME_OVERLAY is not a directory: $R3_RUNTIME_OVERLAY" >&2
+        exit 1
+    }
+    runtime_overlay=$(realpath "$R3_RUNTIME_OVERLAY")
+    cp -a "$runtime_overlay"/. "$work/root/"
+fi
+
+# The player promises the Speex rate converter, which is built from the
+# pinned, redistributable SpeexDSP/alsa-plugins sources by the base-image
+# process. Do not silently publish a base image that falls back to the
+# lower-quality alsa-lib converter: the approved R1 and R3 base images must
+# already contain the plugin and its runtime library.
+speex_plugin="$work/root/usr/lib/alsa-lib/libasound_module_rate_speexrate.so"
+[[ -e "$speex_plugin" ]] || {
+    echo "${board} base OTA is missing the Speex ALSA rate plugin required by the player" >&2
+    exit 1
+}
+[[ -e "$work/root/usr/lib/libspeexdsp.so.1" ]] || {
+    echo "${board} base OTA is missing the SpeexDSP runtime library required by the ALSA plugin" >&2
+    exit 1
+}
+
+if [[ $board == r3proii ]]; then
+    # R3 releases must use the updated BlueALSA 5/BlueZ runtime. Stock R3
+    # images contain only the legacy bluealsa daemon, so fail before packaging
+    # unless CI's upgraded base or an explicitly selected local overlay has
+    # supplied every player-facing runtime component.
+    r3_runtime_paths=(
+        /usr/bin/bluealsad
+        /usr/bin/bluealsactl
+        /usr/lib/alsa-lib/libasound_module_pcm_bluealsa.so
+        /usr/lib/alsa-lib/libasound_module_ctl_bluealsa.so
+        /usr/libexec/bluetooth/bluetoothd
+    )
+    for runtime_path in "${r3_runtime_paths[@]}"; do
+        [[ -e "$work/root$runtime_path" ]] || {
+            echo "R3 Pro II runtime gate failed: missing $runtime_path (use an updated staging base or R3_RUNTIME_OVERLAY)" >&2
+            exit 1
+        }
+    done
+    for bt_script in bt_init bt_resume; do
+        bt_script_path="$work/root/usr/bin/$bt_script"
+        [[ -f "$bt_script_path" ]] || {
+            echo "R3 Pro II runtime gate failed: missing /usr/bin/$bt_script" >&2
+            exit 1
+        }
+        grep -Eq '(^|[[:space:]/])bluealsad([[:space:]]|$)' "$bt_script_path" || {
+            echo "R3 Pro II runtime gate failed: /usr/bin/$bt_script does not invoke bluealsad" >&2
+            exit 1
+        }
+        for bt_arg in --all-codecs --a2dp-force-audio-cd; do
+            grep -Fq -- "$bt_arg" "$bt_script_path" || {
+                echo "R3 Pro II runtime gate failed: /usr/bin/$bt_script is missing $bt_arg" >&2
+                exit 1
+            }
+        done
+        sh -n "$bt_script_path"
+    done
+    # These scripts are optional across firmware revisions, but when present
+    # they must manage the BlueALSA 5 daemon rather than the legacy daemon.
+    for bt_script in bt_suspend bluealsa_profile; do
+        bt_script_path="$work/root/usr/bin/$bt_script"
+        [[ -f "$bt_script_path" ]] || continue
+        grep -Fq -- 'bluealsad' "$bt_script_path" || {
+            echo "R3 Pro II runtime gate failed: /usr/bin/$bt_script does not manage bluealsad" >&2
+            exit 1
+        }
+        sh -n "$bt_script_path"
+    done
+fi
+
 # Keep the two board packages on the same known-good font set. The manifest
 # contains hashes extracted from the approved R1 package and is checked after
 # every stock asset and overlay has been applied.

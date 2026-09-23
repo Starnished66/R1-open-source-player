@@ -25,6 +25,7 @@ extern const int IDLE_SHUTDOWN_STEPS[];
 extern const int SLEEP_TIMER_STEPS[];
 #define SLEEP_TIMER_STEP_COUNT 10
 #define SETTINGS_SUBSONIC_SAVED_MAX 16
+#define REMOTE_CONTROL_PIN_MAX_LENGTH 12
 
 #define BT_DEVICE_RATE_MAX 8
 
@@ -171,9 +172,13 @@ typedef struct {
 
     /* Phone remote-control over Wi-Fi HTTP and paired Bluetooth RFCOMM -- see
      * remote_control.h. Session-only: startup clears a previously saved true
-     * value. Default false, since Wi-Fi access has no app authentication and
-     * exposes playback state and library browsing to the local network. */
+     * value. Default false; users explicitly choose when either transport
+     * can control playback and browse the library. A shared PIN protects the API. */
     bool remote_control_enabled;
+    /* Shared PIN required by phone clients after Remote Control is enabled.
+     * Empty means the service should generate and persist one on first use.
+     * Stored in the regular plaintext settings file like other credentials. */
+    char remote_control_pin[REMOTE_CONTROL_PIN_MAX_LENGTH + 1];
 
     /* Auto screen-timeout (gui.c's update_timer_cb, backed by
      * backlight_set_screen_on()) -- screen_timeout_enabled=false means never

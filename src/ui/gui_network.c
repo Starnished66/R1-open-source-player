@@ -27,9 +27,8 @@ extern int subprocess_run(char * const argv[], char ** out_output, int timeout_s
 #include "airplay_metadata.h"
 #include "dlna_control.h"
 #include "remote_control.h"
-#ifndef HOST_BUILD
 #include "bt_remote_control.h"
-#endif
+#include "debug_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +46,41 @@ typedef enum {
 } network_service_t;
 
 static bool network_service_enqueue(network_service_t service, bool start, bool force_stop);
+
+#ifdef TEST_BOOT_RC
+static atomic_bool test_boot_services_started = false;
+
+/* /usr/bin/bt_init creates this only after controller firmware setup. Wait
+ * here, off the LVGL thread, so this test path cannot race stock boot's chip
+ * initialization. The bounded wait keeps a failed boot from hanging forever. */
+static void * test_boot_services_worker(void * arg) {
+    (void) arg;
+    /* Start Remote Control immediately. Both entry points create their own
+     * background workers; the RFCOMM worker waits/retries until BlueZ is
+     * available, while the HTTP listener can serve as soon as Wi-Fi is up. */
+    remote_control_start();
+    bt_remote_control_start();
+
+    /* /usr/bin/bt_init creates this only after controller firmware setup.
+     * Wait off the LVGL thread to avoid racing stock boot's chip init. */
+    bool init_gate_seen = false;
+    for (int i = 0; i < 240; ++i) {
+        if (access("/tmp/bt_init_ok", F_OK) == 0) {
+            init_gate_seen = true;
+            break;
+        }
+        usleep(500000);
+    }
+    if (!init_gate_seen) {
+        DBG_LOG("test boot RC: Bluetooth initialization gate timed out\n");
+        return NULL;
+    }
+
+    if (bt_control_init_chip() && !bt_control_is_powered()) bt_control_enable();
+    return NULL;
+}
+
+#endif
 
 /* Screens owned by this module */
 static lv_obj_t * wifi_screen;
@@ -171,11 +205,13 @@ static wifi_info_t wifi_cached_info;
 static bool wifi_cached_info_connected = false;
 #ifndef HOST_BUILD
 static bool remote_control_last_bt_powered;
+static bt_remote_control_status_t remote_control_last_bt_status = BT_REMOTE_CONTROL_DISABLED;
 #endif
 
 static void populate_wifi_info_screen(void);
 static void populate_import_wifi_screen(void);
 static void remote_control_refresh_address(void);
+static void remote_control_refresh_pin_label(void);
 
 static void start_wifi_scan(void);
 static void wifi_settings_snapshot_invalidate(void);
@@ -525,12 +561,17 @@ void poll_wifi_scan(void) {
         if (import_wifi_screen && gui_navigation_is_top(import_wifi_screen)) populate_import_wifi_screen();
         if (remote_control_screen && gui_navigation_is_top(remote_control_screen)) remote_control_refresh_address();
     }
+    if (remote_control_screen && gui_navigation_is_top(remote_control_screen))
+        remote_control_refresh_pin_label();
 #ifndef HOST_BUILD
-    /* The cache is updated by the regular shell poll after this function.
-     * Refresh once when its value changes; never query bluetoothd here. */
+    /* These snapshots are updated by the service thread / regular shell poll;
+     * never query bluetoothd from the UI thread. */
+    bt_remote_control_status_t bt_status = bt_remote_control_status();
     if (remote_control_screen && gui_navigation_is_top(remote_control_screen) &&
-        remote_control_last_bt_powered != bt_is_powered_cached) {
+        (remote_control_last_bt_powered != bt_is_powered_cached ||
+         remote_control_last_bt_status != bt_status)) {
         remote_control_last_bt_powered = bt_is_powered_cached;
+        remote_control_last_bt_status = bt_status;
         remote_control_refresh_address();
     }
 #endif
@@ -3432,6 +3473,9 @@ static void open_dlna_screen(void) {
  * feature. ---- */
 
 static lv_obj_t * remote_control_toggle_img;
+static lv_obj_t * remote_control_pin_label;
+static char remote_control_displayed_pin[REMOTE_CONTROL_PIN_MAX_LENGTH + 1];
+static bool remote_control_displayed_pin_valid;
 static lv_obj_t * remote_control_status_label;
 static lv_obj_t * remote_control_url_label;
 static lv_obj_t * remote_control_bluetooth_label;
@@ -3462,7 +3506,24 @@ static void remote_control_relayout_below_status(void) {
     lv_obj_align_to(remote_control_bluetooth_label, last, LV_ALIGN_OUT_BOTTOM_MID, 0, BOARD_SCALE_PX(12));
 }
 
+static void remote_control_refresh_pin_label(void) {
+    if (!remote_control_pin_label) return;
+    char pin[REMOTE_CONTROL_PIN_MAX_LENGTH + 1] = {0};
+    remote_control_get_pin(pin, sizeof(pin));
+    if (remote_control_displayed_pin_valid && strcmp(remote_control_displayed_pin, pin) == 0) return;
+    if (pin[0]) {
+        char pin_label[64];
+        snprintf(pin_label, sizeof(pin_label), "Connection PIN: %s  ·  Edit", pin);
+        lv_label_set_text(remote_control_pin_label, pin_label);
+    } else {
+        lv_label_set_text(remote_control_pin_label, "Connection PIN: 0000  ·  Edit");
+    }
+    snprintf(remote_control_displayed_pin, sizeof(remote_control_displayed_pin), "%s", pin);
+    remote_control_displayed_pin_valid = true;
+}
+
 static void remote_control_refresh_address(void) {
+    remote_control_refresh_pin_label();
     if (!current_settings.remote_control_enabled) {
         lv_label_set_text(remote_control_status_label,
                            "Turn this on to see the address here.");
@@ -3479,13 +3540,27 @@ static void remote_control_refresh_address(void) {
     bool wifi_available = gui_shell_wifi_effective_enabled() && wifi_cached_info_is_current() &&
                           wifi_cached_info_connected && wifi_cached_info.ip[0] != '\0';
     bool bluetooth_available = false;
+    bool bluetooth_powered = false;
+    bt_remote_control_status_t bluetooth_status = BT_REMOTE_CONTROL_DISABLED;
 #ifndef HOST_BUILD
-    bluetooth_available = bt_is_powered_cached;
+    bluetooth_powered = bt_is_powered_cached;
+    bluetooth_status = bt_remote_control_status();
+    bluetooth_available = bluetooth_powered && bt_remote_control_is_advertising();
 #endif
     if (!wifi_available && !bluetooth_available) {
-        lv_label_set_text(remote_control_status_label, "Enable Wi-Fi or Bluetooth to connect.");
+        if (bluetooth_powered && bluetooth_status == BT_REMOTE_CONTROL_FAILED)
+            lv_label_set_text(remote_control_status_label, "Bluetooth remote service is unavailable; retrying.");
+        else if (bluetooth_powered)
+            lv_label_set_text(remote_control_status_label, "Bluetooth remote service is starting…");
+        else
+            lv_label_set_text(remote_control_status_label, "Enable Wi-Fi or Bluetooth to connect.");
         lv_label_set_text(remote_control_url_label, "");
-        lv_label_set_text(remote_control_bluetooth_label, "");
+        if (bluetooth_powered && bluetooth_status == BT_REMOTE_CONTROL_FAILED)
+            lv_label_set_text(remote_control_bluetooth_label, "Bluetooth: registration failed; retrying");
+        else if (bluetooth_powered)
+            lv_label_set_text(remote_control_bluetooth_label, "Bluetooth: waiting for service registration");
+        else
+            lv_label_set_text(remote_control_bluetooth_label, "");
 #if LV_USE_QRCODE
         lv_obj_add_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
 #endif
@@ -3502,6 +3577,10 @@ static void remote_control_refresh_address(void) {
         lv_label_set_text(remote_control_url_label, "");
     }
     if (bluetooth_available) lv_label_set_text(remote_control_bluetooth_label, "Bluetooth: Compas Remote Control");
+    else if (bluetooth_powered && bluetooth_status == BT_REMOTE_CONTROL_FAILED)
+        lv_label_set_text(remote_control_bluetooth_label, "Bluetooth: registration failed; retrying");
+    else if (bluetooth_powered)
+        lv_label_set_text(remote_control_bluetooth_label, "Bluetooth: waiting for service registration");
     else lv_label_set_text(remote_control_bluetooth_label, "");
 #if LV_USE_QRCODE
     if (wifi_available) {
@@ -3519,6 +3598,27 @@ static void remote_control_refresh_address(void) {
 static void refresh_remote_control_screen_if_built(void) {
     if (remote_control_toggle_img) remote_control_refresh_address();
 }
+
+#ifdef TEST_BOOT_RC
+/* gui_init invokes this on the LVGL thread after all screens are built. Sync
+ * the cached screen's switch and address before starting asynchronous service
+ * bring-up so the test-only boot state is visible immediately. */
+void gui_network_start_test_boot_services(void) {
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&test_boot_services_started, &expected, true)) return;
+    if (remote_control_toggle_img)
+        lv_obj_add_state(remote_control_toggle_img, LV_STATE_CHECKED);
+    refresh_remote_control_screen_if_built();
+
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, test_boot_services_worker, NULL) != 0) {
+        atomic_store(&test_boot_services_started, false);
+        DBG_LOG("test boot RC: could not create startup worker\n");
+        return;
+    }
+    pthread_detach(thread);
+}
+#endif
 
 /* gui_network_toggle_airplay()'s twin for the phone remote-control server --
  * shown as "RC" on the quick drawer's own tile, where there is no room for
@@ -3547,6 +3647,33 @@ bool gui_network_toggle_remote_control(void) {
 static void remote_control_toggle_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     gui_network_toggle_remote_control();
+}
+
+static void remote_control_pin_entered_cb(const char * pin, void * user_data) {
+    (void) user_data;
+    if (!pin) return;
+    size_t length = strlen(pin);
+    if (length < 4 || length > REMOTE_CONTROL_PIN_MAX_LENGTH) {
+        show_info_toast("PIN must be 4 to 12 digits");
+        return;
+    }
+    for (size_t i = 0; i < length; i++) {
+        if (pin[i] < '0' || pin[i] > '9') {
+            show_info_toast("PIN must contain digits only");
+            return;
+        }
+    }
+
+    remote_control_set_pin(pin);
+    remote_control_refresh_pin_label();
+}
+
+static void remote_control_pin_edit_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    lv_event_stop_bubbling(e); /* editing the PIN must not toggle Remote Control */
+    char pin[REMOTE_CONTROL_PIN_MAX_LENGTH + 1] = {0};
+    remote_control_get_pin(pin, sizeof(pin));
+    show_text_entry("Remote Control PIN", pin, false, true, remote_control_pin_entered_cb, NULL);
 }
 
 static lv_obj_t * build_remote_control_screen(void) {
@@ -3580,13 +3707,24 @@ static lv_obj_t * build_remote_control_screen(void) {
     lv_label_set_text(toggle_label, "Remote Control");
     lv_obj_add_style(toggle_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(toggle_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
-    lv_obj_align(toggle_label, LV_ALIGN_LEFT_MID, BOARD_SCALE_PX(24), 0);
+    lv_obj_align(toggle_label, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(24), BOARD_SCALE_PX(15));
+
+    remote_control_pin_label = lv_label_create(toggle_row);
+    remote_control_displayed_pin_valid = false;
+    remote_control_refresh_pin_label();
+    lv_obj_set_width(remote_control_pin_label, lv_pct(82));
+    lv_label_set_long_mode(remote_control_pin_label, LV_LABEL_LONG_DOT);
+    lv_obj_add_style(remote_control_pin_label, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(remote_control_pin_label, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
+    lv_obj_align(remote_control_pin_label, LV_ALIGN_BOTTOM_LEFT, BOARD_SCALE_PX(24), BOARD_SCALE_PX(-14));
+    lv_obj_add_flag(remote_control_pin_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(remote_control_pin_label, remote_control_pin_edit_cb, LV_EVENT_CLICKED, NULL);
 
     /* Standardized switch widget matching the Settings screen style.
      * Non-interactive because the parent toggle_row handles clicks. */
     remote_control_toggle_img = lv_switch_create(toggle_row);
     lv_obj_remove_flag(remote_control_toggle_img, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_align(remote_control_toggle_img, LV_ALIGN_RIGHT_MID, BOARD_SCALE_PX(-20), 0);
+    lv_obj_align(remote_control_toggle_img, LV_ALIGN_TOP_RIGHT, BOARD_SCALE_PX(-20), BOARD_SCALE_PX(10));
     if (current_settings.remote_control_enabled) lv_obj_add_state(remote_control_toggle_img, LV_STATE_CHECKED);
     lv_obj_add_style(remote_control_toggle_img, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
 

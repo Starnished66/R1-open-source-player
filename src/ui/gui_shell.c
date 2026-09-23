@@ -4919,6 +4919,9 @@ void gui_shell_refresh_quick_drawer_cover(void) {
         lv_image_set_src(quick_drawer_cover_img, frost);
         lv_obj_remove_flag(quick_drawer_cover_img, LV_OBJ_FLAG_HIDDEN);
     } else {
+        /* Drop the old descriptor source before its RGB565 buffer can be
+         * released. Hiding alone leaves LVGL holding that source pointer. */
+        lv_image_set_src(quick_drawer_cover_img, NULL);
         lv_obj_add_flag(quick_drawer_cover_img, LV_OBJ_FLAG_HIDDEN);
     }
     quick_drawer_fit_cover();

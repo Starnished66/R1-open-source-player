@@ -70,6 +70,7 @@ static bool is_sd_card_path(const char *path);
 #include "audio.h"
 #include "settings.h"
 #include "assets.h"
+#include "src/misc/cache/instance/lv_image_cache.h"
 #include "device_config.h"
 #include "storage_paths.h"
 #include "plugin_manager.h"
@@ -516,9 +517,15 @@ static player_frost_params_t resolve_player_frost_params(void) {
 static void apply_player_flat_background(bool has_bg_color, uint32_t bg_color) {
     if (player_background_img) {
         lv_obj_add_flag(player_background_img, LV_OBJ_FLAG_HIDDEN);
+        lv_image_set_src(player_background_img, NULL);
     }
-    free(current_reflection_bytes);
+    lv_image_cache_drop(&current_reflection_dsc);
+    uint8_t * old_reflection_bytes = current_reflection_bytes;
     current_reflection_bytes = NULL;
+    current_reflection_dsc.data = NULL;
+    current_reflection_dsc.data_size = 0;
+    gui_shell_refresh_quick_drawer_cover();
+    free(old_reflection_bytes);
 
     if (!player_overlay_panel) return;
 
@@ -977,21 +984,21 @@ void poll_cover_decode(void) {
         free(cover_decode_result_reflection);
     } else if (!cover_decode_result_ok) {
         free(cover_decode_result_reflection);
-        free(current_cover_bytes);
+        /* Retarget every live image object before releasing the backing
+         * buffers. The lock screen may keep current_cover_dsc as its source,
+         * so clear the descriptor before freeing its pixels. */
+        if (cover_img) lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
+        lv_image_cache_drop(&current_cover_dsc);
+        uint8_t * old_cover_bytes = current_cover_bytes;
         current_cover_bytes = NULL;
         current_cover_for_index = -1;
-        /* current_cover_dsc.data still points at the block just freed above
-         * -- gui_player_get_current_cover_dsc() hands this same static
+        /* current_cover_dsc.data still points at the old pixels until it is
+         * cleared below -- gui_player_get_current_cover_dsc() hands this same static
          * struct's address out to other callers (the lock screen), who keep
-         * referencing &current_cover_dsc for as long as they're showing;
-         * without clearing .data here too, their next redraw reads freed
-         * heap. cover_img itself is fine (repointed to the placeholder
-         * asset below), this is purely about the shared descriptor's own
-         * consistency for readers other than cover_img. */
+         * referencing &current_cover_dsc for as long as they're showing. */
         current_cover_dsc.data = NULL;
-        lv_image_set_src(cover_img, asset_path("playing_plane/default_cover_565.png"));
+        current_cover_dsc.data_size = 0;
         fit_cover_img_to_card();
-        gui_shell_refresh_quick_drawer_cover();
         /* No in-memory raw bitmap to reflect for the static placeholder
          * cover. Apply a configured flat color if set (it needs no cover
          * pixels), otherwise reset the panel back to its plain background
@@ -1003,14 +1010,22 @@ void poll_cover_decode(void) {
         } else {
             if (player_background_img) {
                 lv_obj_add_flag(player_background_img, LV_OBJ_FLAG_HIDDEN);
+                lv_image_set_src(player_background_img, NULL);
             }
-            free(current_reflection_bytes);
+            lv_image_cache_drop(&current_reflection_dsc);
+            uint8_t * old_reflection_bytes = current_reflection_bytes;
             current_reflection_bytes = NULL;
+            current_reflection_dsc.data = NULL;
+            current_reflection_dsc.data_size = 0;
             /* Clear any flat-mode BG_COLOR left over from a previous live
              * switch away from flat -- same reasoning as gui_player_
              * refresh_frosted_background()'s own no-cover-yet branch. */
-            lv_obj_remove_local_style_prop(player_overlay_panel, LV_STYLE_BG_COLOR, 0);
+            if (player_overlay_panel)
+                lv_obj_remove_local_style_prop(player_overlay_panel, LV_STYLE_BG_COLOR, 0);
+            gui_shell_refresh_quick_drawer_cover();
+            free(old_reflection_bytes);
         }
+        free(old_cover_bytes);
         player_transition_mark_dirty(); /* cover_img just changed to the placeholder -- see the cache's own doc comment */
     } else {
         free(current_cover_bytes);

@@ -565,6 +565,10 @@ static void update_timer_cb(lv_timer_t * timer) {
     if (remote_control_consume_mode_cycle()) {
         cycle_play_mode();
     }
+    int remote_play_mode;
+    if (remote_control_consume_play_mode(&remote_play_mode)) {
+        gui_player_set_play_mode(remote_play_mode);
+    }
     int remote_seek_seconds;
     if (remote_control_consume_seek(&remote_seek_seconds)) {
         audio_seek((double) remote_seek_seconds);
@@ -1683,6 +1687,14 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * pre-first-frame call site that hung boot on the previous attempt at
      * this). */
     fallback_font_schedule_deferred_load();
+#ifdef TEST_BOOT_RC
+    /* The production startup path above deliberately resets session-only
+     * modes and persists them as disabled. Re-enable only in memory for this
+     * test build; never change the user's saved setting. The service startup
+     * does blocking Bluetooth work on its own worker thread. */
+    current_settings.remote_control_enabled = true;
+    gui_network_start_test_boot_services();
+#endif
 }
 
 

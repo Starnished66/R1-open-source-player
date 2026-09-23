@@ -1,11 +1,15 @@
 #include "remote_control.h"
+#include "remote_control_mdns.h"
 #include "remote_control_webapp.h"
 #include "metadata.h"
 #include "metadata_db.h"
 #include "playlist_files.h"
+#include "settings.h"
+#include "audio.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -15,7 +19,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Port 8899 -- verified free on a real device; 4399 is already used by
@@ -42,6 +48,29 @@ static int status_position_seconds = 0;
 static int status_duration_seconds = 0;
 static float status_volume = 0;
 static int status_play_mode = 0;
+/* Source format is copied into this API snapshot before status_mutex is
+ * acquired. Never call into audio.c while holding status_mutex: audio and UI
+ * paths may acquire their own locks in the opposite order. */
+static char status_codec[32] = {0};
+static unsigned int status_source_bit_depth = 0;
+static unsigned int status_source_sample_rate = 0;
+
+static const char * remote_codec_name(audio_codec_t codec) {
+    switch (codec) {
+        case AUDIO_CODEC_FLAC: return "FLAC";
+        case AUDIO_CODEC_MP3: return "MP3";
+        case AUDIO_CODEC_PCM: return "PCM";
+        case AUDIO_CODEC_DSD: return "DSD";
+        case AUDIO_CODEC_AAC: return "AAC";
+        case AUDIO_CODEC_ALAC: return "ALAC";
+        case AUDIO_CODEC_APE: return "APE";
+        case AUDIO_CODEC_WMA: return "WMA";
+        case AUDIO_CODEC_OPUS: return "Opus";
+        case AUDIO_CODEC_VORBIS: return "Vorbis";
+        case AUDIO_CODEC_UNKNOWN: break;
+    }
+    return "";
+}
 
 /* Playback requests -- edge-triggered flags consumed by update_timer_cb.
  * Guarded by status_mutex. */
@@ -49,6 +78,8 @@ static bool request_play_pause = false;
 static bool request_next = false;
 static bool request_prev = false;
 static bool request_mode_cycle = false;
+static bool request_has_play_mode = false;
+static int request_play_mode = 0;
 static bool request_has_seek = false;
 static int request_seek_seconds = 0;
 static bool request_has_volume = false;
@@ -80,9 +111,128 @@ static pthread_t listener_thread;
 static pthread_mutex_t listener_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int active_client_fd = -1;
 
+/* The PIN is shared by Wi-Fi and RFCOMM because both transports carry the
+ * same HTTP request format. Keep reads and UI writes serialized. */
+static pthread_mutex_t pin_mutex = PTHREAD_MUTEX_INITIALIZER;
+static unsigned int pin_failures = 0;
+static char pin_failed_candidates[5][REMOTE_CONTROL_PIN_MAX_LENGTH + 1];
+static time_t pin_failure_window = 0;
+static time_t pin_blocked_until = 0;
+
+#define REMOTE_CONTROL_PIN_MIN_LENGTH 4
+
+static bool remote_control_pin_is_valid(const char * pin) {
+    if (!pin) return false;
+    size_t len = strlen(pin);
+    if (len < REMOTE_CONTROL_PIN_MIN_LENGTH || len > REMOTE_CONTROL_PIN_MAX_LENGTH) return false;
+    for (size_t i = 0; i < len; i++) if (pin[i] < '0' || pin[i] > '9') return false;
+    return true;
+}
+
+/* Initialize the default PIN on first use. Existing saved PINs remain intact;
+ * users can choose a different 4-12 digit PIN in the Remote Control screen. */
+static bool remote_control_ensure_pin(void) {
+    pthread_mutex_lock(&pin_mutex);
+    if (remote_control_pin_is_valid(current_settings.remote_control_pin)) {
+        pthread_mutex_unlock(&pin_mutex);
+        return true;
+    }
+
+    snprintf(current_settings.remote_control_pin, sizeof(current_settings.remote_control_pin), "0000");
+    settings_save_async(&current_settings);
+    pthread_mutex_unlock(&pin_mutex);
+    return true;
+}
+
+void remote_control_set_pin(const char * pin) {
+    if (!remote_control_pin_is_valid(pin)) return;
+    pthread_mutex_lock(&pin_mutex);
+    snprintf(current_settings.remote_control_pin, sizeof(current_settings.remote_control_pin), "%s", pin);
+    pin_failures = 0;
+    memset(pin_failed_candidates, 0, sizeof(pin_failed_candidates));
+    pin_failure_window = 0;
+    pin_blocked_until = 0;
+    settings_save_async(&current_settings);
+    pthread_mutex_unlock(&pin_mutex);
+}
+
+void remote_control_get_pin(char * out_pin, size_t out_pin_size) {
+    if (!out_pin || out_pin_size == 0) return;
+    pthread_mutex_lock(&pin_mutex);
+    snprintf(out_pin, out_pin_size, "%s", current_settings.remote_control_pin);
+    pthread_mutex_unlock(&pin_mutex);
+}
+
+typedef enum {
+    REMOTE_CONTROL_PIN_INVALID = 0,
+    REMOTE_CONTROL_PIN_VALID = 1,
+    REMOTE_CONTROL_PIN_RATE_LIMITED = 2
+} remote_control_pin_result_t;
+
+static remote_control_pin_result_t remote_control_pin_check(const char * candidate) {
+    bool matches = false;
+    time_t now = time(NULL);
+    pthread_mutex_lock(&pin_mutex);
+    if (now < pin_blocked_until) {
+        pthread_mutex_unlock(&pin_mutex);
+        return REMOTE_CONTROL_PIN_RATE_LIMITED;
+    }
+
+    const char * expected = current_settings.remote_control_pin;
+    size_t candidate_len = candidate ? strlen(candidate) : 0;
+    size_t expected_len = strlen(expected);
+    unsigned int diff = (unsigned int) (candidate_len ^ expected_len);
+    size_t compare_len = candidate_len > expected_len ? candidate_len : expected_len;
+    for (size_t i = 0; i < compare_len; i++) {
+        unsigned char a = i < candidate_len ? (unsigned char) candidate[i] : 0;
+        unsigned char b = i < expected_len ? (unsigned char) expected[i] : 0;
+        diff |= (unsigned int) (a ^ b);
+    }
+    matches = diff == 0 && remote_control_pin_is_valid(candidate) &&
+              remote_control_pin_is_valid(expected);
+    if (matches) {
+        pin_failures = 0;
+        memset(pin_failed_candidates, 0, sizeof(pin_failed_candidates));
+        pin_failure_window = 0;
+    } else {
+        if (now - pin_failure_window >= 60 || pin_failure_window == 0) {
+            pin_failure_window = now;
+            pin_failures = 0;
+            memset(pin_failed_candidates, 0, sizeof(pin_failed_candidates));
+        }
+        bool already_counted = false;
+        for (unsigned int i = 0; i < pin_failures; i++) {
+            if (strcmp(pin_failed_candidates[i], candidate) == 0) {
+                already_counted = true;
+                break;
+            }
+        }
+        if (!already_counted && pin_failures < 5) {
+            snprintf(pin_failed_candidates[pin_failures], sizeof(pin_failed_candidates[pin_failures]), "%s", candidate);
+            pin_failures++;
+        }
+        if (pin_failures >= 5) {
+            pin_blocked_until = now + 60;
+            pin_failures = 0;
+            memset(pin_failed_candidates, 0, sizeof(pin_failed_candidates));
+            pin_failure_window = 0;
+        }
+    }
+    pthread_mutex_unlock(&pin_mutex);
+    return matches ? REMOTE_CONTROL_PIN_VALID : REMOTE_CONTROL_PIN_INVALID;
+}
+
 void remote_control_notify_status(bool playing, bool paused, const char * title, const char * artist,
                                    const char * album, const char * path, int position_seconds,
                                    int duration_seconds, float volume, int play_mode) {
+    /* Take the audio snapshot before status_mutex. Match its copied path
+     * against this now-playing snapshot so a track transition cannot publish
+     * the previous decoder's format beside the new track's metadata. */
+    audio_current_format_info_t format = {0};
+    bool format_matches_track = path && path[0] &&
+        audio_get_current_format_info(&format) && format.valid && !format.is_stream &&
+        strcmp(format.path, path) == 0;
+
     pthread_mutex_lock(&status_mutex);
     status_playing = playing;
     status_paused = paused;
@@ -94,6 +244,10 @@ void remote_control_notify_status(bool playing, bool paused, const char * title,
     status_duration_seconds = duration_seconds;
     status_volume = volume;
     status_play_mode = play_mode;
+    snprintf(status_codec, sizeof(status_codec), "%s",
+             format_matches_track ? remote_codec_name(format.codec) : "");
+    status_source_bit_depth = format_matches_track ? format.source_bit_depth : 0;
+    status_source_sample_rate = format_matches_track ? format.source_sample_rate : 0;
     pthread_mutex_unlock(&status_mutex);
 }
 
@@ -125,6 +279,17 @@ bool remote_control_consume_mode_cycle(void) {
     pthread_mutex_lock(&status_mutex);
     bool result = request_mode_cycle;
     request_mode_cycle = false;
+    pthread_mutex_unlock(&status_mutex);
+    return result;
+}
+
+bool remote_control_consume_play_mode(int * out_mode) {
+    pthread_mutex_lock(&status_mutex);
+    bool result = request_has_play_mode;
+    if (result) {
+        request_has_play_mode = false;
+        if (out_mode) *out_mode = request_play_mode;
+    }
     pthread_mutex_unlock(&status_mutex);
     return result;
 }
@@ -418,9 +583,11 @@ static void build_status_json(char * out, size_t out_size) {
     json_escape_append(album_esc, sizeof(album_esc), status_album);
     snprintf(out, out_size,
              "{\"playing\":%s,\"paused\":%s,\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
-             "\"position_seconds\":%d,\"duration_seconds\":%d,\"volume\":%.2f,\"play_mode\":%d}",
+             "\"position_seconds\":%d,\"duration_seconds\":%d,\"volume\":%.2f,\"play_mode\":%d,"
+             "\"codec\":\"%s\",\"source_bit_depth\":%u,\"source_sample_rate\":%u}",
              status_playing ? "true" : "false", status_paused ? "true" : "false", title_esc, artist_esc, album_esc,
-             status_position_seconds, status_duration_seconds, (double) status_volume, status_play_mode);
+             status_position_seconds, status_duration_seconds, (double) status_volume, status_play_mode,
+             status_codec, status_source_bit_depth, status_source_sample_rate);
     pthread_mutex_unlock(&status_mutex);
 }
 
@@ -428,12 +595,14 @@ static void build_status_json(char * out, size_t out_size) {
  * (PLAYLISTS_DIR "/" name ".m3u", see playlist_files_create()) -- unlike
  * gui.c's own in-app equivalent (new_playlist_name_done_cb(), whose name
  * comes from a UI text field only the device's own user can type into),
- * this is reachable by anyone on the network with no authentication, so
- * it's validated here rather than trusted the way playlist_files_create()'s
+ * this is reachable by authenticated remote clients, so it is validated
+ * rather than trusted the way playlist_files_create()'s
  * own doc comment says its callers must. Rejects empty names, anything
  * containing a path separator, and anything containing ".." (defense in
  * depth against path traversal even though a bare ".." alone couldn't
  * escape PLAYLISTS_DIR without a "/" too). */
+#define PLAYLIST_NAME_MAX_BYTES 127
+
 static bool playlist_name_is_safe(const char * name) {
     if (!name || name[0] == '\0') return false;
     if (strchr(name, '/') || strchr(name, '\\')) return false;
@@ -452,12 +621,30 @@ static void build_playlists_json(char * out, size_t out_size) {
     json_builder_appendf(&json,
                             "{\"playlists\":[{\"name\":\"Favorites\",\"key\":\"@favorites\",\"internal\":true,\"writable\":false},"
                             "{\"name\":\"Most Played\",\"key\":\"@most_played\",\"internal\":true,\"writable\":false}");
+    size_t playlists_dir_len = strlen(PLAYLISTS_DIR);
     for (int i = 0; i < count && !json.truncated; i++) {
-        const char * slash = strrchr(paths[i], '/');
-        const char * base = slash ? slash + 1 : paths[i];
-        char name_esc[300] = {0};
+        /* The API routes resolve user playlists as
+         * PLAYLISTS_DIR/<key>.m3u. Advertise only files that exact lookup can
+         * reach: direct children with the canonical lowercase extension. */
+        if (strncmp(paths[i], PLAYLISTS_DIR, playlists_dir_len) != 0 ||
+            paths[i][playlists_dir_len] != '/') continue;
+        const char * base = paths[i] + playlists_dir_len + 1;
+        if (strchr(base, '/') != NULL) continue;
+        size_t base_len = strlen(base);
+        if (base_len <= 4 || strcmp(base + base_len - 4, ".m3u") != 0) continue;
+
+        size_t key_len = base_len - 4;
+        char key[256] = {0};
+        /* Playback context and playlist lookup use 128-byte decoded names. */
+        if (key_len >= sizeof(key) || key_len > PLAYLIST_NAME_MAX_BYTES) continue;
+        memcpy(key, base, key_len);
+        if (!playlist_name_is_safe(key)) continue;
+
+        char name_esc[1600] = {0}, key_esc[1600] = {0};
         json_escape_append(name_esc, sizeof(name_esc), base);
-        if (!json_builder_appendf(&json, ",{\"name\":\"%s\",\"internal\":false,\"writable\":true}", name_esc)) break;
+        json_escape_append(key_esc, sizeof(key_esc), key);
+        if (!json_builder_appendf(&json, ",{\"name\":\"%s\",\"key\":\"%s\",\"internal\":false,\"writable\":true}",
+                                  name_esc, key_esc)) break;
     }
     json.truncated = false;
     json_builder_appendf(&json, "]}");
@@ -549,6 +736,17 @@ static void send_response(int fd, const char * status_line, const char * content
                                status_line, content_type, strlen(body));
     send_all(fd, header, (size_t) header_len);
     send_all(fd, body, strlen(body));
+}
+
+static void send_pin_rate_limited_response(int fd) {
+    static const char body[] = "{\"error\":\"rate_limited\",\"code\":\"pin_rate_limited\",\"retryAfterSeconds\":60}";
+    char header[320];
+    int header_len = snprintf(header, sizeof(header),
+                              "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n"
+                              "Content-Length: %zu\r\nRetry-After: 60\r\nConnection: close\r\n\r\n",
+                              sizeof(body) - 1);
+    send_all(fd, header, (size_t) header_len);
+    send_all(fd, body, sizeof(body) - 1);
 }
 
 /* Pulls an integer query parameter from the request path. Returns false if
@@ -675,9 +873,7 @@ static void handle_art_request(int cfd, const char * path) {
 #define THEME_ROOT "/usr/resource/litegui/theme2/"
 #endif
 
-/* Fixed whitelist, not an arbitrary caller-supplied filename -- this server
- * has no authentication, so GET /assets/icon?name= must never be able to
- * read anything outside this exact set. Use the same bundled submenu icons
+/* Fixed whitelist, not an arbitrary caller-supplied filename. Use the same bundled submenu icons
  * as build_music_screen() in gui_library.c. */
 static const struct {
     const char * name;
@@ -821,9 +1017,12 @@ static void handle_playlist_songs_request(int cfd, const char * path) {
  * response parsing does the same). */
 #define REQUEST_LINE_MAX 512
 #define REQUEST_HEADERS_MAX 4096
-#define PLAYLIST_NAME_MAX_BYTES 127
 
 static void handle_connection(int cfd) {
+    if (!remote_control_ensure_pin()) {
+        send_response(cfd, "503 Service Unavailable", "text/plain", "PIN generation unavailable");
+        return;
+    }
     char buf[REQUEST_LINE_MAX];
     size_t n = 0;
     bool line_complete = false;
@@ -858,8 +1057,12 @@ static void handle_connection(int cfd) {
      * has no request-body endpoints, so only the bounded header section is
      * consumed. Accept CRLF or LF line endings. */
     size_t header_bytes = 0;
-    char tail[4] = {0};
     bool headers_complete = false;
+    char pin_header[REMOTE_CONTROL_PIN_MAX_LENGTH + 1] = {0};
+    bool pin_header_seen = false;
+    bool pin_header_invalid = false;
+    char header_line[512];
+    size_t header_line_len = 0;
     while (header_bytes < REQUEST_HEADERS_MAX) {
         struct pollfd pfd = { .fd = cfd, .events = POLLIN, .revents = 0 };
         int ready = poll(&pfd, 1, 2000);
@@ -873,14 +1076,34 @@ static void handle_connection(int cfd) {
         ssize_t nr = read(cfd, &c, 1);
         if (nr <= 0) return;
         header_bytes++;
-        tail[0] = tail[1]; tail[1] = tail[2]; tail[2] = tail[3]; tail[3] = c;
-        if ((header_bytes == 1 && c == '\n') ||
-            (header_bytes == 2 && tail[2] == '\r' && tail[3] == '\n') ||
-            (header_bytes >= 2 && tail[2] == '\n' && tail[3] == '\n') ||
-            (header_bytes >= 4 && tail[0] == '\r' && tail[1] == '\n' &&
-             tail[2] == '\r' && tail[3] == '\n')) {
-            headers_complete = true;
-            break;
+        if (c == '\n') {
+            if (header_line_len && header_line[header_line_len - 1] == '\r') header_line_len--;
+            header_line[header_line_len] = '\0';
+            if (header_line_len == 0) {
+                headers_complete = true;
+                break;
+            }
+            static const char pin_name[] = "X-Compas-PIN:";
+            if (header_line_len >= sizeof(pin_name) - 1 &&
+                strncasecmp(header_line, pin_name, sizeof(pin_name) - 1) == 0) {
+                const char * value = header_line + sizeof(pin_name) - 1;
+                while (*value == ' ' || *value == '\t') value++;
+                size_t value_len = strlen(value);
+                while (value_len && (value[value_len - 1] == ' ' || value[value_len - 1] == '\t')) value_len--;
+                if (pin_header_seen || value_len == 0 || value_len >= sizeof(pin_header)) {
+                    pin_header_invalid = true;
+                } else {
+                    memcpy(pin_header, value, value_len);
+                    pin_header[value_len] = '\0';
+                    pin_header_seen = true;
+                }
+            }
+            header_line_len = 0;
+        } else if (header_line_len + 1 < sizeof(header_line)) {
+            header_line[header_line_len++] = c;
+        } else {
+            send_response(cfd, "431 Request Header Fields Too Large", "text/plain", "Request headers too large");
+            return;
         }
     }
     if (!headers_complete) {
@@ -910,7 +1133,8 @@ static void handle_connection(int cfd) {
     if (api_v1) {
         if (strcmp(path_only, "/api/v1/capabilities") == 0 && strcmp(method, "GET") == 0) {
             static const char capabilities[] =
-                "{\"version\":1,\"transports\":[\"wifi\",\"bluetooth_classic_rfcomm\"],\"features\":["
+                "{\"version\":1,\"authRequired\":true,\"authHeader\":\"X-Compas-PIN\","
+                "\"transports\":[\"wifi\",\"bluetooth_classic_rfcomm\"],\"features\":["
                 "\"status\",\"playback_controls\",\"queue\",\"library_browse\","
                 "\"playlists\",\"album_art\"]}";
             send_response(cfd, "200 OK", "application/json", capabilities);
@@ -919,6 +1143,27 @@ static void handle_connection(int cfd) {
         /* Remove only "/v1" so "/api/v1/status" routes as "/api/status". */
         memmove(path_only + sizeof("/api") - 1, path_only + sizeof("/api/v1") - 1,
                 strlen(path_only + sizeof("/api/v1") - 1) + 1);
+    }
+
+    /* Only the shell and capabilities handshake are public. All library,
+     * status, artwork, playback, playlist, queue, and asset requests require
+     * the same PIN header over both Wi-Fi and Bluetooth RFCOMM. */
+    bool public_request = strcmp(method, "GET") == 0 &&
+                          (strcmp(path_only, "/") == 0 ||
+                           strcmp(path, "/api/v1/capabilities") == 0 ||
+                           strcmp(path, "/api/capabilities") == 0);
+    if (!public_request) {
+        remote_control_pin_result_t pin_result = REMOTE_CONTROL_PIN_INVALID;
+        if (!pin_header_invalid && pin_header_seen) pin_result = remote_control_pin_check(pin_header);
+        if (pin_result == REMOTE_CONTROL_PIN_RATE_LIMITED) {
+            send_pin_rate_limited_response(cfd);
+            return;
+        }
+        if (pin_result != REMOTE_CONTROL_PIN_VALID) {
+            send_response(cfd, "401 Unauthorized", "application/json",
+                          "{\"error\":\"unauthorized\",\"code\":\"pin_required\"}");
+            return;
+        }
     }
 
     if (strcmp(method, "GET") == 0) {
@@ -1081,7 +1326,21 @@ static void handle_connection(int cfd) {
             } else if (strcmp(path_only, "/api/playback/prev") == 0) {
                 request_prev = true;
             } else if (strcmp(path_only, "/api/playback/mode") == 0) {
-                request_mode_cycle = true;
+                char mode_raw[32] = {0};
+                bool mode_present = query_param_str(path, "mode", mode_raw, sizeof(mode_raw));
+                if (!mode_present) {
+                    request_mode_cycle = true;
+                } else {
+                    char * end = NULL;
+                    errno = 0;
+                    long mode = strtol(mode_raw, &end, 10);
+                    if (errno == 0 && end != mode_raw && *end == '\0' && mode >= 0 && mode <= 3) {
+                        request_has_play_mode = true;
+                        request_play_mode = (int) mode;
+                    } else {
+                        ok = false;
+                    }
+                }
             } else if (strcmp(path_only, "/api/playback/seek") == 0) {
                 int seconds;
                 if (query_param_int(path, "seconds", &seconds) && seconds >= 0) {
@@ -1222,6 +1481,7 @@ static void * listener_thread_func(void * arg) {
 }
 
 void remote_control_start(void) {
+    if (!remote_control_ensure_pin()) return;
     pthread_mutex_lock(&listener_mutex);
     if (atomic_load_explicit(&running, memory_order_acquire)) {
         pthread_mutex_unlock(&listener_mutex);
@@ -1261,11 +1521,16 @@ void remote_control_start(void) {
         atomic_store_explicit(&running, false, memory_order_release);
         close(listen_fd);
         listen_fd = -1;
+    } else {
+        /* DNS-SD runs on its own best-effort worker. A missing Wi-Fi link or
+         * occupied multicast socket never affects the HTTP listener. */
+        remote_control_mdns_start();
     }
     pthread_mutex_unlock(&listener_mutex);
 }
 
 void remote_control_stop(void) {
+    remote_control_mdns_stop();
     pthread_mutex_lock(&listener_mutex);
     if (!atomic_load_explicit(&running, memory_order_acquire)) {
         pthread_mutex_unlock(&listener_mutex);

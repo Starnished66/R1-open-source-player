@@ -233,6 +233,7 @@
 !/src/core/sd_fsck_test.c
 !/src/library/albumart_migration_test.c
 !/src/library/metadata_migration_retry_test.c
+!/src/network/remote_control_mdns_test.c
 !/src/library/tagcache_storage_test.c
 !/src/library/tagcache_write_volume_test.c
 !/src/library/tagcache_incremental_test.c

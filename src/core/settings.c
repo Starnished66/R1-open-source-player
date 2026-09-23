@@ -66,6 +66,16 @@ static bool valid_bt_output_mac(const char * value) {
     return true;
 }
 
+static bool valid_remote_control_pin(const char * value) {
+    if (!value) return false;
+    size_t length = strlen(value);
+    if (length < 4 || length > REMOTE_CONTROL_PIN_MAX_LENGTH) return false;
+    for (size_t i = 0; i < length; i++) {
+        if (value[i] < '0' || value[i] > '9') return false;
+    }
+    return true;
+}
+
 static void set_defaults(player_settings_t * out) {
     out->volume = 1.0f;
     out->last_track[0] = '\0';
@@ -99,6 +109,7 @@ static void set_defaults(player_settings_t * out) {
     out->wifi_dac_mode_enabled = false;
     out->dlna_renderer_enabled = false;
     out->remote_control_enabled = false;
+    out->remote_control_pin[0] = '\0';
     out->screen_timeout_enabled = true;
     out->screen_timeout_seconds = 30;
     out->screen_dimming_enabled = true;
@@ -375,6 +386,9 @@ bool settings_load(player_settings_t * out) {
             out->dlna_renderer_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "remote_control_enabled") == 0) {
             out->remote_control_enabled = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "remote_control_pin") == 0) {
+            if (valid_remote_control_pin(value))
+                snprintf(out->remote_control_pin, sizeof(out->remote_control_pin), "%s", value);
         } else if (strcmp(key, "screen_timeout_enabled") == 0) {
             out->screen_timeout_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "screen_timeout_seconds") == 0) {
@@ -497,8 +511,20 @@ static void fsync_settings_dir(void) {
 static void settings_write_file(const player_settings_t * settings) {
     DBG_LOG("settings_save: called (idle_suspend_enabled=%d)\n", settings->idle_suspend_enabled ? 1 : 0);
     (void) mkdir(INTERNAL_COMPAS_DIR, 0755);
-    FILE * f = fopen(SETTINGS_TMP_FILE_PATH, "w");
-    if (!f) return;
+    /* This file contains the RC PIN and Subsonic credentials. Create or
+     * rewrite the atomic temp file as owner-only even when an older temp
+     * file exists with broader permissions. */
+    int settings_fd = open(SETTINGS_TMP_FILE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (settings_fd < 0) return;
+    if (fchmod(settings_fd, 0600) != 0) {
+        close(settings_fd);
+        return;
+    }
+    FILE * f = fdopen(settings_fd, "w");
+    if (!f) {
+        close(settings_fd);
+        return;
+    }
 
     fprintf(f, "volume=%.3f\n", (double) settings->volume);
     fprintf(f, "last_track=%s\n", settings->last_track);
@@ -536,6 +562,7 @@ static void settings_write_file(const player_settings_t * settings) {
     fprintf(f, "wifi_dac_mode=%d\n", settings->wifi_dac_mode_enabled ? 1 : 0);
     fprintf(f, "dlna_renderer_enabled=%d\n", settings->dlna_renderer_enabled ? 1 : 0);
     fprintf(f, "remote_control_enabled=%d\n", settings->remote_control_enabled ? 1 : 0);
+    fprintf(f, "remote_control_pin=%s\n", settings->remote_control_pin);
     fprintf(f, "screen_timeout_enabled=%d\n", settings->screen_timeout_enabled ? 1 : 0);
     fprintf(f, "screen_timeout_seconds=%d\n", settings->screen_timeout_seconds);
     fprintf(f, "screen_dimming_enabled=%d\n", settings->screen_dimming_enabled ? 1 : 0);
@@ -570,7 +597,7 @@ static void settings_write_file(const player_settings_t * settings) {
     fflush(f);
     fsync(fileno(f));
     fclose(f);
-    rename(SETTINGS_TMP_FILE_PATH, SETTINGS_FILE_PATH);
+    if (rename(SETTINGS_TMP_FILE_PATH, SETTINGS_FILE_PATH) == 0) chmod(SETTINGS_FILE_PATH, 0600);
     fsync_settings_dir();
 }
 

@@ -20,6 +20,11 @@ void remote_control_start(void);
 /* Stops the listener thread and its socket. Idempotent. */
 void remote_control_stop(void);
 
+/* Replace the shared Wi-Fi/Bluetooth Remote Control PIN. Accepts only a
+ * 4-12 digit PIN and persists it with the other player settings. */
+void remote_control_set_pin(const char * pin);
+void remote_control_get_pin(char * out_pin, size_t out_pin_size);
+
 /* Handles one HTTP request on a connected byte-stream socket (for example an
  * RFCOMM connection). The caller retains ownership of fd and must close it. */
 void remote_control_handle_stream(int fd);
@@ -36,9 +41,11 @@ bool remote_control_consume_play_pause(void);
 bool remote_control_consume_next(void);
 bool remote_control_consume_prev(void);
 
-/* POST /api/playback/mode -- cycles play mode (Sequential -> Repeat All ->
- * Repeat One -> Shuffle -> Sequential). */
+/* POST /api/playback/mode without a parameter cycles play mode. With
+ * ?mode=N, selects N directly (0=Sequential, 1=Repeat All, 2=Repeat One,
+ * 3=Shuffle). Both requests are consumed on the UI thread. */
 bool remote_control_consume_mode_cycle(void);
+bool remote_control_consume_play_mode(int * out_mode);
 
 /* Edge-triggered seek and volume control consumption. out_seconds/out_percent
  * are only written when returning true. percent is 0-100. */

@@ -17,6 +17,11 @@ bool gui_network_usb_dac_mode_active(void);
 lv_obj_t * gui_network_get_import_wifi_screen(void);
 
 void gui_network_init(void);
+#ifdef TEST_BOOT_RC
+/* Test build only: power Bluetooth and start the remote-control transports
+ * asynchronously after the UI has completed its normal session-mode reset. */
+void gui_network_start_test_boot_services(void);
+#endif
 /* Deletes every screen/popup this module owns so gui_reload.c's in-process
  * UI reload can call gui_network_init() again from a clean slate. */
 void gui_network_teardown(void);

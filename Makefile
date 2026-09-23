@@ -36,6 +36,20 @@ HOST_BIN = compas_player_host_$(BOARD)
 TARGET_BIN = compas_player_target_$(BOARD)
 endif
 
+# Test-only boot behavior gets its own object directory and executable. Make
+# does not notice CFLAGS changes, so sharing build_target/ could silently keep
+# TEST_BOOT_RC objects in a later normal build (or vice versa).
+ifeq ($(TEST_BOOT_RC),1)
+ifeq ($(BOARD),r1)
+BUILD_TARGET_DIR := build_target_test_boot_rc
+TARGET_BIN := compas_player_target_test_boot_rc
+else
+BUILD_TARGET_DIR := build_target_$(BOARD)_test_boot_rc
+TARGET_BIN := compas_player_target_test_boot_rc_$(BOARD)
+endif
+TEST_BOOT_RC_DEFINE = -DTEST_BOOT_RC=1
+endif
+
 # Compiler and Linker configuration
 CC = gcc
 CXX = g++
@@ -471,8 +485,8 @@ BUILD_STAMP_DEFINE = -DBUILD_STAMP=\"$(shell date +%Y-%m-%d_%H:%M)\"
 # #include <execinfo.h> resolves to on target: musl (unlike host's glibc)
 # ships no execinfo.h/backtrace() of its own, which is what main.c's SIGSEGV
 # handler needs. Host build doesn't need this -- glibc already provides it.
-TARGET_CFLAGS = $(CFLAGS) -I$(LIBEXECINFO_DIR) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE) -I$(TINFL_DIR) -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS
-TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LIBEXECINFO_DIR) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE) -I$(TINFL_DIR) -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS
+TARGET_CFLAGS = $(CFLAGS) -I$(LIBEXECINFO_DIR) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BOOT_RC_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE) -I$(TINFL_DIR) -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS
+TARGET_CXXFLAGS = $(CXXFLAGS) -I$(LIBEXECINFO_DIR) -I$(LVGL_DIR)/src -I$(TINYALSA_DIR)/include -Idbus_vendor_config -I$(DBUS_DIR) $(BOARD_DEFINE) $(TEST_BOOT_RC_DEFINE) $(TEST_BUILD_TAG_DEFINE) $(RELEASE_LABEL_DEFINE) $(UI_PERF_TRACE_DEFINE) $(UI_GESTURE_TRACE_DEFINE) $(UI_HITBOX_DEBUG_DEFINE) $(BUILD_STAMP_DEFINE) -I$(TINFL_DIR) -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS
 TINYALSA_CFLAGS = -O3 -g -Wall -I$(TINYALSA_DIR)/include -I$(TINYALSA_DIR)/src
 # DBUS_COMPILATION/DBUS_STATIC_BUILD: libdbus's own headers gate some
 # declarations on these (matching how its own build always defines them
@@ -538,7 +552,7 @@ TARGET_LDFLAGS = -static -no-pie -lpthread -lm
 # control), ui/ (gui/screens/assets/fonts), core/ (settings, subprocess,
 # misc). main.c stays at src/ root as the entry point.
 APP_SRCS = src/main.c src/ui/gui.c src/ui/gui_subsonic.c src/ui/gui_settings.c src/ui/gui_network.c src/ui/gui_theme.c src/ui/gui_notifications.c src/ui/gui_library.c src/ui/gui_queue.c src/ui/gui_player.c src/ui/gui_track_info.c src/ui/gui_plugins.c src/ui/gui_shell.c src/ui/gui_navigation.c src/ui/gui_books.c src/ui/gui_text_input.c src/ui/gui_lyrics.c src/ui/gui_reload.c src/audio/audio.c src/library/file_browser.c src/hardware/hw_buttons.c src/hardware/input_device_utils.c src/library/metadata.c src/library/metadata_db.c src/core/settings.c src/core/app_version.c src/audio/aiff_decoder.c src/audio/dsd_filter.c src/audio/dsd_decoder.c src/audio/aac_decoder.c src/audio/mp4_demux.c src/audio/ape_demux.c src/audio/ape_decoder.c src/audio/peq.c src/ui/assets.c src/ui/screen_builders.c src/hardware/battery.c src/network/wifi_status.c src/network/ca_bundle.c src/network/http_conn.c src/network/http_client.c src/network/http_stream.c src/network/subsonic_client.c src/library/cover_decode.c src/library/lyrics.c src/audio/asf_demux.c src/audio/wma_decoder.c src/audio/ogg_demux.c src/audio/opus_decoder.c src/audio/vorbis_decoder.c src/library/cue_parser.c src/ui/fallback_font.c \
-src/core/subprocess.c src/network/wifi_control.c src/network/bluetooth_control.c src/network/hiby_sys_server.c src/hardware/backlight.c src/network/import_web.c src/network/airplay_control.c src/network/airplay_bridge.c src/network/airplay_metadata.c src/hardware/headphone_status.c src/hardware/device_config.c src/hardware/led_control.c src/hardware/charge_limiter.c src/core/idle_shutdown.c src/hardware/power_suspend.c src/core/text_reader.c src/hardware/usb_mode_control.c src/hardware/usb_dac_bridge.c src/hardware/usb_audio_output.c src/core/firmware_update.c src/library/playlist_files.c src/core/timezone_data.c src/core/timezone_apply.c src/core/hostname_apply.c src/network/dlna_control.c src/network/remote_control.c src/plugins/plugin_manager.c
+src/core/subprocess.c src/network/wifi_control.c src/network/bluetooth_control.c src/network/hiby_sys_server.c src/hardware/backlight.c src/network/import_web.c src/network/airplay_control.c src/network/airplay_bridge.c src/network/airplay_metadata.c src/hardware/headphone_status.c src/hardware/device_config.c src/hardware/led_control.c src/hardware/charge_limiter.c src/core/idle_shutdown.c src/hardware/power_suspend.c src/core/text_reader.c src/hardware/usb_mode_control.c src/hardware/usb_dac_bridge.c src/hardware/usb_audio_output.c src/core/firmware_update.c src/library/playlist_files.c src/core/timezone_data.c src/core/timezone_apply.c src/core/hostname_apply.c src/network/dlna_control.c src/network/remote_control.c src/network/remote_control_mdns.c src/plugins/plugin_manager.c
 APP_SRCS += src/ui/lyrics_layout.c src/ui/transition_compositor.c src/ui/frosted_glass.c src/ui/hw_volume_coalesce.c
 APP_SRCS += src/core/storage_migration.c src/core/sd_fsck.c src/core/sd_fsck_run.c
 APP_SRCS += src/plugins/plugin_json.c src/plugins/plugin_storage.c src/plugins/plugin_disabled_list.c
@@ -806,6 +820,12 @@ $(BUILD_HOST_DIR)/lua/%.o: $(LUA_DIR)/src/%.c
 # Build for target (MIPS HiBy Device)
 target: $(TARGET_BIN) compile_commands.json
 
+# Clearly named, isolated test binary: powers Bluetooth and enables both
+# Remote Control transports on boot. Normal `make target` is unchanged.
+.PHONY: target-test-boot-rc
+target-test-boot-rc:
+	$(MAKE) target TEST_BOOT_RC=1
+
 $(TARGET_BIN): $(TARGET_OBJS)
 	$(CROSS_CXX) -o $(BUILD_TARGET_DIR)/$(TARGET_BIN)_unstripped $(TARGET_OBJS) $(TARGET_LDFLAGS)
 	$(CROSS_STRIP) -s -o $@ $(BUILD_TARGET_DIR)/$(TARGET_BIN)_unstripped
@@ -879,6 +899,14 @@ wifi-status-selftest:
 	@mkdir -p $(BUILD_TARGET_DIR)
 	$(CC) -O0 -g -Wall -Wextra -Isrc/network -Isrc/core src/network/wifi_status.c src/network/wifi_status_test.c -o $(BUILD_TARGET_DIR)/wifi_status_test
 	./$(BUILD_TARGET_DIR)/wifi_status_test
+
+# Unit check for DNS-SD query parsing and the responder's emitted RR wire data.
+.PHONY: remote-control-mdns-selftest
+remote-control-mdns-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -Isrc/network src/network/remote_control_mdns_test.c -pthread \
+	    -o $(BUILD_TARGET_DIR)/remote_control_mdns_test
+	./$(BUILD_TARGET_DIR)/remote_control_mdns_test
 
 subprocess-timeout-selftest:
 	@mkdir -p $(BUILD_TARGET_DIR)

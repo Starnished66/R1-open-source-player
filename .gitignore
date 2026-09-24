@@ -239,6 +239,10 @@
 !/src/library/tagcache_incremental_test.c
 !/src/library/tagcache_refs_test.c
 !/src/library/tagcache_commit_failure_test.c
+!/src/bootloader/sd_ready_test.c
+!/src/library/playlist_test.c
+!/src/network/bluetooth_codec_test.c
+!/src/ui/sd_card_identity_test.c
 
 # Local GUI-refactor extraction workspace
 /scratch/

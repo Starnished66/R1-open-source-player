@@ -131,8 +131,8 @@ lv_obj_t * more_menu_popup_backdrop = NULL;
 
 static lv_obj_t * volume_popup_track = NULL;
 static lv_obj_t * volume_popup_speaker_icon = NULL;
+static lv_obj_t * volume_popup_value_label = NULL;
 static lv_timer_t * volume_popup_hide_timer = NULL;
-static asset_decoded_image_t volume_popup_bg_image;
 static asset_decoded_image_t volume_popup_speaker_image;
 /* Decoded copies of btn_play.png / btn_pause.png with the baked-in cyan
  * glyph rewritten to the current accent. Kept across widget teardown so
@@ -213,6 +213,7 @@ static void volume_popup_track_event_cb(lv_event_t * e) {
         lv_timer_pause(volume_popup_hide_timer);
     } else if (code == LV_EVENT_VALUE_CHANGED) {
         hw_volume_coalesce_drag_update(&volume_popup_hv, (int) percent);
+        if (volume_popup_value_label) lv_label_set_text_fmt(volume_popup_value_label, "%d", (int) percent);
         refresh_volume_topbar(percent);
     } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
         hw_volume_coalesce_drag_end(&volume_popup_hv, (int) percent);
@@ -248,18 +249,19 @@ bool gui_player_volume_control_hit_test(lv_point_t point) {
            point.y >= area.y1 && point.y <= area.y2;
 }
 
+/* Same card as the quick drawer's volume row (gui_shell.c): 413x73 rounded
+ * panel, speaker icon, rail and a right-aligned numeric value, so the
+ * hardware-button indicator reads exactly like the drawer's control. */
 static void build_volume_popup(void) {
     lv_obj_t * top = lv_layer_top();
 
     volume_popup = lv_obj_create(top);
-    lv_obj_set_size(volume_popup, 440, 60);
-    lv_obj_align(volume_popup, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + 12);
-    lv_obj_set_style_bg_opa(volume_popup, LV_OPA_TRANSP, 0);
-    const void * popup_bg = asset_decoded_image_open(&volume_popup_bg_image, "volume/bg.png")
-                          ? asset_decoded_image_source(&volume_popup_bg_image) : NULL;
-    lv_obj_set_style_bg_image_src(volume_popup, popup_bg ? popup_bg : asset_path("volume/bg.png"), 0);
-    lv_obj_set_style_border_width(volume_popup, 0, 0);
-    lv_obj_set_style_pad_all(volume_popup, 0, 0);
+    lv_obj_remove_style_all(volume_popup);
+    lv_obj_set_size(volume_popup, BOARD_SCALE_PX(413), BOARD_SCALE_PY(73));
+    lv_obj_align(volume_popup, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + BOARD_SCALE_PX(12));
+    lv_obj_set_style_bg_color(volume_popup, lv_color_hex(0x151b17), 0);
+    lv_obj_set_style_bg_opa(volume_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(volume_popup, BOARD_SCALE_PX(23), 0);
     lv_obj_remove_flag(volume_popup, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(volume_popup, LV_OBJ_FLAG_HIDDEN);
 
@@ -267,23 +269,37 @@ static void build_volume_popup(void) {
     const void * speaker = asset_decoded_image_open(&volume_popup_speaker_image, "volume/vol.png")
                          ? asset_decoded_image_source(&volume_popup_speaker_image) : NULL;
     lv_image_set_src(volume_popup_speaker_icon, speaker ? speaker : asset_path("volume/vol.png"));
-    lv_obj_align(volume_popup_speaker_icon, LV_ALIGN_LEFT_MID, 20, 0);
+    lv_obj_align(volume_popup_speaker_icon, LV_ALIGN_LEFT_MID, BOARD_SCALE_PX(21), 0);
+
+    /* Drawer geometry relative to its card (x=34): track at 103, value
+     * right edge at 428, a 16px gap before the widest value ("100"). */
+    lv_point_t value_size;
+    lv_text_get_size(&value_size, "100", &app_font_player_meta, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    int32_t track_w = BOARD_SCALE_PX(428) - value_size.x - BOARD_SCALE_PX(16) - BOARD_SCALE_PX(103);
+    if (track_w > BOARD_SCALE_PX(300)) track_w = BOARD_SCALE_PX(300);
+    if (track_w < BOARD_SCALE_PX(120)) track_w = BOARD_SCALE_PX(120);
+
+    volume_popup_value_label = lv_label_create(volume_popup);
+    lv_obj_add_style(volume_popup_value_label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(volume_popup_value_label, &app_font_player_meta, 0);
+    lv_obj_align(volume_popup_value_label, LV_ALIGN_RIGHT_MID, -BOARD_SCALE_PX(19), 0);
+    lv_label_set_text_fmt(volume_popup_value_label, "%d", (int) gui_player_get_volume_percent());
 
     volume_popup_track = lv_slider_create(volume_popup);
-    lv_obj_set_size(volume_popup_track, 360, SLIDER_TRACK_HEIGHT);
-    lv_obj_align(volume_popup_track, LV_ALIGN_RIGHT_MID, -20, 0);
+    lv_obj_set_size(volume_popup_track, track_w, SLIDER_TRACK_HEIGHT);
+    lv_obj_align(volume_popup_track, LV_ALIGN_LEFT_MID, BOARD_SCALE_PX(69), 0);
     lv_slider_set_range(volume_popup_track, 0, 100);
-    lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(volume_popup_track, lv_color_black(), LV_PART_MAIN);
     lv_obj_add_style(volume_popup_track, gui_theme_accent_style(), LV_PART_INDICATOR);
     lv_obj_add_style(volume_popup_track, gui_theme_accent_knob_style(), LV_PART_KNOB);
     configure_native_slider_rail(volume_popup_track);
+    lv_obj_set_style_bg_opa(volume_popup_track, LV_OPA_COVER, LV_PART_KNOB);
     lv_obj_set_style_width(volume_popup_track, SLIDER_KNOB_SIZE, LV_PART_KNOB);
     lv_obj_set_style_height(volume_popup_track, SLIDER_KNOB_SIZE, LV_PART_KNOB);
     lv_obj_add_event_cb(volume_popup_track, volume_popup_track_event_cb, LV_EVENT_ALL, NULL);
 
-    /* Stock uses a 390x60 volume control. Keep our rail unchanged visually,
-     * but give it the same forgiving vertical capture area for fast drags. */
+    /* Forgiving vertical capture area for fast drags; the hit test in
+     * gui_player_volume_control_hit_test() uses the same 24px margin. */
     lv_obj_set_ext_click_area(volume_popup_track, 24);
 
     volume_popup_hide_timer = lv_timer_create(volume_popup_hide_timer_cb, 1500, NULL);
@@ -2715,8 +2731,10 @@ void show_volume_popup(int32_t percent) {
      * snaps the knob back to the last applied value, then the next indev
      * sample jumps it forward again. */
     bool dragged = lv_slider_is_dragged(volume_popup_track);
-    if (!dragged)
+    if (!dragged) {
         lv_slider_set_value(volume_popup_track, percent, LV_ANIM_OFF);
+        if (volume_popup_value_label) lv_label_set_text_fmt(volume_popup_value_label, "%d", (int) percent);
+    }
     lv_obj_remove_flag(volume_popup, LV_OBJ_FLAG_HIDDEN);
     if (volume_popup_hide_timer && !dragged) {
         lv_timer_reset(volume_popup_hide_timer);
@@ -4145,7 +4163,7 @@ void gui_player_teardown(void) {
     }
     if (volume_popup) { lv_obj_delete(volume_popup); volume_popup = NULL; }
     volume_popup_speaker_icon = NULL;
-    asset_decoded_image_close(&volume_popup_bg_image);
+    volume_popup_value_label = NULL;
     asset_decoded_image_close(&volume_popup_speaker_image);
     volume_popup_track = NULL;
     gui_popup_teardown(&delete_song_popup);
@@ -4186,13 +4204,9 @@ void gui_player_teardown(void) {
 void gui_player_refresh_static_assets(void) {
     refresh_play_btn_icon();
     if (!volume_popup) return;
-    asset_decoded_image_close(&volume_popup_bg_image);
     asset_decoded_image_close(&volume_popup_speaker_image);
-    const void * bg = asset_decoded_image_open(&volume_popup_bg_image, "volume/bg.png")
-                    ? asset_decoded_image_source(&volume_popup_bg_image) : NULL;
     const void * speaker = asset_decoded_image_open(&volume_popup_speaker_image, "volume/vol.png")
                          ? asset_decoded_image_source(&volume_popup_speaker_image) : NULL;
-    lv_obj_set_style_bg_image_src(volume_popup, bg ? bg : asset_path("volume/bg.png"), 0);
     if (volume_popup_speaker_icon)
         lv_image_set_src(volume_popup_speaker_icon, speaker ? speaker : asset_path("volume/vol.png"));
 }

@@ -26,7 +26,29 @@ static atomic_bool refresh_done;
 static bool refresh_ok;
 static char refresh_root[PATH_MAX];
 
-bool playlist_files_reconcile(const char * root) {
+/* A scan that fails anywhere (missing Playlists folder, one unreadable
+ * entry) never publishes its partial result, but it must not keep showing
+ * playlists that were deleted, moved or renamed either: drop only cached
+ * entries whose file is confirmed gone. */
+static void prune_missing_playlists(void) {
+    char ** old = NULL;
+    int old_count = 0;
+    path_cache_load(PATH_CACHE_PLAYLISTS, &old, &old_count);
+    int kept = 0;
+    for (int i = 0; i < old_count; i++) {
+        struct stat st;
+        if (stat(old[i], &st) != 0 && errno == ENOENT) {
+            free(old[i]);
+            continue;
+        }
+        old[kept++] = old[i];
+    }
+    if (kept != old_count) path_cache_replace(PATH_CACHE_PLAYLISTS, old, kept);
+    for (int i = 0; i < kept; i++) free(old[i]);
+    free(old);
+}
+
+bool playlist_files_reconcile(const char * root, bool prune_missing) {
     char ** paths = NULL;
     int count = 0;
     pthread_mutex_lock(&playlist_files_mutex);
@@ -40,6 +62,8 @@ bool playlist_files_reconcile(const char * root) {
         if (changed) path_cache_replace(PATH_CACHE_PLAYLISTS, paths, count);
         for (int i = 0; i < old_count; i++) free(old[i]);
         free(old);
+    } else if (prune_missing) {
+        prune_missing_playlists();
     }
     for (int i = 0; i < count; i++) free(paths[i]);
     free(paths);
@@ -49,7 +73,7 @@ bool playlist_files_reconcile(const char * root) {
 
 static void * refresh_worker(void * unused) {
     (void) unused;
-    refresh_ok = playlist_files_reconcile(refresh_root);
+    refresh_ok = playlist_files_reconcile(refresh_root, true);
     atomic_store(&refresh_done, true);
     return NULL;
 }
@@ -66,11 +90,12 @@ void playlist_files_refresh_async(const char * root) {
     pthread_attr_destroy(&attr);
 }
 
-bool playlist_files_refresh_poll(void) {
+bool playlist_files_refresh_poll(bool * out_ok) {
     if (!refresh_running || !atomic_load(&refresh_done)) return false;
     pthread_join(refresh_thread, NULL);
     refresh_running = false;
-    return refresh_ok;
+    if (out_ok) *out_ok = refresh_ok;
+    return true;
 }
 
 bool playlist_files_has_active_write(void) {

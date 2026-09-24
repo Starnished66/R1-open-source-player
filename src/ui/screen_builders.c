@@ -545,6 +545,28 @@ void align_screen_header_action(lv_obj_t * action, int32_t right_inset) {
     lv_obj_set_style_translate_y(action, lv_pct(-50), 0);
 }
 
+/* Same glyph, accent color and font as the Remote Control PIN refresh icon,
+ * placed like the Wi-Fi/Bluetooth Rescan action. The glyph is small, so its
+ * touch area is widened. */
+lv_obj_t * build_header_refresh_action(lv_obj_t * scr, lv_event_cb_t click_cb) {
+    lv_obj_t * icon = lv_label_create(scr);
+    lv_label_set_text(icon, LV_SYMBOL_REFRESH);
+    lv_obj_set_style_text_font(icon, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    align_screen_header_action(icon, 20);
+    lv_obj_set_ext_click_area(icon, BOARD_SCALE_PX(20));
+    if (click_cb) lv_obj_add_event_cb(icon, click_cb, LV_EVENT_CLICKED, NULL);
+    set_header_refresh_action_busy(icon, false);
+    return icon;
+}
+
+/* Greyed out and not clickable while its refresh runs. */
+void set_header_refresh_action_busy(lv_obj_t * icon, bool busy) {
+    if (!icon) return;
+    lv_obj_set_style_text_color(icon, busy ? lv_color_make(160, 160, 160) : accent_lv_color(), 0);
+    if (busy) lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE);
+    else lv_obj_add_flag(icon, LV_OBJ_FLAG_CLICKABLE);
+}
+
 lv_obj_t * build_top_right_icon_button(lv_obj_t * scr, const char * icon_asset, lv_event_cb_t click_cb) {
     lv_obj_t * btn = build_header_icon_button(scr, icon_asset, LV_ALIGN_TOP_RIGHT, click_cb);
     /* Some screens add their action after the shared header was built. */

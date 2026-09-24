@@ -225,6 +225,10 @@ lv_obj_t * build_header_back_button(lv_obj_t * scr, lv_event_cb_t cb);
 /* Align existing text actions/switches by their actual height, not an
  * assumed font or asset size. Position remains centered when size changes. */
 void align_screen_header_action(lv_obj_t * action, int32_t right_inset);
+/* Top-right refresh glyph (LV_SYMBOL_REFRESH, accent color) for list screens
+ * whose contents come from a cached scan; busy greys it out and blocks taps. */
+lv_obj_t * build_header_refresh_action(lv_obj_t * scr, lv_event_cb_t click_cb);
+void set_header_refresh_action_busy(lv_obj_t * icon, bool busy);
 /* Returns the title label. Optional trailing action reserves its hitbox. */
 lv_obj_t * build_screen_header(lv_obj_t * scr, const char * title, lv_event_cb_t back_cb,
                               const char * trailing_asset, lv_event_cb_t trailing_cb);

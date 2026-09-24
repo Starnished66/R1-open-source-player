@@ -43,6 +43,7 @@ extern void show_info_toast(const char * msg);
 static lv_obj_t * books_screen = NULL;
 
 static void rescan_books(void);
+static void populate_books_files_screen(void);
 
 static char * text_reader_current_content = NULL; /* owned; replaced (freed) on every new file opened */
 static char text_reader_current_path[600] = ""; /* the currently open book's path -- what the favorite icon below toggles */
@@ -130,41 +131,89 @@ static void * books_scan_worker(void * arg) {
     return NULL;
 }
 
-static bool books_scan_txt_files_with_timeout(const char * root, char *** out_paths, int * out_count) {
+/* Starts a detached scan of root. The worker owns the returned item until
+ * done is set; a caller that stops waiting before then must leak it (see
+ * scan_all_songs_with_timeout()'s own comment). NULL if it could not start. */
+static books_scan_work_t * books_scan_start(const char * root) {
     books_scan_work_t * w = calloc(1, sizeof(*w));
+    if (!w) return NULL;
     snprintf(w->root, sizeof(w->root), "%s", root);
 
     pthread_t thread;
     if (pthread_create(&thread, NULL, books_scan_worker, w) != 0) {
         free(w);
-        return false;
+        return NULL;
     }
-    pthread_detach(thread); /* never joined either way -- see scan_all_songs_with_timeout()'s own comment */
+    pthread_detach(thread);
+    return w;
+}
 
-    for (int waited_ms = 0; waited_ms < BOOKS_SCAN_TIMEOUT_MS; waited_ms += 20) {
-        if (atomic_load_explicit(&w->done, memory_order_acquire)) {
-            bool ok = w->ok;
-            *out_paths = w->paths;
-            *out_count = w->count;
-            free(w);
-            return ok;
-        }
-        usleep(20000);
-    }
-
-    fprintf(stderr, "Warning: timed out scanning %s for .txt files (possible filesystem corruption) -- treating as empty\n", root);
-    return false;
+/* Publishes a finished scan to the book cache and frees it. A scan that
+ * found no .txt files (including a missing Books folder) clears the list. */
+static void books_scan_commit(books_scan_work_t * w) {
+    metadata_db_book_replace_all(w->paths, w->count);
+    for (int i = 0; i < w->count; i++) free(w->paths[i]);
+    free(w->paths);
+    free(w);
 }
 
 static void rescan_books(void) {
-    char ** paths = NULL;
-    int count = 0;
-    books_scan_txt_files_with_timeout(BOOKS_ROOT_DIR, &paths, &count);
+    books_scan_work_t * w = books_scan_start(BOOKS_ROOT_DIR);
+    for (int waited_ms = 0; w && waited_ms < BOOKS_SCAN_TIMEOUT_MS; waited_ms += 20) {
+        if (atomic_load_explicit(&w->done, memory_order_acquire)) {
+            books_scan_commit(w);
+            return;
+        }
+        usleep(20000);
+    }
+    if (w) fprintf(stderr, "Warning: timed out scanning %s for .txt files (possible filesystem corruption) -- treating as empty\n", BOOKS_ROOT_DIR);
+    metadata_db_book_replace_all(NULL, 0);
+}
 
-    metadata_db_book_replace_all(paths, count);
+/* Books screen refresh icon: the same scan as rescan_books(), polled from an
+ * LVGL timer so the UI thread never sleeps on the SD card. */
+#define BOOKS_REFRESH_POLL_MS 100
+static lv_obj_t * books_refresh_icon;
+static lv_timer_t * books_refresh_timer;
+static books_scan_work_t * books_refresh_work;
+static uint32_t books_refresh_started;
 
-    for (int i = 0; i < count; i++) free(paths[i]);
-    free(paths);
+static void books_refresh_finish(void) {
+    if (books_refresh_timer) { lv_timer_delete(books_refresh_timer); books_refresh_timer = NULL; }
+    books_refresh_work = NULL;
+    set_header_refresh_action_busy(books_refresh_icon, false);
+}
+
+static void books_refresh_timer_cb(lv_timer_t * timer) {
+    (void) timer;
+    books_scan_work_t * w = books_refresh_work;
+    if (!w) { books_refresh_finish(); return; }
+    if (atomic_load_explicit(&w->done, memory_order_acquire)) {
+        books_scan_commit(w);
+        books_refresh_finish();
+        if (lv_screen_active() == books_files_screen) populate_books_files_screen();
+        show_info_toast("Books refreshed");
+        return;
+    }
+    if (lv_tick_elaps(books_refresh_started) < BOOKS_SCAN_TIMEOUT_MS) return;
+    /* Same policy as rescan_books(); the worker still owns w. */
+    fprintf(stderr, "Warning: timed out scanning %s for .txt files (possible filesystem corruption) -- treating as empty\n", BOOKS_ROOT_DIR);
+    metadata_db_book_replace_all(NULL, 0);
+    books_refresh_finish();
+    if (lv_screen_active() == books_files_screen) populate_books_files_screen();
+    show_error_toast("Could not read the Books folder");
+}
+
+static void books_refresh_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || books_refresh_work) return;
+    books_refresh_work = books_scan_start(BOOKS_ROOT_DIR);
+    if (!books_refresh_work) {
+        show_error_toast("Could not refresh books");
+        return;
+    }
+    books_refresh_started = lv_tick_get();
+    books_refresh_timer = lv_timer_create(books_refresh_timer_cb, BOOKS_REFRESH_POLL_MS, NULL);
+    set_header_refresh_action_busy(books_refresh_icon, true);
 }
 
 static void free_user_data_event_cb(lv_event_t * e) {
@@ -243,6 +292,7 @@ static void books_favorites_row_cb(lv_event_t * e) {
 
 static lv_obj_t * build_books_files_screen(void) {
     lv_obj_t * scr = build_subsonic_list_screen("Books", &books_files_title_label, &books_files_list);
+    books_refresh_icon = build_header_refresh_action(scr, books_refresh_cb);
     return scr;
 }
 
@@ -338,6 +388,15 @@ bool gui_books_init(void) {
  * module owns so gui_books_init() can rebuild them from a clean slate
  * without leaking the old objects. */
 void gui_books_teardown(void) {
+    /* An in-flight refresh is abandoned: freed if already finished, else left
+     * to its detached worker. */
+    if (books_refresh_work && atomic_load_explicit(&books_refresh_work->done, memory_order_acquire)) {
+        for (int i = 0; i < books_refresh_work->count; i++) free(books_refresh_work->paths[i]);
+        free(books_refresh_work->paths);
+        free(books_refresh_work);
+    }
+    books_refresh_finish();
+    books_refresh_icon = NULL;
     if (books_files_screen) { lv_obj_delete(books_files_screen); books_files_screen = NULL; }
     if (text_reader_screen) { lv_obj_delete(text_reader_screen); text_reader_screen = NULL; }
     if (books_screen) { lv_obj_delete(books_screen); books_screen = NULL; }

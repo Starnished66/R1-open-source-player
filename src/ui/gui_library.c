@@ -150,6 +150,8 @@ static lv_obj_t * artist_albums_title_label = NULL;
 
 static lv_obj_t * playlists_screen = NULL;
 static lv_obj_t * playlists_list = NULL;
+static lv_obj_t * playlists_refresh_icon = NULL;
+static bool playlists_manual_refresh = false;
 
 static lv_obj_t * cue_tracks_screen = NULL;
 static lv_obj_t * cue_tracks_list = NULL;
@@ -427,7 +429,7 @@ static void set_album_disc_headers(const song_row_t * songs, int count,
     int previous_disc = effective_disc_number(&songs[0]);
     for (int i = 0; i < count; i++) {
         entries[i].disc_number = effective_disc_number(&songs[i]);
-        entries[i].show_disc_header = multi_disc && i > 0 && entries[i].disc_number != previous_disc;
+        entries[i].show_disc_header = multi_disc && (i == 0 || entries[i].disc_number != previous_disc);
         previous_disc = entries[i].disc_number;
     }
 }
@@ -3899,9 +3901,26 @@ static void populate_playlists_screen(void) {
     }
 }
 
+/* Rescans only the Playlists folder; gui_library_poll_playlists() reports
+ * the result and repopulates the list. */
+static void playlists_refresh_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || playlists_manual_refresh) return;
+#ifndef HOST_BUILD
+    if (!sd_card_root_is_mounted()) {
+        show_error_toast("SD card not available");
+        return;
+    }
+#endif
+    playlists_manual_refresh = true;
+    set_header_refresh_action_busy(playlists_refresh_icon, true);
+    playlist_files_refresh_async(PLAYLISTS_DIR);
+}
+
 static lv_obj_t * build_playlists_screen(void) {
     lv_obj_t * title_label;
     lv_obj_t * scr = build_subsonic_list_screen("Playlists", &title_label, &playlists_list);
+    playlists_refresh_icon = build_header_refresh_action(scr, playlists_refresh_cb);
+    set_header_refresh_action_busy(playlists_refresh_icon, playlists_manual_refresh);
 
     /* Explicit cross-axis centering scoped to this screen also keeps rows
      * correct if it is ever hosted in a parent narrower than the display. */
@@ -5785,7 +5804,7 @@ static bool artist_albums_show_all_songs(void) {
         int previous_disc = first_disc;
         for (int i = start; i < end; i++) {
             int disc = sort_entries[i].disc_number > 0 ? sort_entries[i].disc_number : 1;
-            sort_entries[i].show_disc_header = multi_disc && i > start && disc != previous_disc;
+            sort_entries[i].show_disc_header = multi_disc && (i == start || disc != previous_disc);
             previous_disc = disc;
         }
         start = end;
@@ -6321,6 +6340,7 @@ void gui_library_teardown(void) {
     if (artist_albums_screen) { lv_obj_delete(artist_albums_screen); artist_albums_screen = NULL; }
     library_teardown_diag("playlists_screen before");
     if (playlists_screen) { lv_obj_delete(playlists_screen); playlists_screen = NULL; }
+    playlists_refresh_icon = NULL;
     library_teardown_diag("cue_tracks_screen before");
     if (cue_tracks_screen) { lv_obj_delete(cue_tracks_screen); cue_tracks_screen = NULL; }
     library_teardown_diag("add_to_playlist_screen before");
@@ -6652,12 +6672,22 @@ void gui_library_poll_playlists(void) {
     bool visible = screen && (screen == playlists_screen || screen == add_to_playlist_screen);
     bool entered = visible && screen != last_screen;
     last_screen = screen;
-    if (playlist_files_refresh_poll() && visible) {
-        lv_obj_t * list = screen == playlists_screen ? playlists_list : add_to_playlist_list;
-        int32_t scroll = lv_obj_get_scroll_y(list);
-        if (screen == playlists_screen) populate_playlists_screen();
-        else populate_add_to_playlist_screen();
-        lv_obj_scroll_to_y(list, scroll, LV_ANIM_OFF);
+    bool refresh_ok = false;
+    if (playlist_files_refresh_poll(&refresh_ok)) {
+        /* A failed scan can still have pruned deleted playlists. */
+        if (visible) {
+            lv_obj_t * list = screen == playlists_screen ? playlists_list : add_to_playlist_list;
+            int32_t scroll = lv_obj_get_scroll_y(list);
+            if (screen == playlists_screen) populate_playlists_screen();
+            else populate_add_to_playlist_screen();
+            lv_obj_scroll_to_y(list, scroll, LV_ANIM_OFF);
+        }
+        if (playlists_manual_refresh) {
+            playlists_manual_refresh = false;
+            set_header_refresh_action_busy(playlists_refresh_icon, false);
+            if (refresh_ok) show_info_toast("Playlists refreshed");
+            else show_error_toast("Some playlists could not be read");
+        }
     }
     if (!backlight_screen_is_on()) return;
 #ifndef HOST_BUILD
@@ -6685,7 +6715,9 @@ void gui_library_poll_playlists(void) {
 }
 
 static void rescan_playlists(void) {
-    playlist_files_reconcile(PLAYLISTS_DIR);
+    /* Runs before library_scan_once()'s own mount check: never prune
+     * against an unmounted, empty mount point. */
+    playlist_files_reconcile(PLAYLISTS_DIR, sd_card_root_is_mounted());
 }
 
 

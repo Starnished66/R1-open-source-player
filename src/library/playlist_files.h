@@ -12,9 +12,16 @@ bool playlist_files_scan(const char * root, char *** out_paths, int * out_count)
 /* Recursive, complete scan: success includes an empty directory; failure
  * never publishes a partial result. Symlink directories are not followed. */
 bool playlist_files_scan_complete(const char * root, char *** out_paths, int * out_count);
+/* Background reconcile of the playlist cache against root. Callers must only
+ * start it while the card is mounted: a failed scan prunes cached playlists
+ * whose files are gone. */
 void playlist_files_refresh_async(const char * root);
-bool playlist_files_refresh_poll(void);
-bool playlist_files_reconcile(const char * root);
+/* True once a started refresh has finished (whatever its result); *out_ok
+ * reports whether the scan was complete. */
+bool playlist_files_refresh_poll(bool * out_ok);
+/* prune_missing: on a failed scan, drop cached playlists confirmed deleted.
+ * Pass false when the card may not be mounted. */
+bool playlist_files_reconcile(const char * root, bool prune_missing);
 bool playlist_files_rename(const char * path, const char * name, char * out, size_t size);
 /* Entry offsets count nonempty, non-comment lines, including unavailable files.
  * to < 0 removes exactly one occurrence; otherwise moves it before offset to. */

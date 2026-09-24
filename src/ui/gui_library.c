@@ -3901,6 +3901,14 @@ static void populate_playlists_screen(void) {
     }
 }
 
+/* A missing Playlists folder is recreated so the user always has one to use;
+ * a read-only card simply fails the mkdir. Callers check the card is mounted
+ * so an empty mount point never gets one. */
+static void ensure_playlists_dir(void) {
+    if (mkdir(PLAYLISTS_DIR, 0755) != 0 && errno != EEXIST)
+        DB_LOG("DB", "playlists_mkdir_failed errno=%d", errno);
+}
+
 /* Rescans only the Playlists folder; gui_library_poll_playlists() reports
  * the result and repopulates the list. */
 static void playlists_refresh_cb(lv_event_t * e) {
@@ -3911,6 +3919,7 @@ static void playlists_refresh_cb(lv_event_t * e) {
         return;
     }
 #endif
+    ensure_playlists_dir();
     playlists_manual_refresh = true;
     set_header_refresh_action_busy(playlists_refresh_icon, true);
     playlist_files_refresh_async(PLAYLISTS_DIR);
@@ -6715,9 +6724,11 @@ void gui_library_poll_playlists(void) {
 }
 
 static void rescan_playlists(void) {
-    /* Runs before library_scan_once()'s own mount check: never prune
-     * against an unmounted, empty mount point. */
-    playlist_files_reconcile(PLAYLISTS_DIR, sd_card_root_is_mounted());
+    /* Runs before library_scan_once()'s own mount check: never prune or
+     * create folders against an unmounted, empty mount point. */
+    bool mounted = sd_card_root_is_mounted();
+    if (mounted) ensure_playlists_dir();
+    playlist_files_reconcile(PLAYLISTS_DIR, mounted);
 }
 
 

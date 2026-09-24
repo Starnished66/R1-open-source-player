@@ -36,6 +36,7 @@ extern int subprocess_run(char * const argv[], char ** out_output, int timeout_s
 #include <stdatomic.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 
 typedef enum {
@@ -2161,6 +2162,7 @@ static bool usb_cable_state_initialized;
 static bool usb_cable_was_connected;
 static bool usb_storage_rebind_pending;
 static usb_storage_session_t usb_storage_session;
+static void flush_sd_view_after_usb_storage(void);
 static uint32_t usb_storage_host_check_tick;
 
 static void usb_mode_option_row_cb(lv_event_t * e);
@@ -2327,6 +2329,10 @@ void poll_usb_mode_switch(void) {
         return;
     }
 
+    /* Leaving Storage while the PC is still attached ends its access too. */
+    if (current_settings.usb_mode == (int) USB_MODE_STORAGE && usb_mode_switch_target != USB_MODE_STORAGE &&
+        usb_storage_session.host_seen)
+        flush_sd_view_after_usb_storage();
     current_settings.usb_mode = (int) usb_mode_switch_target;
     settings_save(&current_settings);
     /* Process-lifetime truth for "the DAC overlay owns the UI", as opposed to
@@ -2378,6 +2384,22 @@ void poll_usb_mode_switch(void) {
  * switching to DAC/ADB and back, because those taps happened to perform the
  * missing UDC bind. Reapply Storage on every physical connection edge so a
  * PC enumerates it immediately. Never override an active DAC/ADB session. */
+/* The card stays mounted here while a PC writes it over USB storage, so the
+ * kernel keeps cached names for folders and files the PC renamed or deleted:
+ * a renamed Playlists folder still opened by its old name, listing files that
+ * then failed to open. Once the PC is done, write back anything the player
+ * wrote and drop the unused dentry/inode caches so every later lookup reads
+ * the card again. No unmount; in-use entries are left alone by the kernel. */
+static void flush_sd_view_after_usb_storage(void) {
+#ifndef HOST_BUILD
+    sync();
+    int fd = open("/proc/sys/vm/drop_caches", O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    if (write(fd, "2", 1) != 1) fprintf(stderr, "[usb] drop_caches failed after storage session\n");
+    close(fd);
+#endif
+}
+
 void poll_usb_storage_hotplug(void) {
     battery_external_power_state_t power = battery_get_external_power_state();
     /* A failed power-supply read is not an unplug. Preserve both the cable
@@ -2407,6 +2429,7 @@ void poll_usb_storage_hotplug(void) {
     usb_cable_was_connected = connected;
     if (!storage_was_active && gui_network_usb_storage_session_active())
         gui_library_suspend_boot_prompt();
+    if (storage_session_ended) flush_sd_view_after_usb_storage();
     /* Not while the device is a USB sound card. host_seen latches for the
      * whole cable session, so a Storage phase before the user switched to
      * DAC (poll_usb_storage_hotplug() force-binds Storage on every fresh

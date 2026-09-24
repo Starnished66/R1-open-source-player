@@ -36,6 +36,14 @@ static lv_obj_t * queue_actions, * queue_actions_backdrop;
 static void queue_actions_open(lv_event_t * e);
 static int displayed_current = -1;
 
+bool gui_queue_boot_prompt_blocked(void) {
+    return (queue_actions && !lv_obj_has_flag(queue_actions, LV_OBJ_FLAG_HIDDEN)) ||
+           (queue_actions_backdrop && !lv_obj_has_flag(queue_actions_backdrop, LV_OBJ_FLAG_HIDDEN)) ||
+           (song_context_menu_popup && !lv_obj_has_flag(song_context_menu_popup, LV_OBJ_FLAG_HIDDEN)) ||
+           (song_context_menu_popup_backdrop &&
+            !lv_obj_has_flag(song_context_menu_popup_backdrop, LV_OBJ_FLAG_HIDDEN));
+}
+
 static void queue_row_click_cb(lv_event_t * e) {
     if (!gui_player_queue_select(displayed_revision, (int) (intptr_t) lv_event_get_user_data(e)))
         show_error_toast("Queue changed. Try again.");

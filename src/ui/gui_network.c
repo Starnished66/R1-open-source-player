@@ -2237,6 +2237,7 @@ static bool launch_usb_mode_switch(void) {
  * ends up showing a state nothing is working toward. */
 bool start_usb_mode_switch(usb_mode_t target) {
     if (usb_mode_switch_active) return false;
+    gui_library_suspend_boot_prompt();
     usb_mode_switch_target = target;
     usb_mode_switch_active = true;
     /* Preserve the explicit request without letting gadget teardown race a
@@ -2390,6 +2391,7 @@ void poll_usb_storage_hotplug(void) {
         usb_storage_host_check_tick = lv_tick_get();
         storage_configured = usb_mode_control_storage_host_configured();
     }
+    bool storage_was_active = gui_network_usb_storage_session_active();
     bool storage_session_ended = usb_storage_session_poll(&usb_storage_session,
                                                           connected, storage_configured);
     if (!usb_cable_state_initialized) {
@@ -2403,6 +2405,8 @@ void poll_usb_storage_hotplug(void) {
         usb_storage_rebind_pending = true;
     }
     usb_cable_was_connected = connected;
+    if (!storage_was_active && gui_network_usb_storage_session_active())
+        gui_library_suspend_boot_prompt();
     /* Not while the device is a USB sound card. host_seen latches for the
      * whole cable session, so a Storage phase before the user switched to
      * DAC (poll_usb_storage_hotplug() force-binds Storage on every fresh
@@ -2414,7 +2418,7 @@ void poll_usb_storage_hotplug(void) {
      * is picked up by the next ordinary rescan trigger or a manual one from
      * Settings. */
     if (storage_session_ended && !usb_dac_mode_active && gui_library_auto_rescan_enabled()) {
-        start_library_auto_rescan();
+        gui_library_request_files_changed_prompt();
     }
 
     if (!connected || !usb_storage_rebind_pending || usb_mode_switch_active) return;
@@ -4056,3 +4060,17 @@ lv_obj_t * gui_network_get_usb_dac_overlay(void) { return usb_dac_overlay_screen
 
 bool gui_network_usb_dac_mode_active(void) { return usb_dac_mode_active; }
 lv_obj_t * gui_network_get_import_wifi_screen(void) { return import_wifi_screen; }
+
+bool gui_network_usb_prompt_invalidated(void) {
+    /* Check the live UDC state so a confirm click between polls cannot race
+     * a newly-configured USB storage host. */
+    return usb_mode_switch_active || usb_mode_switch_queued || usb_bridge_restart_active ||
+           usb_dac_mode_active || gui_network_usb_storage_session_active() ||
+           usb_mode_control_storage_host_configured();
+}
+
+bool gui_network_boot_prompt_blocked(void) {
+    lv_obj_t * active = lv_screen_active();
+    return gui_network_usb_prompt_invalidated() || active == bt_dac_screen || active == bt_dac_overlay_screen ||
+           active == usb_dac_overlay_screen || active == airplay_overlay_screen;
+}

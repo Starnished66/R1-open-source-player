@@ -3,6 +3,7 @@
 #include "gui.h"
 #include "screen_builders.h"
 #include <stdio.h>
+#include <string.h>
 
 /* Error toast */
 static lv_obj_t * error_toast = NULL;
@@ -19,6 +20,7 @@ static uint32_t gui_busy_current_token = 0;
 static lv_obj_t * gui_busy_screen = NULL;
 static lv_obj_t * gui_busy_label = NULL;
 static lv_obj_t * gui_busy_progress_bar = NULL;
+static lv_obj_t * gui_busy_detail_label = NULL;
 
 extern void nav_push(lv_obj_t * screen);
 extern void nav_pop(void);
@@ -110,6 +112,11 @@ void show_info_toast_for(const char * msg, uint32_t duration_ms) {
     lv_timer_resume(info_toast_hide_timer);
 }
 
+bool gui_notifications_toast_visible(void) {
+    return (error_toast && !lv_obj_has_flag(error_toast, LV_OBJ_FLAG_HIDDEN)) ||
+           (info_toast && !lv_obj_has_flag(info_toast, LV_OBJ_FLAG_HIDDEN));
+}
+
 gui_busy_handle_t gui_busy_show(const char * title, const char * msg) {
     gui_busy_current_token++;
     if (!gui_busy_screen) {
@@ -126,6 +133,15 @@ gui_busy_handle_t gui_busy_show(const char * title, const char * msg) {
         lv_obj_align(gui_busy_progress_bar, LV_ALIGN_CENTER, 0, BOARD_SCALE_PX(30));
         lv_bar_set_range(gui_busy_progress_bar, 0, 100);
         lv_obj_add_style(gui_busy_progress_bar, gui_theme_accent_style(), LV_PART_INDICATOR);
+
+        /* Optional status line under the bar (e.g. scan phase and counts). */
+        gui_busy_detail_label = lv_label_create(gui_busy_screen);
+        lv_obj_add_style(gui_busy_detail_label, &style_theme_text_muted, 0);
+        lv_obj_set_style_text_font(gui_busy_detail_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+        lv_obj_set_style_text_align(gui_busy_detail_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(gui_busy_detail_label, BOARD_SCALE_PX(280));
+        lv_label_set_long_mode(gui_busy_detail_label, LV_LABEL_LONG_WRAP);
+        lv_obj_align_to(gui_busy_detail_label, gui_busy_progress_bar, LV_ALIGN_OUT_BOTTOM_MID, 0, BOARD_SCALE_PX(16));
     }
     
     if (msg && msg[0] != '\0') {
@@ -134,6 +150,8 @@ gui_busy_handle_t gui_busy_show(const char * title, const char * msg) {
         lv_label_set_text(gui_busy_label, title);
     }
     lv_obj_add_flag(gui_busy_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(gui_busy_detail_label, "");
+    lv_obj_add_flag(gui_busy_detail_label, LV_OBJ_FLAG_HIDDEN);
     
     if (lv_screen_active() != gui_busy_screen) {
         nav_push(gui_busy_screen);
@@ -145,6 +163,16 @@ void gui_busy_set_progress(gui_busy_handle_t handle, int percent) {
     if (handle != gui_busy_current_token || !gui_busy_screen) return;
     lv_obj_remove_flag(gui_busy_progress_bar, LV_OBJ_FLAG_HIDDEN);
     lv_bar_set_value(gui_busy_progress_bar, percent, LV_ANIM_OFF);
+}
+
+void gui_busy_set_detail(gui_busy_handle_t handle, const char * text) {
+    if (handle != gui_busy_current_token || !gui_busy_screen) return;
+    if (!text || text[0] == '\0') {
+        lv_obj_add_flag(gui_busy_detail_label, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    if (strcmp(lv_label_get_text(gui_busy_detail_label), text) != 0) lv_label_set_text(gui_busy_detail_label, text);
+    lv_obj_remove_flag(gui_busy_detail_label, LV_OBJ_FLAG_HIDDEN);
 }
 
 void gui_busy_hide(gui_busy_handle_t handle) {

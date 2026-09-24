@@ -1,6 +1,9 @@
 #include "gui_navigation.h"
 #include "gui_library.h"
 #include "gui_network.h"
+#include "gui_shell.h"
+#include "gui_lock_screen.h"
+#include "gui_queue.h"
 #include "assets.h"
 #include "idle_shutdown.h"
 #include "backlight.h"
@@ -90,6 +93,11 @@ static gui_busy_handle_t library_rescan_token = 0;
 static gui_busy_handle_t sd_format_token = 0;
 static atomic_int library_scan_progress_total = 0;
 static atomic_int library_scan_progress_done = 0;
+/* Directory entries visited so far by the discovery walk (before _total is known). */
+static atomic_int library_scan_walk_items = 0;
+/* Which step the busy screen describes; set by the scan worker. */
+enum { LIBRARY_SCAN_PHASE_WALK, LIBRARY_SCAN_PHASE_TAGS, LIBRARY_SCAN_PHASE_SAVE };
+static atomic_int library_scan_phase = LIBRARY_SCAN_PHASE_WALK;
 static atomic_bool library_scan_cancel_requested = false;
 void gui_library_cancel_scan(void);
 
@@ -4025,6 +4033,330 @@ static metadata_db_load_outcome_t combine_load_outcomes(metadata_db_load_outcome
 /* Cache reports are owned by the UI thread. */
 static metadata_db_load_outcome_t library_cache_load_outcome;
 static bool library_cache_load_pending;
+/* "Library loaded" is shown only for an SD hot swap, not at boot. */
+static bool library_cache_load_announce_loaded;
+static uint32_t library_cache_load_card_generation;
+static uint32_t library_cache_load_generation;
+static uint32_t library_prompt_card_generation;
+static uint32_t library_boot_ready_tick;
+static bool library_boot_ready_tick_set;
+static bool boot_warmup_requested;
+static bool boot_warmup_pending;
+
+typedef enum {
+    LIBRARY_PROMPT_NONE,
+    LIBRARY_PROMPT_NO_DATABASE,
+    LIBRARY_PROMPT_LOAD_FAILED,
+    LIBRARY_PROMPT_FILES_CHANGED,
+} library_prompt_reason_t;
+
+typedef enum {
+    LIBRARY_PROMPT_REQUEST_NONE,
+    LIBRARY_PROMPT_REQUEST_PENDING,
+    LIBRARY_PROMPT_REQUEST_VISIBLE,
+} library_prompt_request_state_t;
+
+typedef struct {
+    library_prompt_reason_t reason;
+    library_prompt_request_state_t state;
+    uint32_t card_generation;
+    uint32_t load_generation;
+} library_prompt_request_t;
+
+typedef enum {
+    LIBRARY_PROMPT_CARD_CURRENT,
+    LIBRARY_PROMPT_CARD_CHANGED,
+    LIBRARY_PROMPT_CARD_UNKNOWN,
+} library_prompt_card_status_t;
+
+static library_prompt_request_t library_prompt_request;
+static library_prompt_request_t library_prompt_queued_request;
+static gui_popup_t library_update_prompt_popup;
+static lv_obj_t * library_update_prompt_title;
+static lv_obj_t * library_update_prompt_body;
+static lv_obj_t * library_update_prompt_confirm_label;
+
+static library_prompt_card_status_t library_prompt_card_status(void);
+static void library_prompt_prepare_cache_load_card(void);
+static void library_update_prompt_confirm_cb(lv_event_t * e);
+static void library_update_prompt_later_cb(lv_event_t * e);
+static void library_update_prompt_backdrop_cb(lv_event_t * e);
+static void library_prompt_requeue_visible(void);
+
+static bool library_prompt_request_is_current(const library_prompt_request_t * request) {
+    if (!request || request->state == LIBRARY_PROMPT_REQUEST_NONE ||
+        request->card_generation != library_prompt_card_generation) return false;
+    if (request->reason == LIBRARY_PROMPT_FILES_CHANGED) return true;
+    if (request->load_generation != library_cache_load_generation) return false;
+    if (request->reason == LIBRARY_PROMPT_NO_DATABASE)
+        return library_cache_load_outcome == METADATA_DB_LOAD_SUCCESS_FRESH;
+    if (request->reason == LIBRARY_PROMPT_LOAD_FAILED)
+        return library_cache_load_outcome == METADATA_DB_LOAD_FAILED;
+    return false;
+}
+
+static void library_prompt_clear_request(library_prompt_request_t * request) {
+    memset(request, 0, sizeof(*request));
+}
+
+static void library_prompt_activate_queued_request(void) {
+    if (library_prompt_request.state != LIBRARY_PROMPT_REQUEST_NONE ||
+        library_prompt_queued_request.state == LIBRARY_PROMPT_REQUEST_NONE) return;
+    library_prompt_request = library_prompt_queued_request;
+    library_prompt_clear_request(&library_prompt_queued_request);
+}
+
+static void library_prompt_queue_request(const library_prompt_request_t * request) {
+    if (library_prompt_queued_request.reason == LIBRARY_PROMPT_FILES_CHANGED &&
+        request->reason != LIBRARY_PROMPT_FILES_CHANGED) return;
+    library_prompt_queued_request = *request;
+}
+
+static void library_prompt_enqueue(library_prompt_reason_t reason, uint32_t card_generation) {
+    library_prompt_request_t request = {
+        .reason = reason,
+        .state = LIBRARY_PROMPT_REQUEST_PENDING,
+        .card_generation = card_generation,
+        .load_generation = library_cache_load_generation,
+    };
+    if (library_prompt_request.state == LIBRARY_PROMPT_REQUEST_VISIBLE) {
+        if (library_prompt_request.reason == LIBRARY_PROMPT_FILES_CHANGED &&
+            reason == LIBRARY_PROMPT_FILES_CHANGED) return;
+        library_prompt_queue_request(&request);
+    } else if (library_prompt_request.state == LIBRARY_PROMPT_REQUEST_PENDING &&
+               library_prompt_request.reason == LIBRARY_PROMPT_FILES_CHANGED &&
+               reason != LIBRARY_PROMPT_FILES_CHANGED) {
+        library_prompt_queue_request(&request);
+    } else {
+        library_prompt_request = request;
+        library_prompt_clear_request(&library_prompt_queued_request);
+    }
+}
+
+static void library_prompt_drop_all(void) {
+    gui_popup_hide(&library_update_prompt_popup);
+    library_prompt_clear_request(&library_prompt_request);
+    library_prompt_clear_request(&library_prompt_queued_request);
+}
+
+void gui_library_invalidate_boot_prompt(void) {
+    library_prompt_drop_all();
+}
+
+void gui_library_suspend_boot_prompt(void) {
+    library_prompt_requeue_visible();
+}
+
+static void library_prompt_card_changed(void) {
+    library_prompt_card_generation++;
+    boot_warmup_pending = false;
+    library_prompt_drop_all();
+}
+
+void gui_library_request_files_changed_prompt(void) {
+    library_prompt_card_status_t card_status = library_prompt_card_status();
+    if (card_status == LIBRARY_PROMPT_CARD_CHANGED) {
+        library_prompt_card_changed();
+        return;
+    }
+    library_prompt_enqueue(LIBRARY_PROMPT_FILES_CHANGED, library_prompt_card_generation);
+}
+
+static bool library_prompt_has_manual_overlay(void) {
+    return az_index_dragging ||
+           (az_index_active_binding && az_index_active_binding->popup &&
+            !lv_obj_has_flag(az_index_active_binding->popup, LV_OBJ_FLAG_HIDDEN)) ||
+           (playlist_start_popup && !lv_obj_has_flag(playlist_start_popup, LV_OBJ_FLAG_HIDDEN)) ||
+           (playlist_start_backdrop && !lv_obj_has_flag(playlist_start_backdrop, LV_OBJ_FLAG_HIDDEN)) ||
+           (playlist_context_menu_popup &&
+            !lv_obj_has_flag(playlist_context_menu_popup, LV_OBJ_FLAG_HIDDEN)) ||
+           (playlist_context_menu_backdrop &&
+            !lv_obj_has_flag(playlist_context_menu_backdrop, LV_OBJ_FLAG_HIDDEN)) ||
+           (collection_menu_popup && !lv_obj_has_flag(collection_menu_popup, LV_OBJ_FLAG_HIDDEN)) ||
+           (collection_menu_backdrop && !lv_obj_has_flag(collection_menu_backdrop, LV_OBJ_FLAG_HIDDEN)) ||
+           (album_collection_menu_popup && !lv_obj_has_flag(album_collection_menu_popup, LV_OBJ_FLAG_HIDDEN)) ||
+           (album_collection_menu_backdrop &&
+            !lv_obj_has_flag(album_collection_menu_backdrop, LV_OBJ_FLAG_HIDDEN));
+}
+
+#define BOOT_SETTLE_MS 8000
+static bool library_prompt_environment_idle(void) {
+    if (!library_boot_ready_tick_set || lv_tick_elaps(library_boot_ready_tick) < BOOT_SETTLE_MS ||
+        !backlight_screen_is_on() || gui_navigation_transition_in_progress() ||
+        lv_screen_active() == gui_busy_get_screen() || gui_library_navigation_blocked() ||
+        gui_network_boot_prompt_blocked() || gui_shell_boot_prompt_blocked() ||
+        gui_lock_screen_is_showing() || gui_player_boot_prompt_blocked() ||
+        gui_queue_boot_prompt_blocked() || library_prompt_has_manual_overlay() ||
+        gui_notifications_toast_visible()) return false;
+
+    lv_obj_t * active = lv_screen_active();
+    if (t9_keypad_is_inline_active() ||
+        (gui_text_input_get_screen() && active == gui_text_input_get_screen()) ||
+        (gui_network_get_import_wifi_screen() && active == gui_network_get_import_wifi_screen())) return false;
+
+    return gui_popup_visible_count() == 0;
+}
+
+/* A visible prompt yields only to something that takes over the screen.
+ * Touches on the prompt itself latch the shell's gesture candidates, and a
+ * toast can appear under it, so the settle checks above do not apply. */
+static bool library_prompt_taken_over(void) {
+    return !backlight_screen_is_on() || lv_screen_active() == gui_busy_get_screen() ||
+           gui_lock_screen_is_showing() || gui_network_boot_prompt_blocked() ||
+           gui_popup_visible_count() != 1;
+}
+
+static void library_prompt_update_labels(library_prompt_reason_t reason) {
+    switch (reason) {
+        case LIBRARY_PROMPT_NO_DATABASE:
+            lv_label_set_text(library_update_prompt_title, "No music database");
+            lv_label_set_text(library_update_prompt_body,
+                              "Build it now? Large libraries can take several minutes.");
+            lv_label_set_text(library_update_prompt_confirm_label, "Build");
+            break;
+        case LIBRARY_PROMPT_LOAD_FAILED:
+            lv_label_set_text(library_update_prompt_title, "Music database unavailable");
+            lv_label_set_text(library_update_prompt_body, "It could not be loaded. Rebuild it now?");
+            lv_label_set_text(library_update_prompt_confirm_label, "Rebuild");
+            break;
+        case LIBRARY_PROMPT_FILES_CHANGED:
+            lv_label_set_text(library_update_prompt_title, "Update music database?");
+            lv_label_set_text(library_update_prompt_body, "Files on the card may have changed.");
+            lv_label_set_text(library_update_prompt_confirm_label, "Update");
+            break;
+        case LIBRARY_PROMPT_NONE:
+            break;
+    }
+}
+
+static void library_update_prompt_close(bool show_settings_toast) {
+    gui_popup_hide(&library_update_prompt_popup);
+    library_prompt_clear_request(&library_prompt_request);
+    library_prompt_activate_queued_request();
+
+    if (!show_settings_toast) return;
+    show_info_toast("Use Settings > Update Music Database");
+}
+
+/* The settle checks only decide when to show the prompt. Once the user taps
+ * the action, revalidate what makes the scan unsafe or stale; the tap's own
+ * press still has the shell's gesture candidates latched at this point. */
+static bool library_prompt_can_run_action(const library_prompt_request_t * request) {
+    return library_prompt_request_is_current(request) &&
+           library_prompt_card_status() == LIBRARY_PROMPT_CARD_CURRENT &&
+           !gui_library_navigation_blocked() && !gui_network_usb_prompt_invalidated();
+}
+
+static void library_update_prompt_confirm_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED ||
+        !gui_popup_is_visible(&library_update_prompt_popup)) return;
+    library_prompt_request_t handled = library_prompt_request;
+    gui_popup_hide(&library_update_prompt_popup);
+    library_prompt_clear_request(&library_prompt_request);
+    if (!library_prompt_can_run_action(&handled)) {
+        library_prompt_card_status_t card_status = library_prompt_card_status();
+        if (card_status == LIBRARY_PROMPT_CARD_CHANGED) library_prompt_card_changed();
+        else if (gui_library_navigation_blocked())
+            library_prompt_drop_all();
+        else if (library_prompt_request_is_current(&handled)) {
+            handled.state = LIBRARY_PROMPT_REQUEST_PENDING;
+            library_prompt_request = handled;
+        }
+        return;
+    }
+    if (handled.reason == LIBRARY_PROMPT_LOAD_FAILED) start_library_rescan();
+    else start_library_auto_rescan();
+}
+
+static void library_update_prompt_later_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    library_update_prompt_close(true);
+}
+
+static void library_update_prompt_backdrop_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    library_update_prompt_close(true);
+}
+
+static void build_library_update_prompt_popup(void) {
+    library_update_prompt_popup.popup = build_confirm_popup_with_labels(
+        "", LV_LABEL_LONG_WRAP, &library_update_prompt_title, "", &library_update_prompt_body,
+        "", &library_update_prompt_confirm_label, accent_lv_color(), library_update_prompt_confirm_cb, NULL,
+        "Later", lv_color_white(), library_update_prompt_later_cb, NULL,
+        library_update_prompt_backdrop_cb, &library_update_prompt_popup.backdrop);
+}
+
+static void library_prompt_requeue_visible(void) {
+    if (!gui_popup_is_visible(&library_update_prompt_popup)) return;
+    gui_popup_hide(&library_update_prompt_popup);
+    if (library_prompt_request_is_current(&library_prompt_request))
+        library_prompt_request.state = LIBRARY_PROMPT_REQUEST_PENDING;
+    else
+        library_prompt_clear_request(&library_prompt_request);
+}
+
+void gui_library_boot_ready(uint32_t tick) {
+    if (library_boot_ready_tick_set) return;
+    library_boot_ready_tick = tick;
+    library_boot_ready_tick_set = true;
+}
+
+void gui_library_poll_boot_prompt(void) {
+    bool has_request = library_prompt_request.state != LIBRARY_PROMPT_REQUEST_NONE ||
+                       library_prompt_queued_request.state != LIBRARY_PROMPT_REQUEST_NONE;
+    library_prompt_card_status_t card_status = LIBRARY_PROMPT_CARD_CURRENT;
+    if (has_request || boot_warmup_pending) card_status = library_prompt_card_status();
+    if ((has_request || boot_warmup_pending) && card_status == LIBRARY_PROMPT_CARD_CHANGED) {
+        library_prompt_card_changed();
+        return;
+    }
+    if (card_status == LIBRARY_PROMPT_CARD_UNKNOWN) {
+        library_prompt_requeue_visible();
+        return;
+    }
+    if (has_request && gui_network_usb_prompt_invalidated()) {
+        gui_library_suspend_boot_prompt();
+        return;
+    }
+    if (has_request && gui_library_navigation_blocked()) {
+        library_prompt_drop_all();
+        return;
+    }
+
+    if (library_prompt_request.state != LIBRARY_PROMPT_REQUEST_NONE &&
+        !library_prompt_request_is_current(&library_prompt_request)) {
+        gui_popup_hide(&library_update_prompt_popup);
+        library_prompt_clear_request(&library_prompt_request);
+    }
+    if (library_prompt_queued_request.state != LIBRARY_PROMPT_REQUEST_NONE &&
+        !library_prompt_request_is_current(&library_prompt_queued_request))
+        library_prompt_clear_request(&library_prompt_queued_request);
+    library_prompt_activate_queued_request();
+
+    if (boot_warmup_pending && library_prompt_environment_idle()) {
+        int64_t song_count = metadata_db_get_song_count();
+        bool warmer_active = atomic_load(&album_thumb_gen_active);
+        if (song_count <= 0 || warmer_active) {
+            boot_warmup_pending = false;
+        } else if (!album_thumbnail_active) {
+            boot_warmup_pending = false;
+            start_album_thumbnail_generation();
+        }
+    }
+
+    if (library_prompt_request.state == LIBRARY_PROMPT_REQUEST_VISIBLE) {
+        if (!gui_popup_is_visible(&library_update_prompt_popup) ||
+            library_prompt_taken_over()) library_prompt_requeue_visible();
+        return;
+    }
+    if (library_prompt_request.state != LIBRARY_PROMPT_REQUEST_PENDING ||
+        !library_update_prompt_popup.popup || !library_prompt_environment_idle()) return;
+
+    library_prompt_update_labels(library_prompt_request.reason);
+    library_prompt_request.state = LIBRARY_PROMPT_REQUEST_VISIBLE;
+    gui_popup_show(&library_update_prompt_popup);
+}
+
 /* Initialized before pthread_create and published by library_rescan_done_flag. */
 static metadata_db_load_outcome_t library_operation_outcome;
 static metadata_db_load_outcome_t reload_library_cache(void);
@@ -4040,12 +4372,16 @@ static void report_library_cache_load(void) {
     }
     switch (library_cache_load_outcome) {
         case METADATA_DB_LOAD_FAILED:
-            show_error_toast("Library unavailable. Use Settings > Update Music Database to rebuild");
+            library_prompt_enqueue(LIBRARY_PROMPT_LOAD_FAILED, library_cache_load_card_generation);
             break;
         case METADATA_DB_LOAD_UNMOUNTED: show_error_toast("No SD card"); break;
         case METADATA_DB_LOAD_SUCCESS_RECOVERED: show_info_toast(library_recovered_message); break;
-        case METADATA_DB_LOAD_SUCCESS_FRESH: show_info_toast("Library empty"); break;
-        case METADATA_DB_LOAD_SUCCESS_NORMAL: show_info_toast("Library loaded"); break;
+        case METADATA_DB_LOAD_SUCCESS_FRESH:
+            library_prompt_enqueue(LIBRARY_PROMPT_NO_DATABASE, library_cache_load_card_generation);
+            break;
+        case METADATA_DB_LOAD_SUCCESS_NORMAL:
+            if (library_cache_load_announce_loaded) show_info_toast("Library loaded");
+            break;
     }
 }
 
@@ -4079,6 +4415,8 @@ bool gui_library_auto_rescan_enabled(void) {
 #define LIBRARY_RESCAN_THREAD_STACK_SIZE (4 * 1024 * 1024)
 
 static void start_library_rescan_with_repair(bool allow_rebuild) {
+    gui_library_invalidate_boot_prompt();
+    boot_warmup_pending = false;
     /* Ignore request if a rescan is already running. */
     if (library_rescan_active) return;
     DB_LOG("DB", "rescan_requested existing_songs=%lld rss_kb=%ld",
@@ -4193,16 +4531,16 @@ static void refresh_library_screens_after_reload(void) {
 /* SD reinsertion loads an existing saved database and queue without walking
  * the whole tree again. A card with no database still needs its first scan;
  * users can explicitly update a saved database after changing files. */
-static void reload_library_on_sd_reinsert(void) {
+static void reload_library_on_sd_reinsert(bool announce_loaded) {
     playlist_files_refresh_async(PLAYLISTS_DIR);
     library_load_from_cache_only();
+    library_cache_load_announce_loaded = announce_loaded;
     refresh_library_screens_after_reload();
-    if (gui_library_auto_rescan_enabled() &&
-        library_cache_load_outcome == METADATA_DB_LOAD_SUCCESS_FRESH) {
-        start_library_auto_rescan();
-    } else {
-        report_library_cache_load();
-        if (metadata_db_get_song_count() > 0) start_album_thumbnail_generation();
+    report_library_cache_load();
+    if (library_cache_load_outcome != METADATA_DB_LOAD_SUCCESS_FRESH &&
+        metadata_db_get_song_count() > 0) {
+        boot_warmup_pending = false;
+        start_album_thumbnail_generation();
     }
 }
 
@@ -4255,9 +4593,24 @@ void poll_library_rescan(void) {
          * finishes (see library_scan_once()), so there's nothing
          * meaningful to show yet in that window; the label just keeps
          * reading "Updating music database..." until then. */
-        if (library_scan_progress_total > 0) {
-            gui_busy_set_progress(library_rescan_token, (int32_t) ((int64_t) library_scan_progress_done * 100 / library_scan_progress_total));
+        int total = library_scan_progress_total;
+        int done = library_scan_progress_done;
+        char detail[96];
+        int phase = library_scan_phase;
+        if (phase == LIBRARY_SCAN_PHASE_WALK) {
+            int items = library_scan_walk_items;
+            if (items > 0) snprintf(detail, sizeof(detail), "Looking for music files\n%d items checked", items);
+            else snprintf(detail, sizeof(detail), "Looking for music files");
+        } else if (phase == LIBRARY_SCAN_PHASE_TAGS && total > 0) {
+            if (done > total) done = total;
+            gui_busy_set_progress(library_rescan_token, (int32_t) ((int64_t) done * 100 / total));
+            snprintf(detail, sizeof(detail), "Reading tags\n%d of %d songs (%d%%)", done, total,
+                     (int) ((int64_t) done * 100 / total));
+        } else {
+            gui_busy_set_progress(library_rescan_token, 100);
+            snprintf(detail, sizeof(detail), "Saving music database\nThis can take a few minutes on large libraries");
         }
+        gui_busy_set_detail(library_rescan_token, detail);
         return;
     }
 
@@ -4344,6 +4697,12 @@ static bool sd_handoff_pending = false;
  * after physical insertion can't false-positive, short enough the user
  * isn't left staring at an empty library wondering what's wrong). */
 #define SD_MOUNT_FAIL_STREAK_THRESHOLD 6
+
+static dev_t last_mounted_device;
+static bool have_last_mounted_device;
+static char last_card_cid[64];
+static bool have_last_card_identity;
+static bool prompt_card_change_seen;
 
 static bool sd_card_mount_attached(dev_t * mounted_device) {
     struct stat parent_st, root_st;
@@ -4443,6 +4802,36 @@ static void sd_card_read_cid(char out[64]) {
     fclose(file);
 }
 
+static library_prompt_card_status_t library_prompt_card_status(void) {
+    if (!sd_card_root_is_mounted()) return LIBRARY_PROMPT_CARD_UNKNOWN;
+    bool have_current_device = false;
+    dev_t current_device = 0;
+    have_current_device = sd_card_mount_attached(&current_device);
+    if (!have_current_device) return LIBRARY_PROMPT_CARD_UNKNOWN;
+    char current_cid[64];
+    sd_card_read_cid(current_cid);
+    if (sd_card_identity_replaced(true, true, have_last_card_identity,
+                                  have_last_mounted_device, last_mounted_device,
+                                  have_current_device, current_device,
+                                  last_card_cid, current_cid))
+        return LIBRARY_PROMPT_CARD_CHANGED;
+    if (have_last_card_identity && !current_cid[0]) return LIBRARY_PROMPT_CARD_UNKNOWN;
+    return LIBRARY_PROMPT_CARD_CURRENT;
+}
+
+static void library_prompt_prepare_cache_load_card(void) {
+    if (!sd_card_root_is_mounted()) return;
+    dev_t current_device = 0;
+    bool have_current_device = sd_card_mount_attached(&current_device);
+    char current_cid[64];
+    sd_card_read_cid(current_cid);
+    bool replaced = sd_card_identity_replaced(true, true, have_last_card_identity,
+                                              have_last_mounted_device, last_mounted_device,
+                                              have_current_device, current_device,
+                                              last_card_cid, current_cid);
+    if (replaced) library_prompt_card_changed();
+}
+
 static void clear_removed_sd_library(void) {
     gui_player_handle_sd_unmount();
     metadata_db_close();
@@ -4486,10 +4875,6 @@ void poll_sd_card_hotplug(void) {
      * (SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD) before tearing down library
      * state to debounce brief transient unmounts. */
     static int unmount_confirm_streak = 0;
-    static dev_t last_mounted_device;
-    static bool have_last_mounted_device;
-    static char last_card_cid[64];
-    static bool have_last_card_identity;
 #define SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD 2
 
     time_t now = time(NULL);
@@ -4530,6 +4915,12 @@ void poll_sd_card_hotplug(void) {
     bool replaced_between_polls = sd_card_identity_replaced(
         mounted, was_mounted, have_last_card_identity, have_last_mounted_device, last_mounted_device,
         have_current_device, current_mounted_device, last_card_cid, current_card_cid);
+    if (replaced_between_polls) {
+        if (!prompt_card_change_seen) library_prompt_card_changed();
+        prompt_card_change_seen = true;
+    } else if (!mounted) {
+        library_prompt_requeue_visible();
+    }
     /* Unconfirmed absence still cancels a scan and, below, blocks writes.
      * It does not latch sd_handoff_pending; that waits for confirmation. */
     if (sd_card_sample_cancels_scan(mounted, replaced_between_polls, library_rescan_active))
@@ -4558,6 +4949,8 @@ void poll_sd_card_hotplug(void) {
         subprocess_run(argv, NULL, 0);
         mounted = false;
         if (library_rescan_active) gui_library_cancel_scan();
+        if (!prompt_card_change_seen) library_prompt_card_changed();
+        prompt_card_change_seen = true;
     }
 
     group_probe_storage_available = mounted;
@@ -4578,6 +4971,10 @@ void poll_sd_card_hotplug(void) {
             removal_confirmed = sd_card_absence_confirmed(
                 stale_mount || forced_removal, unmount_confirm_streak,
                 SD_UNMOUNT_CONFIRM_STREAK_THRESHOLD);
+            if (removal_confirmed && !prompt_card_change_seen) {
+                library_prompt_card_changed();
+                prompt_card_change_seen = true;
+            }
             if (removal_confirmed && !library_rescan_active) {
                 /* Close old handles before loading the next card. */
                 clear_removed_sd_library();
@@ -4670,7 +5067,7 @@ void poll_sd_card_hotplug(void) {
         return;
     }
     /* Every poll that observes the card mounted un-sticks the checkpoint
-     * target, even for a transient blip that never reached the confirmed-
+    * target, even for a transient blip that never reached the confirmed-
      * removal streak above. */
     gui_player_notify_sd_mounted();
     /* Reset file browser and reload fallback fonts before triggering the
@@ -4680,7 +5077,7 @@ void poll_sd_card_hotplug(void) {
         was_mounted = false;
         file_browser_reset_to_root();
         fallback_font_on_sd_mounted();
-        reload_library_on_sd_reinsert();
+        reload_library_on_sd_reinsert(true);
         gui_player_restore_sd_queue(false);
         sd_handoff_pending = false;
     } else if (!boot_library_recheck_done) {
@@ -4688,7 +5085,7 @@ void poll_sd_card_hotplug(void) {
         fallback_font_on_sd_mounted();
         if (metadata_db_get_load_outcome() == METADATA_DB_LOAD_UNMOUNTED && !library_rescan_active) {
             file_browser_reset_to_root();
-            reload_library_on_sd_reinsert();
+            reload_library_on_sd_reinsert(false);
         }
         /* Covers the boot-time mount race this whole branch exists for: the
          * card genuinely was NOT YET mounted when gui_init() ran its own
@@ -4711,11 +5108,19 @@ void poll_sd_card_hotplug(void) {
      * CID. A known device number remains a valid identity baseline, so a
      * later device change is still detected while CID reads recover. */
     have_last_card_identity = sd_card_identity_is_known(have_last_mounted_device, current_card_cid);
+    prompt_card_change_seen = false;
 }
 #else
 bool sd_card_root_is_mounted(void) {
     struct stat st;
     return stat(MUSIC_ROOT_DIR, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static library_prompt_card_status_t library_prompt_card_status(void) {
+    return sd_card_root_is_mounted() ? LIBRARY_PROMPT_CARD_CURRENT : LIBRARY_PROMPT_CARD_UNKNOWN;
+}
+
+static void library_prompt_prepare_cache_load_card(void) {
 }
 
 void poll_sd_card_hotplug(void) {
@@ -4806,6 +5211,8 @@ static void start_sd_format(void) {
         show_error_toast("SD card repair is still running");
         return;
     }
+    gui_library_invalidate_boot_prompt();
+    boot_warmup_pending = false;
     atomic_store_explicit(&sd_format_done_flag, false, memory_order_relaxed);
     sd_format_active = true;
     sd_format_token = gui_busy_show("Formatting\nSD Card...", "");
@@ -5829,6 +6236,8 @@ void gui_library_init(void) {
     build_sd_format_confirm_popup();
     library_teardown_diag("build_collection_menus before");
     build_collection_menus();
+    library_teardown_diag("build_library_update_prompt_popup before");
+    build_library_update_prompt_popup();
     library_teardown_diag("gui_library_init done");
 }
 
@@ -5862,6 +6271,11 @@ static void library_teardown_diag(const char * step) {
 void gui_library_teardown(void) {
     cancel_group_song_probes();
     reset_az_index_bindings();
+    library_prompt_requeue_visible();
+    gui_popup_teardown(&library_update_prompt_popup);
+    library_update_prompt_title = NULL;
+    library_update_prompt_body = NULL;
+    library_update_prompt_confirm_label = NULL;
     if (playlist_start_popup) { lv_obj_delete(playlist_start_popup); playlist_start_popup = NULL; }
     if (playlist_start_backdrop) { lv_obj_delete(playlist_start_backdrop); playlist_start_backdrop = NULL; }
     gui_popup_teardown(&playlist_delete_popup);
@@ -6098,6 +6512,7 @@ static bool scan_all_songs_with_timeout(const char * root, int * out_spool_fd,
         if (atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire))
             atomic_store_explicit(&w->cancel, true, memory_order_release);
         int progress = w->progress;
+        library_scan_walk_items = progress;
         if (progress != last_seen_progress) {
             last_seen_progress = progress;
             stalled_ms = 0;
@@ -6163,6 +6578,7 @@ static bool library_scan_unchanged_fast_path(int spool_fd, int root_fd, int disc
     if (fclose(spool) != 0) unchanged = false;
     if (!unchanged) return false;
     library_scan_progress_done = discovered_count;
+    library_scan_phase = LIBRARY_SCAN_PHASE_SAVE;
     library_rescan_succeeded = true;
     library_rescan_incomplete = false;
     library_rescan_saved = false;
@@ -6285,6 +6701,8 @@ void library_scan_once(void) {
     uint64_t phase_started_ms = scan_started_ms;
     library_scan_progress_done = 0;
     library_scan_progress_total = 0;
+    library_scan_walk_items = 0;
+    library_scan_phase = LIBRARY_SCAN_PHASE_WALK;
 
     if (atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire)) return;
 
@@ -6366,6 +6784,7 @@ void library_scan_once(void) {
     }
 
     library_scan_progress_total = discovered_count;
+    library_scan_phase = LIBRARY_SCAN_PHASE_TAGS;
     if (open_outcome == METADATA_DB_LOAD_SUCCESS_NORMAL && !preserve_rebuild &&
         !library_rescan_migrating && skipped_count == 0 && discovered_count >= 0 &&
         metadata_db_get_song_count() == (int64_t) discovered_count &&
@@ -6481,6 +6900,7 @@ void library_scan_once(void) {
         metadata_db_abort_update();
         return;
     }
+    library_scan_phase = LIBRARY_SCAN_PHASE_SAVE;
     bool committed = metadata_db_end_update();
     if (committed && library_rescan_migrating && metadata_db_storage_current() &&
         !atomic_load_explicit(&library_scan_cancel_requested, memory_order_acquire))
@@ -6513,23 +6933,25 @@ void library_scan_once(void) {
 static metadata_db_load_outcome_t reload_library_cache(void) {
     library_scan_progress_done = 0;
     library_scan_progress_total = 0;
+    library_scan_walk_items = 0;
     return metadata_db_reload();
 }
 
 /* Loads saved metadata without scanning and queues one UI report. */
 void library_load_from_cache_only(void) {
+    library_prompt_prepare_cache_load_card();
+    library_cache_load_card_generation = library_prompt_card_generation;
+    library_cache_load_announce_loaded = false;
     library_cache_load_outcome = reload_library_cache();
+    library_cache_load_generation++;
     library_cache_load_pending = true;
 }
 
-/* Kicks off the persistent album-art warmer at boot (normally only started
- * after a rescan or SD reinsert) so its first ALBUM_THUMBNAIL_CACHE_SIZE
- * decoded thumbnails are already sitting in album_thumbnail_cache[] before
- * the user ever opens Albums, in addition to its existing on-disk sized-BMP
- * warming. No-op on a fresh/empty database, matching every other
- * start_album_thumbnail_generation() call site's own guard. */
+/* Mark the boot warmer for the idle tick after the screen settles. */
 void gui_library_start_boot_thumbnail_warmup(void) {
-    if (metadata_db_get_song_count() > 0) start_album_thumbnail_generation();
+    if (boot_warmup_requested) return;
+    boot_warmup_requested = true;
+    boot_warmup_pending = true;
 }
 
 bool gui_library_has_background_work(void) {

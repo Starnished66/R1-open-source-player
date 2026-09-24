@@ -2413,11 +2413,14 @@ lv_obj_t * build_subsonic_list_screen(const char * default_title, lv_obj_t ** ou
 /* Shared 2-button confirmation popup builder (backdrop, card, wrapped title,
  * and confirm/cancel buttons) using LV_SIZE_CONTENT and flex layout to
  * accommodate varying font sizes. */
-lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
-                                       lv_obj_t ** out_title, const char * body_text, const char * confirm_text,
-                                       lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row,
-                                       const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb,
-                                       lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop) {
+lv_obj_t * build_confirm_popup_with_labels(const char * title_text, lv_label_long_mode_t title_long_mode,
+                                           lv_obj_t ** out_title, const char * body_text, lv_obj_t ** out_body,
+                                           const char * confirm_text, lv_obj_t ** out_confirm_label,
+                                           lv_color_t confirm_color, lv_event_cb_t confirm_cb,
+                                           lv_obj_t ** out_confirm_row, const char * cancel_text,
+                                           lv_color_t cancel_color, lv_event_cb_t cancel_cb,
+                                           lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb,
+                                           lv_obj_t ** out_backdrop) {
     lv_obj_t * top = lv_layer_top();
 
     lv_obj_t * backdrop = lv_obj_create(top);
@@ -2462,6 +2465,9 @@ lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t tit
         lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_add_style(body, &style_theme_text_muted, 0);
         lv_obj_set_style_text_font(body, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
+        if (out_body) *out_body = body;
+    } else if (out_body) {
+        *out_body = NULL;
     }
 
     lv_obj_t * confirm_row = lv_obj_create(popup);
@@ -2479,6 +2485,7 @@ lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t tit
     lv_obj_set_style_text_color(confirm_label, confirm_color, 0);
     lv_obj_set_style_text_font(confirm_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
     lv_obj_center(confirm_label);
+    if (out_confirm_label) *out_confirm_label = confirm_label;
     if (out_confirm_row) *out_confirm_row = confirm_row;
 
     lv_obj_t * cancel_row = lv_obj_create(popup);
@@ -2502,8 +2509,25 @@ lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t tit
     return popup;
 }
 
+lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t title_long_mode,
+                               lv_obj_t ** out_title, const char * body_text, const char * confirm_text,
+                               lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row,
+                               const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb,
+                               lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop) {
+    return build_confirm_popup_with_labels(title_text, title_long_mode, out_title, body_text, NULL,
+                                           confirm_text, NULL, confirm_color, confirm_cb, out_confirm_row,
+                                           cancel_text, cancel_color, cancel_cb, out_cancel_row,
+                                           backdrop_cb, out_backdrop);
+}
+
+static unsigned visible_popup_count;
+
 void gui_popup_show(gui_popup_t * p) {
     if (!p) return;
+    if (!p->visible && (p->popup || p->backdrop)) {
+        p->visible = true;
+        visible_popup_count++;
+    }
     if (p->backdrop) lv_obj_remove_flag(p->backdrop, LV_OBJ_FLAG_HIDDEN);
     if (p->popup) lv_obj_remove_flag(p->popup, LV_OBJ_FLAG_HIDDEN);
     if (p->backdrop) lv_obj_move_foreground(p->backdrop);
@@ -2512,12 +2536,17 @@ void gui_popup_show(gui_popup_t * p) {
 
 void gui_popup_hide(gui_popup_t * p) {
     if (!p) return;
+    if (p->visible) {
+        p->visible = false;
+        if (visible_popup_count > 0) visible_popup_count--;
+    }
     if (p->backdrop) lv_obj_add_flag(p->backdrop, LV_OBJ_FLAG_HIDDEN);
     if (p->popup) lv_obj_add_flag(p->popup, LV_OBJ_FLAG_HIDDEN);
 }
 
 void gui_popup_teardown(gui_popup_t * p) {
     if (!p) return;
+    gui_popup_hide(p);
     if (p->popup) {
         lv_obj_delete(p->popup);
         p->popup = NULL;
@@ -2526,6 +2555,14 @@ void gui_popup_teardown(gui_popup_t * p) {
         lv_obj_delete(p->backdrop);
         p->backdrop = NULL;
     }
+}
+
+bool gui_popup_is_visible(const gui_popup_t * p) {
+    return p && p->visible;
+}
+
+unsigned gui_popup_visible_count(void) {
+    return visible_popup_count;
 }
 
 int find_nearest_step_index(const int * steps, int count, int value) {

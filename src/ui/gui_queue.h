@@ -8,5 +8,6 @@ void gui_queue_teardown(void);
 void open_queue_screen(void);
 void populate_queue_screen(void);
 void gui_queue_poll(void);
+bool gui_queue_boot_prompt_blocked(void);
 void open_song_context_menu(const char * path);
 void hide_song_context_menu_popup(void);

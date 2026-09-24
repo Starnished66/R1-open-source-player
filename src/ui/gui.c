@@ -1035,6 +1035,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     gui_queue_poll();
     gui_network_poll_airplay_overlay();
     gui_track_info_poll();
+    gui_library_poll_boot_prompt();
 
     /* All correctness-critical work above (buttons, queue transitions and
      * completion of requested background operations) still runs at 500 ms.
@@ -1374,20 +1375,17 @@ void gui_stream_media_refresh(void) {
     if (old) lv_obj_delete(old);
 }
 
-/* One-shot deferred trigger for a fresh-SD-card/first-run auto rescan --
- * see this timer's own scheduling call site (gui_init(), right after
- * library_load_from_cache_only()) for why this can't just call
- * start_library_rescan() synchronously there. Same pattern as fallback_
- * font.c's fallback_font_load_deferred()/fallback_font_schedule_deferred_
- * load(). */
-static void fresh_database_rescan_timer_cb(lv_timer_t * timer) {
+/* Keep migration's first scan deferred until screen setup has completed.
+ * This uses the same one-shot timer shape as fallback_font.c's deferred
+ * load because it cannot start synchronously during the cache load. */
+static void migration_rescan_timer_cb(lv_timer_t * timer) {
     lv_timer_delete(timer);
     start_library_auto_rescan();
 }
 
-#define FRESH_DATABASE_RESCAN_DELAY_MS 500
-static void fresh_database_schedule_deferred_rescan(void) {
-    lv_timer_create(fresh_database_rescan_timer_cb, FRESH_DATABASE_RESCAN_DELAY_MS, NULL);
+#define MIGRATION_RESCAN_DELAY_MS 500
+static void migration_schedule_deferred_rescan(void) {
+    lv_timer_create(migration_rescan_timer_cb, MIGRATION_RESCAN_DELAY_MS, NULL);
 }
 
 void gui_init(uint32_t screen_width, uint32_t screen_height) {
@@ -1519,9 +1517,11 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
 #ifndef HOST_BUILD
     boot_checkpoint("library_load_from_cache_only done");
 #endif
-    /* A fresh database schedules its first scan after UI initialization. */
-    if ((metadata_db_get_load_outcome() == METADATA_DB_LOAD_SUCCESS_FRESH || metadata_db_migration_needed()) &&
-        gui_library_auto_rescan_enabled()) fresh_database_schedule_deferred_rescan();
+    /* Migration keeps its automatic first scan, even if the destination
+     * cache reports FRESH. A non-migration FRESH result is handled by the
+     * library's settled build prompt. */
+    if (metadata_db_migration_needed() && gui_library_auto_rescan_enabled())
+        migration_schedule_deferred_rescan();
     /* No whole-library load anywhere in this boot path, on purpose --
      * remote_control.c queries metadata_db.c directly (its own METADATA_DB_
      * GUARD) rather than needing a synced copy of the library, and each of
@@ -1611,6 +1611,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
      * unconditionally, splash included). */
     lv_obj_remove_flag(lv_layer_top(), LV_OBJ_FLAG_HIDDEN);
 #endif
+    gui_library_boot_ready(lv_tick_get());
 
     /* gui_shell_get_home_screen() is the permanent root of the nav stack -- nav_pop() never
      * goes past it. Load it first so there's always something valid on

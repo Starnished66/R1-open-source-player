@@ -105,6 +105,7 @@ void gui_shell_install_indev_hooks(lv_indev_t * indev);
 lv_indev_t * find_pointer_indev(void);
 
 bool gui_shell_has_background_work(void);
+bool gui_shell_boot_prompt_blocked(void);
 void gui_shell_cancel_background_work(void);
 
 

@@ -4795,6 +4795,18 @@ void gui_shell_player_swipe_recover(void * ctx) {
     home_swipe_just_confirmed = false;
 }
 
+bool gui_shell_boot_prompt_blocked(void) {
+    if (quick_drawer_open || quick_drawer_drag_tracking || quick_drawer_drag_claimed ||
+        quick_drawer_expansion_dragging || quick_drawer_bitmap_motion || quick_drawer_direct_motion) return true;
+    if (home_swipe_candidate || home_swipe_tracking || home_swipe_just_confirmed ||
+        player_swipe_candidate || player_swipe_tracking || player_swipe_just_confirmed ||
+        back_swipe_candidate || back_swipe_owns_press || back_swipe_tracking ||
+        back_swipe_just_confirmed) return true;
+    if (!quick_drawer) return false;
+    int32_t height = lv_display_get_vertical_resolution(lv_display_get_default());
+    return height > 0 && quick_drawer_motion_y() > -height;
+}
+
 bool gui_shell_has_background_work(void) {
     return bt_toggle_active || bt_dac_startup_reapply_active || bt_apply_output_settings_active ||
            bt_source_codec_reconcile_active || refresh_bt_icon_active || wifi_toggle_active ||

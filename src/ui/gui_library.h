@@ -29,17 +29,20 @@ lv_obj_t * gui_library_get_playlists_screen(void);
 
 void gui_library_init(void);
 void gui_library_start_boot_thumbnail_warmup(void);
+void gui_library_boot_ready(uint32_t tick);
+void gui_library_poll_boot_prompt(void);
+void gui_library_request_files_changed_prompt(void);
+void gui_library_invalidate_boot_prompt(void);
+void gui_library_suspend_boot_prompt(void);
 /* Deletes every screen this module owns so gui_reload.c's in-process UI
  * reload can call gui_library_init() again from a clean slate. */
 void gui_library_teardown(void);
 void gui_library_refresh_music_screen(void);
 
 void start_library_rescan(void);
-/* Guards every AUTOMATIC start_library_rescan() trigger (fresh-database
- * boot, SD reinsertion, USB Mass Storage disconnect, Wi-Fi Import close) --
- * does NOT guard the manual Settings > Update Music Database row or
- * plugin.refresh_library(), both of which are explicitly requested and
- * stay enabled regardless. */
+void start_library_auto_rescan(void);
+/* Controls boot migration and background import/storage follow-up behavior.
+ * Explicit Settings and plugin refresh requests remain available. */
 bool gui_library_auto_rescan_enabled(void);
 void poll_library_rescan(void);
 void poll_sd_format(void);

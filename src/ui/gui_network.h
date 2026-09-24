@@ -14,6 +14,8 @@ lv_obj_t * gui_network_get_usb_dac_overlay(void);
  * Deliberately NOT current_settings.usb_mode, which is only a persisted UI
  * hint and can still read DAC after a restart with no cable attached. */
 bool gui_network_usb_dac_mode_active(void);
+bool gui_network_usb_prompt_invalidated(void);
+bool gui_network_boot_prompt_blocked(void);
 lv_obj_t * gui_network_get_import_wifi_screen(void);
 
 void gui_network_init(void);

@@ -604,15 +604,26 @@ lv_obj_t * build_confirm_popup(const char * title_text, lv_label_long_mode_t tit
                                lv_color_t confirm_color, lv_event_cb_t confirm_cb, lv_obj_t ** out_confirm_row,
                                const char * cancel_text, lv_color_t cancel_color, lv_event_cb_t cancel_cb,
                                lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb, lv_obj_t ** out_backdrop);
+lv_obj_t * build_confirm_popup_with_labels(const char * title_text, lv_label_long_mode_t title_long_mode,
+                                           lv_obj_t ** out_title, const char * body_text, lv_obj_t ** out_body,
+                                           const char * confirm_text, lv_obj_t ** out_confirm_label,
+                                           lv_color_t confirm_color, lv_event_cb_t confirm_cb,
+                                           lv_obj_t ** out_confirm_row, const char * cancel_text,
+                                           lv_color_t cancel_color, lv_event_cb_t cancel_cb,
+                                           lv_obj_t ** out_cancel_row, lv_event_cb_t backdrop_cb,
+                                           lv_obj_t ** out_backdrop);
 
 typedef struct {
     lv_obj_t * popup;
     lv_obj_t * backdrop;
+    bool visible;
 } gui_popup_t;
 
 void gui_popup_show(gui_popup_t * p);
 void gui_popup_hide(gui_popup_t * p);
 void gui_popup_teardown(gui_popup_t * p);
+bool gui_popup_is_visible(const gui_popup_t * p);
+unsigned gui_popup_visible_count(void);
 
 lv_obj_t * add_pill_row_base(lv_obj_t * parent, const char * label_text);
 lv_obj_t * add_pill_toggle_row(lv_obj_t * parent, const char * label_text, bool checked, lv_event_cb_t on_click);

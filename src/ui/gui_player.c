@@ -1829,6 +1829,12 @@ void hide_more_menu_popup(void) {
     lv_obj_add_flag(more_menu_popup, LV_OBJ_FLAG_HIDDEN);
 }
 
+bool gui_player_boot_prompt_blocked(void) {
+    return (volume_popup && !lv_obj_has_flag(volume_popup, LV_OBJ_FLAG_HIDDEN)) ||
+           (more_menu_popup && !lv_obj_has_flag(more_menu_popup, LV_OBJ_FLAG_HIDDEN)) ||
+           (more_menu_popup_backdrop && !lv_obj_has_flag(more_menu_popup_backdrop, LV_OBJ_FLAG_HIDDEN));
+}
+
 static void more_menu_popup_backdrop_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     hide_more_menu_popup();

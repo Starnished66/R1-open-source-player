@@ -32,6 +32,7 @@ const void * gui_player_play_btn_image_src(bool is_playing);
 void refresh_format_badge(void);
 void set_play_button_state(bool is_playing);
 void hide_more_menu_popup(void);
+bool gui_player_boot_prompt_blocked(void);
 
 void configure_native_slider_rail(lv_obj_t * slider);
 void cycle_play_mode(void);

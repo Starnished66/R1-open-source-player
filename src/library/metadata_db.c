@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -626,6 +627,53 @@ int metadata_db_get_groups_page(metadata_db_group_kind_t kind, int offset, int m
     METADATA_DB_GUARD;
     if (!db_ready || max_rows <= 0) return 0;
     if (offset < 0) offset = 0;
+    if (kind == METADATA_DB_GROUP_GENRE) {
+        enum { GENRE_LIMIT = 2000, GENRE_HASH_SIZE = 4096 };
+        typedef struct { uint32_t hash; group_row_t row; } genre_group_t;
+        genre_group_t * groups = calloc(GENRE_LIMIT, sizeof(*groups));
+        int * slots = malloc(sizeof(*slots) * GENRE_HASH_SIZE);
+        if (!groups || !slots) { free(groups); free(slots); return 0; }
+        for (int i = 0; i < GENRE_HASH_SIZE; i++) slots[i] = -1;
+        int used = 0;
+        tagcache_query_t query;
+        tagcache_query_begin(&query, TAGCACHE_QUERY_SONGS, NULL, NULL, NULL, NULL);
+        int32_t rank;
+        while (tagcache_query_next(&query, &rank)) {
+            tagcache_song_t song;
+            if (!tagcache_song_fields_at_title_rank(rank, TAGCACHE_FIELD_GENRE, &song) || !song.genre[0]) continue;
+            uint32_t hash = 2166136261u;
+            for (const unsigned char *p = (const unsigned char *)song.genre; *p; p++) {
+                unsigned char c = *p >= 'A' && *p <= 'Z' ? (unsigned char)(*p + ('a' - 'A')) : *p;
+                hash = (hash ^ c) * 16777619u;
+            }
+            unsigned bucket = hash % GENRE_HASH_SIZE;
+            while (slots[bucket] >= 0 && (groups[slots[bucket]].hash != hash ||
+                   strcasecmp(groups[slots[bucket]].row.genre_name, song.genre) != 0)) bucket = (bucket + 1) % GENRE_HASH_SIZE;
+            if (slots[bucket] >= 0) { groups[slots[bucket]].row.song_count++; continue; }
+            if (used >= GENRE_LIMIT) continue;
+            int index = used++;
+            slots[bucket] = index;
+            groups[index].hash = hash;
+            snprintf(groups[index].row.genre_name, sizeof(groups[index].row.genre_name), "%s", song.genre);
+            groups[index].row.song_count = 1;
+            groups[index].row.first_song_id = song.id;
+        }
+        /* Sort the bounded distinct genre list alphabetically for a stable UI. */
+        for (int i = 1; i < used; i++) {
+            group_row_t value = groups[i].row;
+            int j = i;
+            while (j > 0 && strcasecmp(groups[j - 1].row.genre_name, value.genre_name) > 0) {
+                groups[j].row = groups[j - 1].row;
+                j--;
+            }
+            groups[j].row = value;
+        }
+        int written = 0;
+        for (int i = offset; i < used && written < max_rows; i++) out_rows[written++] = groups[i].row;
+        free(slots);
+        free(groups);
+        return written;
+    }
     int tc_kind = (kind == METADATA_DB_GROUP_ALBUM_ARTIST) ? TAGCACHE_GROUP_ALBUM_ARTIST
                   : (kind == METADATA_DB_GROUP_ALBUM)     ? TAGCACHE_GROUP_ALBUM
                                                           : TAGCACHE_GROUP_ARTIST;
@@ -872,25 +920,49 @@ void metadata_db_song_display_title(const song_row_t * row, char * out, size_t o
 
 int metadata_db_search_songs(const char *query_text, song_row_t *out_rows, int max_rows) {
     if (!query_text || !query_text[0]) return 0;
-    return metadata_db_get_songs_filtered_page(query_text, NULL, NULL, NULL, 0, max_rows, out_rows);
+    return metadata_db_get_songs_filtered_page(query_text, NULL, NULL, NULL, NULL, 0, max_rows, out_rows);
 }
 
 int64_t metadata_db_count_songs_filtered(const char *needle, const char *artist,
-                                        const char *album_artist, const char *album) {
+                                        const char *album_artist, const char *album, const char *genre) {
     METADATA_DB_GUARD;
     if (!db_ready) return 0;
+    if (genre && strlen(genre) >= METADATA_DB_TEXT_MAX) return 0;
     tagcache_query_t query;
     tagcache_query_begin(&query, TAGCACHE_QUERY_SONGS, needle, artist, album_artist, album);
+    if (genre && genre[0]) {
+        int32_t rank, count = 0;
+        while (tagcache_query_next(&query, &rank)) {
+            tagcache_song_t song;
+            if (tagcache_song_fields_at_title_rank(rank, TAGCACHE_FIELD_GENRE, &song) &&
+                strcasecmp(song.genre, genre) == 0) count++;
+        }
+        return count;
+    }
     return tagcache_query_count(&query);
 }
 
 int metadata_db_get_songs_filtered_page(const char *needle, const char *artist,
-                                        const char *album_artist, const char *album, int offset,
-                                        int max_rows, song_row_t *out_rows) {
+                                        const char *album_artist, const char *album, const char *genre,
+                                        int offset, int max_rows, song_row_t *out_rows) {
     METADATA_DB_GUARD;
     if (!db_ready || max_rows <= 0) return 0;
+    if (genre && strlen(genre) >= METADATA_DB_TEXT_MAX) return 0;
     tagcache_query_t query;
     tagcache_query_begin(&query, TAGCACHE_QUERY_SONGS, needle, artist, album_artist, album);
+    if (genre && genre[0]) {
+        if (offset < 0) offset = 0;
+        int w = 0, skipped = 0;
+        int32_t rank;
+        while (w < max_rows && tagcache_query_next(&query, &rank)) {
+            tagcache_song_t song;
+            if (!tagcache_song_fields_at_title_rank(rank, TAGCACHE_FIELD_GENRE, &song) ||
+                strcasecmp(song.genre, genre) != 0) continue;
+            if (skipped++ < offset) continue;
+            if (tagcache_song_at_title_rank(rank, &song)) copy_song(&song, &out_rows[w++]);
+        }
+        return w;
+    }
     tagcache_query_skip(&query, offset);
     int w = 0;
     int32_t rank;

@@ -2,6 +2,7 @@
 #include "debug_log.h"
 #include "hiby_sys_server.h"
 #include "input_device_utils.h"
+#include "utf8_util.h"
 
 #include <dbus/dbus.h>
 #include <errno.h>
@@ -13,6 +14,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* AVRCP transport button support.
@@ -24,6 +26,8 @@
 #define BT_MEDIA_PLAYER_OBJECT_PATH "/org/openhibyplayer/MediaPlayer"
 #define BT_MEDIA_PLAYER_ADAPTER_PATH "/org/bluez/hci0"
 #define BT_MEDIA_PLAYER_POLL_TIMEOUT_MS 200
+/* Let GUI labels and decoder duration settle before notifying AVRCP. */
+#define BT_MEDIA_PLAYER_METADATA_SETTLE_MS 500
 
 static DBusConnection * conn = NULL;
 static pthread_t dispatch_thread;
@@ -36,18 +40,149 @@ static bool play_pause_requested = false;
 static bool next_requested = false;
 static bool prev_requested = false;
 
-static void append_variant_bool(DBusMessageIter * iter, dbus_bool_t value) {
-    DBusMessageIter variant;
-    dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, "b", &variant);
-    dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &value);
-    dbus_message_iter_close_container(iter, &variant);
+/* Current AVRCP track data, copied by the GUI thread and read by dispatch. */
+typedef struct {
+    char title[256], artist[256], album[256], genre[256];
+    int track_number;
+    double position_seconds, duration_seconds;
+    uint64_t generation;
+} track_snapshot_t;
+static track_snapshot_t track_state;
+
+static void call_register_player(bool register_it);
+
+static void copy_utf8(char * dst, size_t size, const char * src) {
+    if (!src) src = "";
+    size_t len = strlen(src);
+    utf8_truncate_safe_bounded(dst, size, src, len);
+    utf8_sanitize(dst);
 }
 
-static void append_variant_string(DBusMessageIter * iter, const char * value) {
+static track_snapshot_t snapshot_copy(void) {
+    pthread_mutex_lock(&state_mutex);
+    track_snapshot_t copy = track_state;
+    pthread_mutex_unlock(&state_mutex);
+    return copy;
+}
+
+static bool append_variant_bool(DBusMessageIter * iter, dbus_bool_t value) {
     DBusMessageIter variant;
-    dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, "s", &variant);
-    dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &value);
-    dbus_message_iter_close_container(iter, &variant);
+    return dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, "b", &variant) &&
+           dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &value) &&
+           dbus_message_iter_close_container(iter, &variant);
+}
+
+static bool append_variant_string(DBusMessageIter * iter, const char * value) {
+    DBusMessageIter variant;
+    return dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, "s", &variant) &&
+           dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &value) &&
+           dbus_message_iter_close_container(iter, &variant);
+}
+
+static bool append_variant_int64(DBusMessageIter * iter, int64_t value) {
+    DBusMessageIter variant;
+    return dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, "x", &variant) &&
+           dbus_message_iter_append_basic(&variant, DBUS_TYPE_INT64, &value) &&
+           dbus_message_iter_close_container(iter, &variant);
+}
+
+static int64_t seconds_to_microseconds(double seconds) {
+    return seconds > 0 ? (int64_t) (seconds * 1000000.0) : 0;
+}
+
+static bool append_dict_string(DBusMessageIter * dict, const char * name,
+                               const char * value) {
+    DBusMessageIter entry;
+    if (!dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry)) return false;
+    if (!dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &name)) return false;
+    if (!append_variant_string(&entry, value)) return false;
+    return dbus_message_iter_close_container(dict, &entry);
+}
+
+static bool append_dict_bool(DBusMessageIter * dict, const char * name,
+                             dbus_bool_t value) {
+    DBusMessageIter entry;
+    if (!dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry)) return false;
+    if (!dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &name)) return false;
+    if (!append_variant_bool(&entry, value)) return false;
+    return dbus_message_iter_close_container(dict, &entry);
+}
+
+static bool append_dict_string_array(DBusMessageIter * dict, const char * name,
+                                     const char * value) {
+    DBusMessageIter entry, variant, array;
+    if (!dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry)) return false;
+    if (!dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &name)) return false;
+    if (!dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "as", &variant)) return false;
+    if (!dbus_message_iter_open_container(&variant, DBUS_TYPE_ARRAY, "s", &array)) return false;
+    if (!dbus_message_iter_append_basic(&array, DBUS_TYPE_STRING, &value)) return false;
+    if (!dbus_message_iter_close_container(&variant, &array)) return false;
+    if (!dbus_message_iter_close_container(&entry, &variant)) return false;
+    return dbus_message_iter_close_container(dict, &entry);
+}
+
+static bool append_dict_int32(DBusMessageIter * dict, const char * name, int32_t value) {
+    DBusMessageIter entry, variant;
+    if (!dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry)) return false;
+    if (!dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &name)) return false;
+    if (!dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "i", &variant)) return false;
+    if (!dbus_message_iter_append_basic(&variant, DBUS_TYPE_INT32, &value)) return false;
+    if (!dbus_message_iter_close_container(&entry, &variant)) return false;
+    return dbus_message_iter_close_container(dict, &entry);
+}
+
+static bool append_dict_object_path(DBusMessageIter * dict, const char * name,
+                                   const char * value) {
+    DBusMessageIter entry, variant;
+    if (!dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry)) return false;
+    if (!dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &name)) return false;
+    if (!dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "o", &variant)) return false;
+    if (!dbus_message_iter_append_basic(&variant, DBUS_TYPE_OBJECT_PATH, &value)) return false;
+    if (!dbus_message_iter_close_container(&entry, &variant)) return false;
+    return dbus_message_iter_close_container(dict, &entry);
+}
+
+static bool append_dict_int64(DBusMessageIter * dict, const char * name, int64_t value) {
+    DBusMessageIter entry;
+    if (!dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry)) return false;
+    if (!dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &name)) return false;
+    if (!append_variant_int64(&entry, value)) return false;
+    return dbus_message_iter_close_container(dict, &entry);
+}
+
+static bool append_metadata(DBusMessageIter * dict, const track_snapshot_t * s) {
+    const char * track_id = "/org/openhibyplayer/track/current";
+    if (!append_dict_string(dict, "xesam:title", s->title) ||
+        !append_dict_string_array(dict, "xesam:artist", s->artist) ||
+        !append_dict_string(dict, "xesam:album", s->album)) return false;
+    if (s->genre[0] && !append_dict_string_array(dict, "xesam:genre", s->genre)) return false;
+    if (s->track_number > 0 &&
+        !append_dict_int32(dict, "xesam:trackNumber", s->track_number)) return false;
+    if (s->duration_seconds > 0 &&
+        !append_dict_int64(dict, "mpris:length", seconds_to_microseconds(s->duration_seconds))) return false;
+    return append_dict_object_path(dict, "mpris:trackid", track_id);
+}
+
+static bool append_metadata_variant(DBusMessageIter * variant, const track_snapshot_t * s) {
+    DBusMessageIter metadata;
+    if (!dbus_message_iter_open_container(variant, DBUS_TYPE_ARRAY, "{sv}", &metadata)) return false;
+    if (!append_metadata(&metadata, s)) return false;
+    return dbus_message_iter_close_container(variant, &metadata);
+}
+
+static bool append_metadata_entry(DBusMessageIter * dict, const track_snapshot_t * s) {
+    DBusMessageIter entry, variant;
+    const char * name = "Metadata";
+    if (!dbus_message_iter_open_container(dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry)) return false;
+    if (!dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &name)) return false;
+    if (!dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "a{sv}", &variant)) return false;
+    if (!append_metadata_variant(&variant, s)) return false;
+    if (!dbus_message_iter_close_container(&entry, &variant)) return false;
+    return dbus_message_iter_close_container(dict, &entry);
+}
+
+static bool append_position_entry(DBusMessageIter * dict, double seconds) {
+    return append_dict_int64(dict, "Position", seconds_to_microseconds(seconds));
 }
 
 /* Returns NULL (not an error) if name isn't one of ours -- callers fall
@@ -65,19 +200,31 @@ static const char * playback_status_string(void) {
  * recognized for `interface`. */
 static bool append_property_value(DBusMessageIter * iter, const char * interface, const char * property) {
     if (strcmp(interface, "org.mpris.MediaPlayer2.Player") == 0) {
-        if (strcmp(property, "PlaybackStatus") == 0) { append_variant_string(iter, playback_status_string()); return true; }
-        if (strcmp(property, "CanControl") == 0) { append_variant_bool(iter, TRUE); return true; }
-        if (strcmp(property, "CanPlay") == 0) { append_variant_bool(iter, TRUE); return true; }
-        if (strcmp(property, "CanPause") == 0) { append_variant_bool(iter, TRUE); return true; }
-        if (strcmp(property, "CanGoNext") == 0) { append_variant_bool(iter, TRUE); return true; }
-        if (strcmp(property, "CanGoPrevious") == 0) { append_variant_bool(iter, TRUE); return true; }
+        if (strcmp(property, "PlaybackStatus") == 0)
+            return append_variant_string(iter, playback_status_string());
+        if (strcmp(property, "Metadata") == 0) {
+            DBusMessageIter variant;
+            track_snapshot_t s = snapshot_copy();
+            if (!dbus_message_iter_open_container(iter, DBUS_TYPE_VARIANT, "a{sv}", &variant)) return false;
+            if (!append_metadata_variant(&variant, &s)) return false;
+            return dbus_message_iter_close_container(iter, &variant);
+        }
+        if (strcmp(property, "Position") == 0) {
+            track_snapshot_t s = snapshot_copy();
+            return append_variant_int64(iter, seconds_to_microseconds(s.position_seconds));
+        }
+        if (strcmp(property, "CanControl") == 0) return append_variant_bool(iter, TRUE);
+        if (strcmp(property, "CanPlay") == 0) return append_variant_bool(iter, TRUE);
+        if (strcmp(property, "CanPause") == 0) return append_variant_bool(iter, TRUE);
+        if (strcmp(property, "CanGoNext") == 0) return append_variant_bool(iter, TRUE);
+        if (strcmp(property, "CanGoPrevious") == 0) return append_variant_bool(iter, TRUE);
         return false;
     }
     if (strcmp(interface, "org.mpris.MediaPlayer2") == 0) {
-        if (strcmp(property, "Identity") == 0) { append_variant_string(iter, "Compás"); return true; }
-        if (strcmp(property, "CanQuit") == 0) { append_variant_bool(iter, FALSE); return true; }
-        if (strcmp(property, "CanRaise") == 0) { append_variant_bool(iter, FALSE); return true; }
-        if (strcmp(property, "HasTrackList") == 0) { append_variant_bool(iter, FALSE); return true; }
+        if (strcmp(property, "Identity") == 0) return append_variant_string(iter, "Compás");
+        if (strcmp(property, "CanQuit") == 0) return append_variant_bool(iter, FALSE);
+        if (strcmp(property, "CanRaise") == 0) return append_variant_bool(iter, FALSE);
+        if (strcmp(property, "HasTrackList") == 0) return append_variant_bool(iter, FALSE);
         return false;
     }
     return false;
@@ -86,7 +233,7 @@ static bool append_property_value(DBusMessageIter * iter, const char * interface
 /* Every property name this app exposes for `interface`, in the same order
  * append_property_value() recognizes them -- used by GetAll. NULL-terminated. */
 static const char * const player_properties[] = {
-    "PlaybackStatus", "CanControl", "CanPlay", "CanPause", "CanGoNext", "CanGoPrevious", NULL
+    "PlaybackStatus", "Metadata", "Position", "CanControl", "CanPlay", "CanPause", "CanGoNext", "CanGoPrevious", NULL
 };
 static const char * const root_properties[] = {
     "Identity", "CanQuit", "CanRaise", "HasTrackList", NULL
@@ -210,6 +357,8 @@ static DBusHandlerResult message_handler(DBusConnection * c, DBusMessage * msg, 
             "    <method name=\"Next\"/>\n"
             "    <method name=\"Previous\"/>\n"
             "    <property name=\"PlaybackStatus\" type=\"s\" access=\"read\"/>\n"
+            "    <property name=\"Metadata\" type=\"a{sv}\" access=\"read\"/>\n"
+            "    <property name=\"Position\" type=\"x\" access=\"read\"/>\n"
             "    <property name=\"CanControl\" type=\"b\" access=\"read\"/>\n"
             "    <property name=\"CanPlay\" type=\"b\" access=\"read\"/>\n"
             "    <property name=\"CanPause\" type=\"b\" access=\"read\"/>\n"
@@ -268,6 +417,37 @@ static DBusObjectPathVTable vtable = {
     NULL, NULL, NULL, NULL
 };
 
+static DBusHandlerResult interfaces_added_filter(DBusConnection * c, DBusMessage * msg, void * data) {
+    (void) c;
+    (void) data;
+    if (!dbus_message_is_signal(msg, "org.freedesktop.DBus.ObjectManager", "InterfacesAdded"))
+        return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+
+    DBusMessageIter iter, interfaces, interface_entry;
+    if (!dbus_message_iter_init(msg, &iter) || dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_OBJECT_PATH)
+        return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+    const char * object_path = NULL;
+    dbus_message_iter_get_basic(&iter, &object_path);
+    if (!object_path || strcmp(object_path, BT_MEDIA_PLAYER_ADAPTER_PATH) != 0 ||
+        !dbus_message_iter_next(&iter) || dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_ARRAY)
+        return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+
+    dbus_message_iter_recurse(&iter, &interfaces);
+    while (dbus_message_iter_get_arg_type(&interfaces) == DBUS_TYPE_DICT_ENTRY) {
+        dbus_message_iter_recurse(&interfaces, &interface_entry);
+        if (dbus_message_iter_get_arg_type(&interface_entry) == DBUS_TYPE_STRING) {
+            const char * interface_name = NULL;
+            dbus_message_iter_get_basic(&interface_entry, &interface_name);
+            if (interface_name && strcmp(interface_name, "org.bluez.Media1") == 0) {
+                call_register_player(true);
+                break;
+            }
+        }
+        if (!dbus_message_iter_next(&interfaces)) break;
+    }
+    return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+}
+
 /* Fire-and-forget: dbus_message_set_no_reply() tells BlueZ not to send a
  * reply, and dbus_connection_send() queues the call without blocking.
  * Neither RegisterPlayer's nor UnregisterPlayer's reply content is used
@@ -284,7 +464,10 @@ static void call_register_player(bool register_it) {
     const char * path = BT_MEDIA_PLAYER_OBJECT_PATH;
     DBusMessageIter iter;
     dbus_message_iter_init_append(msg, &iter);
-    dbus_message_iter_append_basic(&iter, DBUS_TYPE_OBJECT_PATH, &path);
+    if (!dbus_message_iter_append_basic(&iter, DBUS_TYPE_OBJECT_PATH, &path)) {
+        dbus_message_unref(msg);
+        return;
+    }
     if (register_it) {
         /* BlueZ's RegisterPlayer handler reads CanPlay/CanPause/
          * CanControl/CanGoNext/CanGoPrevious directly out of this
@@ -296,18 +479,36 @@ static void call_register_player(bool register_it) {
          * (matching append_property_value()'s hardcoded TRUE for the same
          * properties). */
         DBusMessageIter dict_iter;
-        dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{sv}", &dict_iter);
+        if (!dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{sv}", &dict_iter)) {
+            dbus_message_unref(msg);
+            return;
+        }
         static const char * const cap_names[] = {
             "CanPlay", "CanPause", "CanControl", "CanGoNext", "CanGoPrevious"
         };
         for (size_t i = 0; i < sizeof(cap_names) / sizeof(cap_names[0]); i++) {
-            DBusMessageIter entry_iter;
-            dbus_message_iter_open_container(&dict_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry_iter);
-            dbus_message_iter_append_basic(&entry_iter, DBUS_TYPE_STRING, &cap_names[i]);
-            append_variant_bool(&entry_iter, TRUE);
-            dbus_message_iter_close_container(&dict_iter, &entry_iter);
+            if (!append_dict_bool(&dict_iter, cap_names[i], TRUE)) {
+                dbus_message_unref(msg);
+                return;
+            }
         }
-        dbus_message_iter_close_container(&iter, &dict_iter);
+        track_snapshot_t s = snapshot_copy();
+        if (!append_dict_string(&dict_iter, "PlaybackStatus", playback_status_string())) {
+            dbus_message_unref(msg);
+            return;
+        }
+        if (!append_metadata_entry(&dict_iter, &s)) {
+            dbus_message_unref(msg);
+            return;
+        }
+        if (!append_position_entry(&dict_iter, s.position_seconds)) {
+            dbus_message_unref(msg);
+            return;
+        }
+        if (!dbus_message_iter_close_container(&iter, &dict_iter)) {
+            dbus_message_unref(msg);
+            return;
+        }
     }
 
     dbus_message_set_no_reply(msg, TRUE);
@@ -350,6 +551,25 @@ static void send_playback_status_changed(void) {
     dbus_message_unref(signal);
 }
 
+static bool send_track_changed(bool metadata_changed, bool position_changed) {
+    DBusMessage * signal = dbus_message_new_signal(BT_MEDIA_PLAYER_OBJECT_PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged");
+    if (!signal) return false;
+    DBusMessageIter iter, dict, invalid;
+    dbus_message_iter_init_append(signal, &iter);
+    const char * interface_name = "org.mpris.MediaPlayer2.Player";
+    bool ok = dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &interface_name);
+    if (ok) ok = dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{sv}", &dict);
+    track_snapshot_t s = snapshot_copy();
+    if (ok && metadata_changed) ok = append_metadata_entry(&dict, &s);
+    if (ok && position_changed) ok = append_position_entry(&dict, s.position_seconds);
+    if (ok) ok = dbus_message_iter_close_container(&iter, &dict);
+    if (ok) ok = dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "s", &invalid);
+    if (ok) ok = dbus_message_iter_close_container(&iter, &invalid);
+    if (ok) ok = dbus_connection_send(conn, signal, NULL);
+    dbus_message_unref(signal);
+    return ok;
+}
+
 static void * dispatch_thread_func(void * arg) {
     (void) arg;
 
@@ -359,21 +579,52 @@ static void * dispatch_thread_func(void * arg) {
      * this app already knows the real state. */
     bool last_notified_playing = !playing_state;
 
-    /* Registers once for the app's lifetime to answer standard AVRCP
-     * metadata/status queries. */
+    /* Registers initially; a later adapter InterfacesAdded signal
+     * re-registers the player after BlueZ recreates the adapter. */
     call_register_player(true);
+    uint64_t last_seen_generation = snapshot_copy().generation;
+    uint64_t last_emitted_generation = last_seen_generation;
+    double last_position = snapshot_copy().position_seconds;
     DBG_LOG("bt_media_player: registered\n");
 
+    struct timespec previous_iteration;
+    clock_gettime(CLOCK_MONOTONIC, &previous_iteration);
+    struct timespec metadata_change_time = previous_iteration;
     for (;;) {
+        struct timespec iteration_time;
+        clock_gettime(CLOCK_MONOTONIC, &iteration_time);
+        double elapsed_seconds = (double) (iteration_time.tv_sec - previous_iteration.tv_sec) +
+                                 (double) (iteration_time.tv_nsec - previous_iteration.tv_nsec) / 1000000000.0;
+        previous_iteration = iteration_time;
         pthread_mutex_lock(&state_mutex);
         bool current_playing = playing_state;
         pthread_mutex_unlock(&state_mutex);
 
         if (current_playing != last_notified_playing) {
             send_playback_status_changed();
+            send_track_changed(false, true);
             hiby_sys_server_report_playback_status(current_playing);
             last_notified_playing = current_playing;
         }
+        track_snapshot_t current = snapshot_copy();
+        if (current.generation != last_seen_generation) {
+            last_seen_generation = current.generation;
+            metadata_change_time = iteration_time;
+        }
+        double metadata_stable_seconds = (double) (iteration_time.tv_sec - metadata_change_time.tv_sec) +
+                                        (double) (iteration_time.tv_nsec - metadata_change_time.tv_nsec) / 1000000000.0;
+        bool metadata_pending = current.generation != last_emitted_generation;
+        bool metadata_settled = metadata_stable_seconds >= (BT_MEDIA_PLAYER_METADATA_SETTLE_MS / 1000.0);
+        bool emit_metadata = metadata_pending && metadata_settled;
+        double elapsed_position = last_position + (current_playing ? elapsed_seconds : 0.0);
+        bool seek_detected = (current.position_seconds - elapsed_position > 2.0) ||
+                             (elapsed_position - current.position_seconds > 2.0);
+        bool position_changed = emit_metadata || (!metadata_pending && seek_detected);
+        if (emit_metadata || (!metadata_pending && seek_detected)) {
+            send_track_changed(emit_metadata, position_changed);
+            if (emit_metadata) last_emitted_generation = current.generation;
+        }
+        last_position = current.position_seconds;
 
         /* Processes any incoming method calls (dispatched to
          * message_handler() above) and blocks for up to this long if
@@ -410,6 +661,14 @@ static bool attempt_connect_once(void) {
         DBG_LOG("bt_media_player: failed to register object path\n");
         return false;
     }
+    DBusError match_err;
+    dbus_error_init(&match_err);
+    dbus_bus_add_match(conn, "type='signal',sender='org.bluez',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesAdded'", &match_err);
+    if (dbus_error_is_set(&match_err)) {
+        DBG_LOG("bt_media_player: failed to watch BlueZ interfaces: %s\n", match_err.message);
+        dbus_error_free(&match_err);
+    }
+    dbus_connection_add_filter(conn, interfaces_added_filter, NULL, NULL);
     DBG_LOG("bt_media_player: connected to system bus and registered %s\n", BT_MEDIA_PLAYER_OBJECT_PATH);
 
     pthread_create(&dispatch_thread, NULL, dispatch_thread_func, NULL);
@@ -526,6 +785,26 @@ void bt_media_player_init(void) {
 void bt_media_player_notify_playback_state(bool playing) {
     pthread_mutex_lock(&state_mutex);
     playing_state = playing;
+    pthread_mutex_unlock(&state_mutex);
+}
+
+void bt_media_player_notify_track(const char * title, const char * artist, const char * album,
+                                  const char * genre, int track_number, double position_seconds,
+                                  double duration_seconds) {
+    track_snapshot_t next = {0};
+    copy_utf8(next.title, sizeof(next.title), title);
+    copy_utf8(next.artist, sizeof(next.artist), artist);
+    copy_utf8(next.album, sizeof(next.album), album);
+    copy_utf8(next.genre, sizeof(next.genre), genre);
+    next.track_number = track_number > 0 ? track_number : 0;
+    next.position_seconds = position_seconds > 0 ? position_seconds : 0;
+    next.duration_seconds = duration_seconds > 0 ? duration_seconds : 0;
+    pthread_mutex_lock(&state_mutex);
+    bool changed = strcmp(track_state.title, next.title) || strcmp(track_state.artist, next.artist) ||
+                   strcmp(track_state.album, next.album) || strcmp(track_state.genre, next.genre) ||
+                   track_state.track_number != next.track_number || track_state.duration_seconds != next.duration_seconds;
+    next.generation = track_state.generation + (changed ? 1 : 0);
+    track_state = next;
     pthread_mutex_unlock(&state_mutex);
 }
 

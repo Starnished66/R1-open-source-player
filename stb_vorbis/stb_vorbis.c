@@ -3577,6 +3577,19 @@ static int is_whole_packet_present(stb_vorbis *f)
 }
 #endif // !STB_VORBIS_NO_PUSHDATA_API
 
+// Compas: bound the Vorbis comment header so a crafted length/count field
+// cannot drive a multi-GiB setup_malloc or a multi-billion-iteration byte
+// read. This metadata is parsed in process on the UI thread
+// (read_ogg_vorbis_metadata -> stb_vorbis_open_filename), so an unbounded
+// loop here freezes the device. 16 MiB per string still admits a base64
+// METADATA_BLOCK_PICTURE cover; 65536 fields is far beyond any real file.
+#ifndef STB_VORBIS_COMMENT_MAX_BYTES
+#define STB_VORBIS_COMMENT_MAX_BYTES (16 * 1024 * 1024)
+#endif
+#ifndef STB_VORBIS_COMMENT_LIST_MAX
+#define STB_VORBIS_COMMENT_LIST_MAX 65536
+#endif
+
 static int start_decoder(vorb *f)
 {
    uint8 header[6], x,y;
@@ -3650,28 +3663,45 @@ static int start_decoder(vorb *f)
    if (!vorbis_validate(header))                    return error(f, VORBIS_invalid_setup);
    //file vendor
    len = get32_packet(f);
+   // Compas: reject an absurd/negative declared length before allocating; the
+   // read loop below also stops at EOP so a truncated string can't spin.
+   if (len < 0 || len > STB_VORBIS_COMMENT_MAX_BYTES) return error(f, VORBIS_invalid_setup);
    f->vendor = (char*)setup_malloc(f, sizeof(char) * (len+1));
    if (f->vendor == NULL)                           return error(f, VORBIS_outofmem);
    for(i=0; i < len; ++i) {
-      f->vendor[i] = get8_packet(f);
+      int ch = get8_packet(f);
+      if (ch == EOP) { len = i; break; }            // declared length ran past the packet data
+      f->vendor[i] = (char) ch;
    }
    f->vendor[len] = (char)'\0';
    //user comments
    f->comment_list_length = get32_packet(f);
+   // Compas: bound the field count so the array allocation below stays sane.
+   if (f->comment_list_length < 0 || f->comment_list_length > STB_VORBIS_COMMENT_LIST_MAX)
+                                                    return error(f, VORBIS_invalid_setup);
    f->comment_list = NULL;
    if (f->comment_list_length > 0)
    {
       f->comment_list = (char**) setup_malloc(f, sizeof(char*) * (f->comment_list_length));
       if (f->comment_list == NULL)                  return error(f, VORBIS_outofmem);
+      // Compas: setup_malloc does not zero -- NULL every slot so an early
+      // error (or a short comment list) leaves the cleanup loop and the
+      // caller's own NULL checks safe against uninitialized pointers.
+      for(i=0; i < f->comment_list_length; ++i) f->comment_list[i] = NULL;
    }
 
    for(i=0; i < f->comment_list_length; ++i) {
       len = get32_packet(f);
+      // Compas: a malformed per-comment length stops the walk; comments read
+      // so far are kept, trailing slots stay NULL (safe for cleanup/caller).
+      if (len < 0 || len > STB_VORBIS_COMMENT_MAX_BYTES) break;
       f->comment_list[i] = (char*)setup_malloc(f, sizeof(char) * (len+1));
       if (f->comment_list[i] == NULL)               return error(f, VORBIS_outofmem);
 
       for(j=0; j < len; ++j) {
-         f->comment_list[i][j] = get8_packet(f);
+         int ch = get8_packet(f);
+         if (ch == EOP) { len = j; break; }         // truncated comment
+         f->comment_list[i][j] = (char) ch;
       }
       f->comment_list[i][len] = (char)'\0';
    }
@@ -4210,8 +4240,16 @@ static void vorbis_deinit(stb_vorbis *p)
    int i,j;
 
    setup_free(p, p->vendor);
-   for (i=0; i < p->comment_list_length; ++i) {
-      setup_free(p, p->comment_list[i]);
+   // Compas: guard against comment_list_length being set from a crafted
+   // header while comment_list itself is still NULL -- an error return in
+   // start_decoder between reading the field count and allocating (or
+   // filling) the array would otherwise deref NULL here. Entries are
+   // NULL-initialized at allocation, so freeing a partially filled list is
+   // also safe.
+   if (p->comment_list) {
+      for (i=0; i < p->comment_list_length; ++i) {
+         setup_free(p, p->comment_list[i]);
+      }
    }
    setup_free(p, p->comment_list);
 

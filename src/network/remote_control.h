@@ -20,9 +20,13 @@ void remote_control_start(void);
 /* Stops the listener thread and its socket. Idempotent. */
 void remote_control_stop(void);
 
-/* Replace the shared Wi-Fi/Bluetooth Remote Control PIN. Accepts only a
- * 4-12 digit PIN and persists it with the other player settings. */
-void remote_control_set_pin(const char * pin);
+/* Replace the shared Wi-Fi/Bluetooth Remote Control PIN with a new random
+ * 6-digit PIN, persist it, and clear any PIN lockout. Paired apps must be
+ * given the new PIN. Returns false if the system random source is
+ * unavailable, leaving the current PIN unchanged. */
+bool remote_control_generate_new_pin(void);
+/* Copy the current PIN, generating the random 6-digit PIN first if none has
+ * been created yet. out_pin is empty only if that generation failed. */
 void remote_control_get_pin(char * out_pin, size_t out_pin_size);
 
 /* Handles one HTTP request on a connected byte-stream socket (for example an
@@ -71,8 +75,9 @@ bool remote_control_consume_play_index(int64_t * out_index, char * out_playlist,
  *
  * Additional endpoints:
  * - GET /api/library/artists and /api/library/album_artists
+ * - GET /api/library/genres
  * - GET /api/library/albums?artist=NAME or ?album_artist=NAME
- * - GET /api/library (with offset/limit/q and artist/album_artist/album filters)
+ * - GET /api/library (with offset/limit/q and artist/album_artist/album/genre filters)
  * - GET /api/playlists/songs?name=NAME
  * - GET /api/art (optional ?index=N)
  * - GET /assets/icon?name= */

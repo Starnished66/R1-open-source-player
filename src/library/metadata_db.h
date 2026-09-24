@@ -5,6 +5,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Must match tagcache's maximum metadata text field, including the NUL. */
+#define METADATA_DB_TEXT_MAX 600
+
 /* On-disk cache of every scanned song's title/artist/album/album_artist/
  * genre tags, keyed by path + the file's mtime/size at the time it was
  * cached --
@@ -115,6 +118,9 @@ typedef struct {
 
 typedef struct {
     char name[128];
+    /* Genre rows preserve the full tagcache value so long names remain
+     * distinct and can be passed back to the genre filter. Empty otherwise. */
+    char genre_name[METADATA_DB_TEXT_MAX];
     int song_count;
     int64_t first_song_id; /* one representative song, e.g. for cover art -- not a full song_row_t, callers query that separately if needed */
     /* Only populated by metadata_db_get_albums_page_filtered() below (empty
@@ -140,16 +146,17 @@ void metadata_db_get_group_counts(int * out_artist_count, int * out_album_artist
  * "now playing" position in this same order. */
 int metadata_db_get_songs_page_by_recency(int offset, int max_rows, song_row_t * out_rows);
 
-/* Offset-paginated page of distinct values of the named column, ordered
- * alphabetically (ASCII case-insensitive) -- ARTIST/ALBUM_ARTIST kinds only in
- * practice (every real caller wants "all albums" grouped by the *pair*
+/* Offset-paginated page of distinct values, ordered alphabetically
+ * (ASCII case-insensitive). ARTIST/ALBUM_ARTIST/ALBUM use tagcache's indexed
+ * groups; GENRE streams song ranks and retains only the bounded distinct-name
+ * aggregate. Every real album caller wants "all albums" grouped by the *pair*
  * (album, album_artist) instead, which is what metadata_db_get_albums_
  * page_filtered() below does -- ALBUM here would just group by album name
  * alone, merging different artists' same-titled albums, so nothing calls
  * it that way). Returns the number of rows written into out_rows (a
  * caller-owned buffer of at least max_rows entries) -- fewer than max_rows
  * (including 0) means this was the last page. */
-typedef enum { METADATA_DB_GROUP_ARTIST, METADATA_DB_GROUP_ALBUM_ARTIST, METADATA_DB_GROUP_ALBUM } metadata_db_group_kind_t;
+typedef enum { METADATA_DB_GROUP_ARTIST, METADATA_DB_GROUP_ALBUM_ARTIST, METADATA_DB_GROUP_ALBUM, METADATA_DB_GROUP_GENRE } metadata_db_group_kind_t;
 int metadata_db_get_groups_page(metadata_db_group_kind_t kind, int offset, int max_rows, group_row_t * out_rows);
 
 /* Every song credited to one artist, across all their albums -- Artist ->
@@ -242,7 +249,7 @@ void metadata_db_song_display_title(const song_row_t * row, char * out, size_t o
 int metadata_db_search_songs(const char * query, song_row_t * out_rows, int max_rows);
 
 /* remote_control.c's GET /api/library: query (title/artist substring) and
- * the three exact-match filters (artist/album_artist/album) are each
+ * exact-match filters (artist/album_artist/album/genre) are each
  * independently optional -- NULL or "" skips that condition. Offset-based
  * (not keyset) since a remote HTTP client passes an arbitrary offset it
  * doesn't control the shape of, same paging contract that endpoint already
@@ -250,10 +257,11 @@ int metadata_db_search_songs(const char * query, song_row_t * out_rows, int max_
  * count first (metadata_db_count_songs_filtered()) for the response's own
  * "total" field, then the page. */
 int64_t metadata_db_count_songs_filtered(const char * query, const char * artist_filter,
-                                          const char * album_artist_filter, const char * album_filter);
+                                          const char * album_artist_filter, const char * album_filter,
+                                          const char * genre_filter);
 int metadata_db_get_songs_filtered_page(const char * query, const char * artist_filter,
-                                         const char * album_artist_filter, const char * album_filter, int offset,
-                                         int max_rows, song_row_t * out_rows);
+                                         const char * album_artist_filter, const char * album_filter,
+                                         const char * genre_filter, int offset, int max_rows, song_row_t * out_rows);
 
 /* Albums grouped and filtered by artist OR album_artist matching one name.
  * filter may be NULL/"" for every album, unfiltered. Groups by distinct

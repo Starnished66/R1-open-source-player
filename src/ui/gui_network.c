@@ -3465,12 +3465,10 @@ static void open_dlna_screen(void) {
 
 /* ---- Remote Control screen (Wireless -> "Open Link") -- exposes the
  * HTTP address over Wi-Fi and the RFCOMM service name over Bluetooth.
- * Toggle row styled like
- * build_dlna_screen()'s own row; the IP/QR/URL display below it is styled
- * exactly like build_import_wifi_screen()'s (same colors, sizes, and even
- * the same 20px QR-to-URL-label gap) -- this is the same "here's an
- * address, scan or type it" moment for the user, just for a different
- * feature. ---- */
+ * Built on the same flex list as the DLNA/Wi-Fi screens: standard toggle
+ * row, a "Connection PIN" row, a "Generate New PIN" action row, then the
+ * QR/URL lines styled like build_import_wifi_screen()'s -- the same
+ * "here's an address, scan or type it" moment for a different feature. ---- */
 
 static lv_obj_t * remote_control_toggle_img;
 static lv_obj_t * remote_control_pin_label;
@@ -3483,27 +3481,17 @@ static lv_obj_t * remote_control_bluetooth_label;
 static lv_obj_t * remote_control_qrcode;
 #endif
 
-/* Re-chains remote_control_qrcode/remote_control_url_label below
- * remote_control_status_label's own CURRENT bottom edge -- must be called
- * again every time that label's text changes (all 3 branches below), not
- * just once at screen-build time: lv_obj_align_to() computes an absolute
- * position from the base object's size at the moment it's called, it does
- * NOT track the base object live, so a later lv_label_set_text() on a
- * differently-sized string (the whole point of this label -- it cycles
- * between "Turn this on...", "Connect to Wi-Fi first", and "Open this
- * address...", three different lengths) would otherwise leave the chain
- * still positioned for whatever text happened to be showing at build time. */
-static void remote_control_relayout_below_status(void) {
-    lv_obj_t * last = remote_control_status_label;
-#if LV_USE_QRCODE
-    if (!lv_obj_has_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN)) {
-        lv_obj_align_to(remote_control_qrcode, last, LV_ALIGN_OUT_BOTTOM_MID, 0, BOARD_SCALE_PX(20));
-        last = remote_control_qrcode;
+/* The screen is a flex column (build_subsonic_list_screen()), so positions
+ * follow the content automatically. An empty label still occupies a text
+ * line there, though, so hide the address lines whose text is empty instead
+ * of leaving blank gaps. Call after every text change below. */
+static void remote_control_hide_empty_lines(void) {
+    lv_obj_t * lines[] = { remote_control_url_label, remote_control_bluetooth_label };
+    for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) {
+        const char * text = lv_label_get_text(lines[i]);
+        if (text && text[0]) lv_obj_remove_flag(lines[i], LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(lines[i], LV_OBJ_FLAG_HIDDEN);
     }
-#endif
-    lv_obj_align_to(remote_control_url_label, last, LV_ALIGN_OUT_BOTTOM_MID, 0, BOARD_SCALE_PX(20));
-    last = remote_control_url_label;
-    lv_obj_align_to(remote_control_bluetooth_label, last, LV_ALIGN_OUT_BOTTOM_MID, 0, BOARD_SCALE_PX(12));
 }
 
 static void remote_control_refresh_pin_label(void) {
@@ -3511,13 +3499,9 @@ static void remote_control_refresh_pin_label(void) {
     char pin[REMOTE_CONTROL_PIN_MAX_LENGTH + 1] = {0};
     remote_control_get_pin(pin, sizeof(pin));
     if (remote_control_displayed_pin_valid && strcmp(remote_control_displayed_pin, pin) == 0) return;
-    if (pin[0]) {
-        char pin_label[64];
-        snprintf(pin_label, sizeof(pin_label), "Connection PIN: %s  ·  Edit", pin);
-        lv_label_set_text(remote_control_pin_label, pin_label);
-    } else {
-        lv_label_set_text(remote_control_pin_label, "Connection PIN: 0000  ·  Edit");
-    }
+    /* Empty only if the system random source failed; the server refuses to
+     * start in that state too, so say so rather than show a fake PIN. */
+    lv_label_set_text(remote_control_pin_label, pin[0] ? pin : "Unavailable");
     snprintf(remote_control_displayed_pin, sizeof(remote_control_displayed_pin), "%s", pin);
     remote_control_displayed_pin_valid = true;
 }
@@ -3532,7 +3516,7 @@ static void remote_control_refresh_address(void) {
 #if LV_USE_QRCODE
         lv_obj_add_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
 #endif
-        remote_control_relayout_below_status();
+        remote_control_hide_empty_lines();
         return;
     }
 
@@ -3564,7 +3548,7 @@ static void remote_control_refresh_address(void) {
 #if LV_USE_QRCODE
         lv_obj_add_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
 #endif
-        remote_control_relayout_below_status();
+        remote_control_hide_empty_lines();
         return;
     }
 
@@ -3592,7 +3576,7 @@ static void remote_control_refresh_address(void) {
         lv_obj_add_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
     }
 #endif
-    remote_control_relayout_below_status();
+    remote_control_hide_empty_lines();
 }
 
 static void refresh_remote_control_screen_if_built(void) {
@@ -3649,135 +3633,115 @@ static void remote_control_toggle_cb(lv_event_t * e) {
     gui_network_toggle_remote_control();
 }
 
-static void remote_control_pin_entered_cb(const char * pin, void * user_data) {
-    (void) user_data;
-    if (!pin) return;
-    size_t length = strlen(pin);
-    if (length < 4 || length > REMOTE_CONTROL_PIN_MAX_LENGTH) {
-        show_info_toast("PIN must be 4 to 12 digits");
+/* ---- "Generate new PIN" confirmation. Regenerating immediately locks out
+ * every app and browser still using the old PIN, so it asks first, like the
+ * other disruptive actions in this file (bt_dac_leave_popup). Built once in
+ * gui_network_init() on lv_layer_top(), torn down in gui_network_teardown(). */
+static gui_popup_t remote_control_new_pin_popup;
+
+static void remote_control_new_pin_popup_dismiss_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    gui_popup_hide(&remote_control_new_pin_popup);
+}
+
+static void remote_control_new_pin_confirm_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    gui_popup_hide(&remote_control_new_pin_popup);
+    if (!remote_control_generate_new_pin()) {
+        show_info_toast("Could not generate a new PIN");
         return;
     }
-    for (size_t i = 0; i < length; i++) {
-        if (pin[i] < '0' || pin[i] > '9') {
-            show_info_toast("PIN must contain digits only");
-            return;
-        }
-    }
-
-    remote_control_set_pin(pin);
     remote_control_refresh_pin_label();
+    show_info_toast("New PIN generated");
 }
 
-static void remote_control_pin_edit_cb(lv_event_t * e) {
+static void remote_control_generate_pin_row_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    lv_event_stop_bubbling(e); /* editing the PIN must not toggle Remote Control */
-    char pin[REMOTE_CONTROL_PIN_MAX_LENGTH + 1] = {0};
-    remote_control_get_pin(pin, sizeof(pin));
-    show_text_entry("Remote Control PIN", pin, false, true, remote_control_pin_entered_cb, NULL);
+    gui_popup_show(&remote_control_new_pin_popup);
 }
 
+static void build_remote_control_new_pin_popup(void) {
+    remote_control_new_pin_popup.popup = build_confirm_popup(
+        "Generate a new PIN?", LV_LABEL_LONG_WRAP, NULL,
+        "Apps and browsers using the current PIN will need the new one to reconnect.", "Generate",
+        lv_color_make(255, 120, 120), remote_control_new_pin_confirm_cb, NULL, "Cancel", accent_lv_color(),
+        remote_control_new_pin_popup_dismiss_cb, NULL, remote_control_new_pin_popup_dismiss_cb,
+        &remote_control_new_pin_popup.backdrop);
+}
+
+/* Standard settings-list layout (build_subsonic_list_screen(), the same
+ * flex column as the Wi-Fi and Bluetooth screens): the on/off toggle row,
+ * the PIN on its own row, and a separate action row to replace it. The
+ * connection details follow as wrapped text lines. */
 static lv_obj_t * build_remote_control_screen(void) {
-    lv_obj_t * scr = lv_obj_create(NULL);
-    lv_obj_add_style(scr, &style_theme_screen_bg, 0);
+    lv_obj_t * title_label;
+    lv_obj_t * list;
+    lv_obj_t * scr = build_subsonic_list_screen("Remote Control", &title_label, &list);
 
-    build_screen_header(scr, "Remote Control", generic_back_cb, NULL, NULL);
+    lv_obj_t * toggle_row = add_pill_toggle_row(list, "Remote Control", current_settings.remote_control_enabled,
+                                                remote_control_toggle_cb);
+    /* add_pill_toggle_row() creates the label first and the switch last;
+     * gui_network_toggle_remote_control() drives this switch's state. */
+    remote_control_toggle_img = lv_obj_get_child(toggle_row, -1);
 
-    /* Same font-tier-aware pill geometry as add_pill_row_base(), built
-     * directly here (not via that helper) since it needs to sit above the
-     * absolutely-positioned Import-Wi-Fi-style fields below rather than
-     * inside a flex-column list. */
-    lv_obj_t * toggle_row = lv_obj_create(scr);
-    int32_t toggle_row_width = pill_row_default_width();
-    lv_obj_set_size(toggle_row, toggle_row_width, BOARD_SCALE_PX(124));
-    lv_obj_align(toggle_row, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + BOARD_SCALE_PX(10));
-    lv_obj_add_style(toggle_row, &style_theme_screen_bg, 0);
-    if (toggle_row_width == 448) {
-        lv_obj_set_style_bg_image_src(toggle_row, asset_path("touch_list/item_bg.png"), 0);
-    } else {
-        lv_obj_set_style_radius(toggle_row, LIST_ROW_RADIUS, 0);
-        lv_obj_set_style_bg_color(toggle_row, LIST_ROW_BG_COLOR, 0);
-    }
-    lv_obj_set_style_bg_opa(toggle_row, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(toggle_row, 0, 0);
-    lv_obj_remove_flag(toggle_row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(toggle_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(toggle_row, remote_control_toggle_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t * toggle_label = lv_label_create(toggle_row);
-    lv_label_set_text(toggle_label, "Remote Control");
-    lv_obj_add_style(toggle_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_font(toggle_label, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
-    lv_obj_align(toggle_label, LV_ALIGN_TOP_LEFT, BOARD_SCALE_PX(24), BOARD_SCALE_PX(15));
-
-    remote_control_pin_label = lv_label_create(toggle_row);
+    lv_obj_t * pin_row = add_pill_row_base(list, "Connection PIN");
+    remote_control_pin_label = lv_label_create(pin_row);
+    lv_obj_add_style(remote_control_pin_label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_font(remote_control_pin_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_obj_align(remote_control_pin_label, LV_ALIGN_RIGHT_MID, -20, 0);
     remote_control_displayed_pin_valid = false;
     remote_control_refresh_pin_label();
-    lv_obj_set_width(remote_control_pin_label, lv_pct(82));
-    lv_label_set_long_mode(remote_control_pin_label, LV_LABEL_LONG_DOT);
-    lv_obj_add_style(remote_control_pin_label, &style_theme_text_muted, 0);
-    lv_obj_set_style_text_font(remote_control_pin_label, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
-    lv_obj_align(remote_control_pin_label, LV_ALIGN_BOTTOM_LEFT, BOARD_SCALE_PX(24), BOARD_SCALE_PX(-14));
-    lv_obj_add_flag(remote_control_pin_label, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(remote_control_pin_label, remote_control_pin_edit_cb, LV_EVENT_CLICKED, NULL);
 
-    /* Standardized switch widget matching the Settings screen style.
-     * Non-interactive because the parent toggle_row handles clicks. */
-    remote_control_toggle_img = lv_switch_create(toggle_row);
-    lv_obj_remove_flag(remote_control_toggle_img, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_align(remote_control_toggle_img, LV_ALIGN_TOP_RIGHT, BOARD_SCALE_PX(-20), BOARD_SCALE_PX(10));
-    if (current_settings.remote_control_enabled) lv_obj_add_state(remote_control_toggle_img, LV_STATE_CHECKED);
-    lv_obj_add_style(remote_control_toggle_img, gui_theme_accent_style(), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_t * generate_row = add_pill_row_base(list, "Generate New PIN");
+    lv_obj_add_flag(generate_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(generate_row, remote_control_generate_pin_row_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t * explanation = lv_label_create(scr);
+    lv_obj_t * explanation = lv_label_create(list);
     lv_label_set_text(explanation,
-                       "Connect over Wi-Fi or Bluetooth to see what's playing, control playback, and browse "
-                       "your library. Wi-Fi has no app password; Bluetooth requires pairing.");
+                      "Connect over Wi-Fi or Bluetooth to see what's playing, control playback, and browse "
+                      "your library. Enter this PIN when the app or browser asks for it; Bluetooth also "
+                      "requires pairing.");
     lv_obj_set_width(explanation, lv_pct(90));
     lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(explanation, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(explanation, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(explanation, gui_theme_font(GUI_FONT_ROLE_SUBTEXT), 0);
-    lv_obj_align(explanation, LV_ALIGN_TOP_MID, 0, STATUS_BAR_CLEARANCE + TITLE_ROW_HEIGHT + BOARD_SCALE_PX(150));
+    lv_obj_set_style_pad_top(explanation, BOARD_SCALE_PX(12), 0);
 
-    remote_control_status_label = lv_label_create(scr);
+    remote_control_status_label = lv_label_create(list);
     lv_obj_set_width(remote_control_status_label, lv_pct(90));
     lv_label_set_long_mode(remote_control_status_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(remote_control_status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(remote_control_status_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(remote_control_status_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    /* Position below explanation text to dynamically accommodate text
-     * wrapping across different font sizes. */
-    lv_obj_align_to(remote_control_status_label, explanation, LV_ALIGN_OUT_BOTTOM_MID, 0, BOARD_SCALE_PX(20));
 
 #if LV_USE_QRCODE
-    remote_control_qrcode = lv_qrcode_create(scr);
+    remote_control_qrcode = lv_qrcode_create(list);
     lv_qrcode_set_size(remote_control_qrcode, BOARD_SCALE_PX(220));
     lv_qrcode_set_dark_color(remote_control_qrcode, lv_color_black());
     lv_qrcode_set_light_color(remote_control_qrcode, lv_color_white());
     lv_obj_set_style_border_width(remote_control_qrcode, 4, 0);
     lv_obj_set_style_border_color(remote_control_qrcode, lv_color_white(), 0);
+    lv_obj_add_flag(remote_control_qrcode, LV_OBJ_FLAG_HIDDEN);
 #endif
 
-    remote_control_url_label = lv_label_create(scr);
+    remote_control_url_label = lv_label_create(list);
     lv_obj_set_width(remote_control_url_label, lv_pct(90));
     lv_label_set_long_mode(remote_control_url_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(remote_control_url_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(remote_control_url_label, accent_lv_color(), 0);
     lv_obj_set_style_text_font(remote_control_url_label, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
-    remote_control_bluetooth_label = lv_label_create(scr);
+    remote_control_bluetooth_label = lv_label_create(list);
     lv_obj_set_width(remote_control_bluetooth_label, lv_pct(90));
     lv_label_set_long_mode(remote_control_bluetooth_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(remote_control_bluetooth_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_style(remote_control_bluetooth_label, &style_theme_text_muted, 0);
     lv_obj_set_style_text_font(remote_control_bluetooth_label, gui_theme_font(GUI_FONT_ROLE_ROW), 0);
-    /* Positions qrcode/url_label below remote_control_status_label for the
-     * first time -- open_remote_control_screen() calls remote_control_
-     * refresh_address() (which calls this same helper again) every time
-     * this screen opens, so this initial call just avoids either object
-     * sitting at LVGL's own default (0,0) for one frame before that. */
-    remote_control_relayout_below_status();
+    lv_obj_set_style_pad_bottom(remote_control_bluetooth_label, BOARD_SCALE_PX(24), 0);
+    /* open_remote_control_screen() fills these in every time the screen
+     * opens; hide the still-empty lines until then. */
+    remote_control_hide_empty_lines();
 
-    finalize_screen_navigation(scr);
     return scr;
 }
 
@@ -3892,6 +3856,7 @@ void gui_network_init(void) {
     build_wifi_action_popup();
     build_usb_dac_leave_popup();
     build_bt_dac_leave_popup();
+    build_remote_control_new_pin_popup();
     dac_stream_labels_timer_cb(NULL);
     /* Guarded like gui_library.c's az_index_drag_timer -- gui_network_init()
      * can run again after a UI reload, and an unguarded lv_timer_create()
@@ -3903,7 +3868,7 @@ void gui_network_init(void) {
  * module owns so gui_network_init() can rebuild them from a clean slate
  * without leaking the old objects. Deliberately does NOT touch
  * dac_stream_labels_timer (already guarded/reused correctly by gui_network_
- * init() itself). The four popup-and-backdrop pairs below are built
+ * init() itself). The five popup-and-backdrop pairs below are built
  * directly on lv_layer_top() (see build_confirm_popup()'s own comment), not
  * as children of any of these screens, so each needs its own explicit
  * deletion. */
@@ -3914,6 +3879,20 @@ void gui_network_teardown(void) {
     gui_popup_teardown(&wifi_action_popup);
     gui_popup_teardown(&usb_dac_leave_popup);
     gui_popup_teardown(&bt_dac_leave_popup);
+    gui_popup_teardown(&remote_control_new_pin_popup);
+
+    /* The Remote Control screen's widgets die with remote_control_screen
+     * below; clear the pointers so the quick-drawer toggle and the periodic
+     * poll (which check them) can't touch freed objects before a rebuild. */
+    remote_control_toggle_img = NULL;
+    remote_control_pin_label = NULL;
+    remote_control_displayed_pin_valid = false;
+    remote_control_status_label = NULL;
+    remote_control_url_label = NULL;
+    remote_control_bluetooth_label = NULL;
+#if LV_USE_QRCODE
+    remote_control_qrcode = NULL;
+#endif
 
     if (wifi_screen) { lv_obj_delete(wifi_screen); wifi_screen = NULL; }
     if (wifi_info_screen) { lv_obj_delete(wifi_info_screen); wifi_info_screen = NULL; }

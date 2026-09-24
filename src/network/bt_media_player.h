@@ -17,6 +17,13 @@ void bt_media_player_init(void);
  * as the active player. */
 void bt_media_player_notify_playback_state(bool playing);
 
+/* Copies the current track metadata and timing into a fixed-size snapshot
+ * for the D-Bus dispatch thread. NULL strings are treated as empty. */
+void bt_media_player_notify_track(const char * title, const char * artist,
+                                  const char * album, const char * genre,
+                                  int track_number, double position_seconds,
+                                  double duration_seconds);
+
 /* Each returns true (and clears the flag) exactly once when the connected
  * accessory's own play/pause/next/previous button was pressed since the
  * last check -- meant to be polled from the GUI thread's own periodic

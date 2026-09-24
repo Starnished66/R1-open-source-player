@@ -444,7 +444,7 @@ static void fill_song_page_visual(compact_list_page_row_t * out, const song_row_
 static int all_songs_fetch_page(void * ctx, int offset, int count, compact_list_page_row_t out_rows[]) {
     (void) ctx;
     song_row_t * rows = malloc(sizeof(song_row_t) * (size_t) count);
-    int n = rows ? metadata_db_get_songs_filtered_page(NULL, NULL, NULL, NULL, offset, count, rows) : 0;
+    int n = rows ? metadata_db_get_songs_filtered_page(NULL, NULL, NULL, NULL, NULL, offset, count, rows) : 0;
     for (int i = 0; i < n; i++) fill_song_page_visual(&out_rows[i], &rows[i]);
     free(rows);
     return n;
@@ -458,7 +458,7 @@ static int all_songs_fetch_page(void * ctx, int offset, int count, compact_list_
  * same stale-reference tolerance as playlist_path_at()'s own comment). */
 static bool all_songs_resolve_path_at(int display_index, char * out, size_t out_size) {
     song_row_t row;
-    if (metadata_db_get_songs_filtered_page(NULL, NULL, NULL, NULL, display_index, 1, &row) != 1) return false;
+    if (metadata_db_get_songs_filtered_page(NULL, NULL, NULL, NULL, NULL, display_index, 1, &row) != 1) return false;
     snprintf(out, out_size, "%s", row.path);
     return true;
 }
@@ -2535,7 +2535,7 @@ static group_song_entry_t * load_album_entries_filtered(const char * name, const
                                                          int * out_count) {
     *out_count = 0;
     if (artist_filter && artist_filter[0]) {
-        int64_t filtered = metadata_db_count_songs_filtered(NULL, artist_filter, album_artist, name);
+        int64_t filtered = metadata_db_count_songs_filtered(NULL, artist_filter, album_artist, name, NULL);
         song_count = filtered > 0 && filtered <= INT_MAX ? (int) filtered : 0;
     }
     if (song_count <= 0) return NULL;
@@ -2547,7 +2547,7 @@ static group_song_entry_t * load_album_entries_filtered(const char * name, const
         int want = song_count - n;
         if (want > 64) want = 64;
         int got = (artist_filter && artist_filter[0])
-                      ? metadata_db_get_songs_filtered_page(NULL, artist_filter, album_artist, name,
+                      ? metadata_db_get_songs_filtered_page(NULL, artist_filter, album_artist, name, NULL,
                                                             n, want, songs + n)
                       : metadata_db_get_album_songs(name, album_artist, n, songs + n, want);
         if (got <= 0) break;
@@ -3484,14 +3484,14 @@ void play_remote_control_song(const char * song_path, const char * playlist_name
             if (scoped_title[0] == '\0') snprintf(scoped_title, sizeof(scoped_title), "%s", playlist_name);
         }
     } else if (album_filter[0] != '\0' && (artist_filter[0] != '\0' || album_artist_filter[0] != '\0')) {
-        int64_t count64 = metadata_db_count_songs_filtered(NULL, artist_filter, album_artist_filter, album_filter);
+        int64_t count64 = metadata_db_count_songs_filtered(NULL, artist_filter, album_artist_filter, album_filter, NULL);
         if (count64 > 0 && count64 <= INT_MAX) {
             scoped_entries = calloc((size_t) count64, sizeof(*scoped_entries));
             song_row_t rows[64];
             while (scoped_entries && scoped_count < count64) {
                 int want = (int) (count64 - scoped_count);
                 if (want > 64) want = 64;
-                int got = metadata_db_get_songs_filtered_page(NULL, artist_filter, album_artist_filter, album_filter,
+                int got = metadata_db_get_songs_filtered_page(NULL, artist_filter, album_artist_filter, album_filter, NULL,
                                                                scoped_count, want, rows);
                 if (got <= 0) break;
                 for (int i = 0; i < got; i++) {
@@ -5506,7 +5506,7 @@ static bool collection_song_at(int offset, song_row_t * song) {
         if (collection_menu_artist[0])
             return metadata_db_get_songs_filtered_page(NULL, collection_menu_artist,
                                                        collection_menu_album_artist,
-                                                       collection_menu_name, offset, 1, song) == 1;
+                                                       collection_menu_name, NULL, offset, 1, song) == 1;
         return metadata_db_get_album_songs(collection_menu_name, collection_menu_album_artist,
                                             offset, song, 1) == 1;
     }
@@ -5550,7 +5550,7 @@ static void open_album_collection_menu(const group_row_t * group, const char * a
      * screen does not show. */
     if (collection_menu_artist[0]) {
         int64_t filtered = metadata_db_count_songs_filtered(NULL, collection_menu_artist,
-                                                            group->album_artist, group->name);
+                                                            group->album_artist, group->name, NULL);
         collection_menu_song_count = filtered > 0 && filtered <= INT_MAX ? (int) filtered : 0;
     } else {
         collection_menu_song_count = group->song_count;

@@ -27,7 +27,7 @@ The Wi-Fi DNS-SD advertisement is present only while Remote Control is enabled a
 
 - The Wi-Fi base URL is `http://<player-ip>:8899`. Prefix all paths below with `/api/v1`.
 - Every HTTP response has `Content-Length` and `Connection: close`. JSON responses have `Content-Type: application/json`; cover art uses `image/jpeg` or `image/png`. Control requests currently return `text/plain` (`OK` on success).
-- Every request except `GET /` and `GET /api/v1/capabilities` must include `X-Compas-PIN: <pin>`. This applies to Wi-Fi and HTTP carried over Bluetooth RFCOMM. The default PIN is `0000`; the user can change it to 4–12 digits in **Wireless → Remote Control**. A configured PIN persists across boots and is preserved when upgrading.
+- Every request except `GET /` and `GET /api/v1/capabilities` must include `X-Compas-PIN: <pin>`. This applies to Wi-Fi and HTTP carried over Bluetooth RFCOMM. The player generates a random 6-digit PIN the first time Remote Control needs one and keeps reusing it across boots and upgrades. The user sees it in **Wireless → Remote Control** and can replace it only with **Generate New PIN**, which immediately invalidates the old PIN and clears any PIN lockout; clients must then ask for the new PIN. Players that still had the old shared placeholder PIN `0000` are moved to a random PIN once. Earlier user-chosen 4–12 digit PINs are kept, so clients must accept any 4–12 digit PIN. If the player cannot read its system random source it refuses to serve rather than fall back to a guessable PIN (`503`).
 - Five distinct incorrect PIN guesses within a minute pause further PIN checks for one minute. Repeated requests using the same wrong PIN count once, so concurrent polls do not trigger a lockout. Missing PINs do not count as guesses. Incorrect PINs return `401`; while paused, requests return `429 Too Many Requests` with `Retry-After: 60` and `{"error":"rate_limited","code":"pin_rate_limited","retryAfterSeconds":60}`. Wait before asking for or retrying a PIN.
 - `401 Unauthorized` returns JSON `{"error":"unauthorized","code":"pin_required"}`. Ask the user to enter the current player PIN, then retry with the header. Do not put the PIN in a URL, query string, or log.
 - `GET /` serves the browser remote shell without authentication; its API and artwork requests use the same PIN header. The browser prompts for the PIN and stores it in that browser's local storage.
@@ -45,7 +45,7 @@ The Wi-Fi DNS-SD advertisement is present only while Remote Control is enabled a
 | `GET /art` | Artwork for the currently playing file, or `404` if unavailable. |
 | `GET /art?index=<song-id>` | Artwork for a library song, or `404` if unavailable. Use the returned `Content-Type`; there is no fixed image size. |
 
-The current status producer does not populate album metadata; `album` may be empty even when a file has album tags. The current track can be identified for display by its title/artist, while `/art` without an index resolves to its actual file.
+The status producer includes the current track's album when metadata is available; `album` is empty when the file has no album tag. Use the title and artist for track display, and `/art` without an index to resolve the current file's artwork.
 
 ## Playback commands
 
@@ -70,9 +70,11 @@ All commands use `POST`. Successful commands return `200 OK` with text body `OK`
 | `GET /library?artist=<name>&album=<name>` | Same shape, filtered by artist and album. `album_artist=<name>` may replace `artist`. Filters may be combined with `offset` and `limit`. |
 | `GET /library/artists` | `{"artists":[{"name":"...","count":N,"index":ID,"album_artist":"..."}]}`. |
 | `GET /library/album_artists` | Same shape as `/library/artists`; the grouping is by album artist. |
+| `GET /library/genres` | `{"genres":[{"name":"...","count":N,"index":ID,"album_artist":""}]}`. `index` is a representative song ID, suitable for requesting its artwork. |
 | `GET /library/albums?artist=<name>` | `{"albums":[{"name":"...","count":N,"index":ID,"album_artist":"..."}]}`. `album_artist=<name>` is also accepted. |
+| `GET /library?genre=<name>` | Same paged song shape, filtered by an exact case-insensitive genre name (up to 599 UTF-8 bytes). Combine with `q`, `artist`, `album_artist`, `album`, `offset`, and `limit`. Songs without a genre are not included in a genre group. |
 
-The artist and album group lists are capped at 2,000 entries in v1. Use a library song ID to request its artwork or play it.
+The artist, album, and genre group lists are capped at 2,000 entries in v1. Genre groups are derived by a bounded streaming scan of song metadata and hold only distinct genre names and counts in memory. Use a library song ID to request its artwork or play it.
 
 ## Queue and playlists
 
@@ -90,7 +92,7 @@ Playlist names are a single path component: empty names, slash, backslash, and `
 
 ## Errors and compatibility
 
-`400` means a malformed or unsafe request, `401` means the PIN is missing or incorrect, `429` means PIN checks are temporarily rate-limited, `404` means a missing route or resource, `405` means an unsupported method, `409` means a queue mutation used a stale revision, and `500` means an internal failure. Unauthorized and rate-limit responses use the JSON bodies documented above; other error bodies may be plain text. Artwork absence is a normal `404`. Validate user input locally and show a retry path for transport errors.
+`400` means a malformed or unsafe request, `401` means the PIN is missing or incorrect, `429` means PIN checks are temporarily rate-limited, `404` means a missing route or resource, `405` means an unsupported method, `409` means a queue mutation used a stale revision, `500` means an internal failure, and `503` means the player could not create its PIN. Unauthorized and rate-limit responses use the JSON bodies documented above; other error bodies may be plain text. Artwork absence is a normal `404`. Validate user input locally and show a retry path for transport errors.
 
 The original unversioned `/api/...` paths remain available for the existing web remote and require the same PIN. New clients should use `/api/v1/...`. The web page itself is served at `/` over Wi-Fi; the Android app should consume the API directly. Bluetooth uses the bonded link in addition to the PIN. The PIN is stored in the player's settings file, whose mode is restricted to owner read/write. This is a control interface, not an audio output profile.
 

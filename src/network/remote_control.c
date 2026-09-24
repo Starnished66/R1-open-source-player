@@ -129,35 +129,86 @@ static bool remote_control_pin_is_valid(const char * pin) {
     return true;
 }
 
-/* Initialize the default PIN on first use. Existing saved PINs remain intact;
- * users can choose a different 4-12 digit PIN in the Remote Control screen. */
-static bool remote_control_ensure_pin(void) {
-    pthread_mutex_lock(&pin_mutex);
-    if (remote_control_pin_is_valid(current_settings.remote_control_pin)) {
-        pthread_mutex_unlock(&pin_mutex);
-        return true;
-    }
+/* The fixed PIN earlier builds seeded as a placeholder for Android app
+ * testing. Every device shipped that same value, so a saved copy is treated
+ * as unset and replaced with a random PIN once. */
+#define REMOTE_CONTROL_LEGACY_PLACEHOLDER_PIN "0000"
+#define REMOTE_CONTROL_GENERATED_PIN_DIGITS 6
 
-    snprintf(current_settings.remote_control_pin, sizeof(current_settings.remote_control_pin), "0000");
-    settings_save_async(&current_settings);
-    pthread_mutex_unlock(&pin_mutex);
-    return true;
+/* Fills out[] with a uniformly random REMOTE_CONTROL_GENERATED_PIN_DIGITS
+ * PIN from the kernel CSPRNG. Rejection sampling keeps every PIN equally
+ * likely (a plain modulo of a 32-bit value would favor low PINs). */
+static bool remote_control_random_pin(char * out, size_t out_size) {
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const uint32_t range = 1000000u;
+    const uint32_t limit = UINT32_MAX - (UINT32_MAX % range);
+    bool ok = false;
+    for (int attempt = 0; attempt < 16 && !ok; attempt++) {
+        uint32_t value = 0;
+        size_t got = 0;
+        while (got < sizeof(value)) {
+            ssize_t n = read(fd, (uint8_t *) &value + got, sizeof(value) - got);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            got += (size_t) n;
+        }
+        if (got != sizeof(value)) break;
+        if (value >= limit) continue;
+        snprintf(out, out_size, "%0*u", REMOTE_CONTROL_GENERATED_PIN_DIGITS, (unsigned) (value % range));
+        ok = true;
+    }
+    close(fd);
+    return ok;
 }
 
-void remote_control_set_pin(const char * pin) {
-    if (!remote_control_pin_is_valid(pin)) return;
-    pthread_mutex_lock(&pin_mutex);
+/* Caller holds pin_mutex. A new PIN invalidates everything learned about the
+ * old one, including an active lockout. */
+static void remote_control_store_pin_locked(const char * pin) {
     snprintf(current_settings.remote_control_pin, sizeof(current_settings.remote_control_pin), "%s", pin);
     pin_failures = 0;
     memset(pin_failed_candidates, 0, sizeof(pin_failed_candidates));
     pin_failure_window = 0;
     pin_blocked_until = 0;
     settings_save_async(&current_settings);
+}
+
+/* Generates the PIN once on first use and reuses it after that. A saved
+ * 4-12 digit PIN is kept, except the old shared placeholder. Returns false
+ * only when no PIN exists and the CSPRNG cannot be read; callers then refuse
+ * to serve rather than fall back to a guessable value. */
+static bool remote_control_ensure_pin(void) {
+    pthread_mutex_lock(&pin_mutex);
+    const char * saved = current_settings.remote_control_pin;
+    if (remote_control_pin_is_valid(saved) && strcmp(saved, REMOTE_CONTROL_LEGACY_PLACEHOLDER_PIN) != 0) {
+        pthread_mutex_unlock(&pin_mutex);
+        return true;
+    }
+
+    char pin[REMOTE_CONTROL_PIN_MAX_LENGTH + 1];
+    bool ok = remote_control_random_pin(pin, sizeof(pin));
+    if (ok) remote_control_store_pin_locked(pin);
     pthread_mutex_unlock(&pin_mutex);
+    return ok;
+}
+
+bool remote_control_generate_new_pin(void) {
+    char pin[REMOTE_CONTROL_PIN_MAX_LENGTH + 1];
+    pthread_mutex_lock(&pin_mutex);
+    bool ok = remote_control_random_pin(pin, sizeof(pin));
+    /* Never "regenerate" to the same value, which would look like a no-op. */
+    if (ok && strcmp(pin, current_settings.remote_control_pin) == 0)
+        ok = remote_control_random_pin(pin, sizeof(pin));
+    if (ok) remote_control_store_pin_locked(pin);
+    pthread_mutex_unlock(&pin_mutex);
+    return ok;
 }
 
 void remote_control_get_pin(char * out_pin, size_t out_pin_size) {
     if (!out_pin || out_pin_size == 0) return;
+    /* The UI shows the PIN before the server is ever enabled, so create it
+     * here too rather than displaying an empty or placeholder value. */
+    remote_control_ensure_pin();
     pthread_mutex_lock(&pin_mutex);
     snprintf(out_pin, out_pin_size, "%s", current_settings.remote_control_pin);
     pthread_mutex_unlock(&pin_mutex);
@@ -394,9 +445,8 @@ bool remote_control_consume_play_index(int64_t * out_index, char * out_playlist,
     return result;
 }
 
-/* Minimal JSON string escaping -- handles quote, backslash, and control
- * characters, the only ones a real song/artist/album tag could plausibly
- * contain that would break the JSON. Not a general-purpose escaper. */
+/* Escape JSON string delimiters and control bytes so metadata round-trips as
+ * the same string when a client parses the response. */
 static void json_escape_append(char * out, size_t out_size, const char * in) {
     size_t len = strlen(out);
     for (const char * p = in; *p && len + 2 < out_size; p++) {
@@ -406,7 +456,14 @@ static void json_escape_append(char * out, size_t out_size, const char * in) {
             out[len++] = '\\';
             out[len++] = (char) c;
         } else if (c < 0x20) {
-            continue; /* drop control characters rather than \u-escape them -- none are expected in real tags */
+            static const char hex[] = "0123456789abcdef";
+            if (len + 6 >= out_size) break;
+            out[len++] = '\\';
+            out[len++] = 'u';
+            out[len++] = '0';
+            out[len++] = '0';
+            out[len++] = hex[c >> 4];
+            out[len++] = hex[c & 0x0f];
         } else {
             out[len++] = (char) c;
         }
@@ -468,8 +525,49 @@ static void url_decode(const char * in, char * out, size_t out_size) {
     out[len] = '\0';
 }
 
+static bool url_decode_checked(const char * in, char * out, size_t out_size) {
+    size_t len = 0;
+    if (!out || out_size == 0) return false;
+    while (*in) {
+        if (len + 1 >= out_size) { out[0] = '\0'; return false; }
+        if (*in == '%') {
+            if (!in[1] || !in[2]) { out[0] = '\0'; return false; }
+            bool first_is_hex = (in[1] >= '0' && in[1] <= '9') || (in[1] >= 'a' && in[1] <= 'f') ||
+                                (in[1] >= 'A' && in[1] <= 'F');
+            bool second_is_hex = (in[2] >= '0' && in[2] <= '9') || (in[2] >= 'a' && in[2] <= 'f') ||
+                                 (in[2] >= 'A' && in[2] <= 'F');
+            if (!first_is_hex || !second_is_hex) { out[0] = '\0'; return false; }
+            char hex[3] = { in[1], in[2], '\0' };
+            char * end;
+            long v = strtol(hex, &end, 16);
+            if (end != hex + 2 || v == 0) { out[0] = '\0'; return false; }
+            out[len++] = (char)v;
+            in += 3;
+            continue;
+        }
+        out[len++] = (*in == '+') ? ' ' : *in;
+        in++;
+    }
+    out[len] = '\0';
+    return true;
+}
+
+static bool query_param_present(const char * path, const char * key) {
+    const char * q = strchr(path, '?');
+    if (!q) return false;
+    q++;
+    size_t key_len = strlen(key);
+    while (*q) {
+        if (strncmp(q, key, key_len) == 0 && q[key_len] == '=') return true;
+        const char * amp = strchr(q, '&');
+        if (!amp) break;
+        q = amp + 1;
+    }
+    return false;
+}
+
 /* Pulls a raw (still percent-encoded) string query parameter's value.
- * Returns false (leaving out untouched) if the key isn't present. */
+ * Returns false (leaving out untouched) if absent or too long for out. */
 static bool query_param_str(const char * path, const char * key, char * out, size_t out_size) {
     const char * q = strchr(path, '?');
     if (!q) return false;
@@ -481,7 +579,7 @@ static bool query_param_str(const char * path, const char * key, char * out, siz
             const char * val = q + key_len + 1;
             const char * amp = strchr(val, '&');
             size_t val_len = amp ? (size_t) (amp - val) : strlen(val);
-            if (val_len >= out_size) val_len = out_size - 1;
+            if (val_len >= out_size) return false;
             memcpy(out, val, val_len);
             out[val_len] = '\0';
             return true;
@@ -498,13 +596,14 @@ static bool query_param_str(const char * path, const char * key, char * out, siz
 #define LIBRARY_JSON_MAX_LIMIT 100
 
 static void build_library_json(const char * query, const char * artist_filter, const char * album_artist_filter,
-                                const char * album_filter, int offset, int limit, char * out, size_t out_size) {
+                                const char * album_filter, const char * genre_filter, int offset, int limit,
+                                char * out, size_t out_size) {
     if (limit <= 0 || limit > LIBRARY_JSON_MAX_LIMIT) limit = LIBRARY_JSON_MAX_LIMIT;
     if (offset < 0) offset = 0;
 
     /* Query filtered songs directly from metadata_db. "index" in the response
      * is the persistent song id (song_row_t.id). */
-    int64_t total_matches = metadata_db_count_songs_filtered(query, artist_filter, album_artist_filter, album_filter);
+    int64_t total_matches = metadata_db_count_songs_filtered(query, artist_filter, album_artist_filter, album_filter, genre_filter);
 
     json_builder_t json;
     json_builder_init(&json, out, out_size);
@@ -513,7 +612,7 @@ static void build_library_json(const char * query, const char * artist_filter, c
     /* Allocate rows on the heap to keep stack usage bounded. */
     song_row_t * rows = malloc(sizeof(song_row_t) * LIBRARY_JSON_MAX_LIMIT);
     int n = rows ? metadata_db_get_songs_filtered_page(query, artist_filter, album_artist_filter, album_filter,
-                                                         offset, limit, rows)
+                                                         genre_filter, offset, limit, rows)
                  : 0;
     for (int i = 0; i < n && !json.truncated; i++) {
         char display_title[128], title_esc[300] = {0}, artist_esc[300] = {0};
@@ -535,14 +634,22 @@ static void render_name_counts_json(const group_row_t * groups, int count, const
     json_builder_t json;
     json_builder_init(&json, out, out_size);
     json_builder_appendf(&json, "{\"%s\":[", json_key);
-    for (int i = 0; i < count && !json.truncated && json.capacity - json.length >= 512; i++) {
-        char name_esc[300] = {0}, album_artist_esc[300] = {0};
-        json_escape_append(name_esc, sizeof(name_esc), groups[i].name);
+    size_t response_capacity = json.capacity;
+    for (int i = 0; i < count && !json.truncated && json.capacity - json.length >= 3; i++) {
+        char name_esc[METADATA_DB_TEXT_MAX * 6] = {0}, album_artist_esc[300] = {0};
+        const char * name = strcmp(json_key, "genres") == 0 ? groups[i].genre_name : groups[i].name;
+        json_escape_append(name_esc, sizeof(name_esc), name);
         /* album_artist is populated for album groups. */
         json_escape_append(album_artist_esc, sizeof(album_artist_esc), groups[i].album_artist);
-        if (!json_builder_appendf(&json, "%s{\"name\":\"%s\",\"count\":%d,\"index\":%lld,\"album_artist\":\"%s\"}",
-                                  i > 0 ? "," : "", name_esc, groups[i].song_count,
-                                  (long long) groups[i].first_song_id, album_artist_esc)) break;
+        /* Keep room for the closing bracket, brace, and trailing NUL even if
+         * the next full row does not fit in the response buffer. */
+        json.capacity = response_capacity >= 2 ? response_capacity - 2 : response_capacity;
+        bool appended = json_builder_appendf(&json,
+            "%s{\"name\":\"%s\",\"count\":%d,\"index\":%lld,\"album_artist\":\"%s\"}",
+            i > 0 ? "," : "", name_esc, groups[i].song_count,
+            (long long) groups[i].first_song_id, album_artist_esc);
+        json.capacity = response_capacity;
+        if (!appended) break;
     }
     json.truncated = false;
     json_builder_appendf(&json, "]}");
@@ -562,6 +669,13 @@ static void build_album_artists_json(char * out, size_t out_size) {
     group_row_t * groups = malloc(sizeof(group_row_t) * GROUPS_JSON_MAX);
     int n = groups ? metadata_db_get_groups_page(METADATA_DB_GROUP_ALBUM_ARTIST, 0, GROUPS_JSON_MAX, groups) : 0;
     render_name_counts_json(groups, n, "artists", out, out_size);
+    free(groups);
+}
+
+static void build_genres_json(char * out, size_t out_size) {
+    group_row_t * groups = malloc(sizeof(group_row_t) * GROUPS_JSON_MAX);
+    int n = groups ? metadata_db_get_groups_page(METADATA_DB_GROUP_GENRE, 0, GROUPS_JSON_MAX, groups) : 0;
+    render_name_counts_json(groups, n, "genres", out, out_size);
     free(groups);
 }
 
@@ -1015,7 +1129,7 @@ static void handle_playlist_songs_request(int cfd, const char * path) {
  * Bounded read -- see REQUEST_LINE_MAX -- matches this project's general
  * "bound anything read from a socket" posture (http_client.c's own
  * response parsing does the same). */
-#define REQUEST_LINE_MAX 512
+#define REQUEST_LINE_MAX 4096
 #define REQUEST_HEADERS_MAX 4096
 
 static void handle_connection(int cfd) {
@@ -1113,7 +1227,7 @@ static void handle_connection(int cfd) {
 
     char method[8] = {0};
     char path[REQUEST_LINE_MAX] = {0};
-    if (sscanf(buf, "%7s %511s", method, path) != 2) {
+    if (sscanf(buf, "%7s %4095s", method, path) != 2) {
         send_response(cfd, "400 Bad Request", "text/plain", "Bad Request");
         return;
     }
@@ -1177,8 +1291,19 @@ static void handle_connection(int cfd) {
             char artist_raw[128] = {0}, artist_filter[128] = {0};
             char album_artist_raw[128] = {0}, album_artist_filter[128] = {0};
             char album_raw[128] = {0}, album_filter[128] = {0};
+            char genre_raw[METADATA_DB_TEXT_MAX * 3] = {0};
+            char genre_filter[METADATA_DB_TEXT_MAX] = {0};
             query_param_int(path, "offset", &offset);
             query_param_int(path, "limit", &limit);
+            bool query_ok = (!query_param_present(path, "q") || query_param_str(path, "q", query_raw, sizeof(query_raw))) &&
+                            (!query_param_present(path, "artist") || query_param_str(path, "artist", artist_raw, sizeof(artist_raw))) &&
+                            (!query_param_present(path, "album_artist") || query_param_str(path, "album_artist", album_artist_raw, sizeof(album_artist_raw))) &&
+                            (!query_param_present(path, "album") || query_param_str(path, "album", album_raw, sizeof(album_raw)));
+            if (!query_ok) {
+                send_response(cfd, "400 Bad Request", "application/json",
+                              "{\"error\":\"query_parameter_too_long\"}");
+                return;
+            }
             if (query_param_str(path, "q", query_raw, sizeof(query_raw))) {
                 url_decode(query_raw, query, sizeof(query));
             }
@@ -1191,9 +1316,16 @@ static void handle_connection(int cfd) {
             if (query_param_str(path, "album", album_raw, sizeof(album_raw))) {
                 url_decode(album_raw, album_filter, sizeof(album_filter));
             }
+            if (query_param_present(path, "genre") &&
+                (!query_param_str(path, "genre", genre_raw, sizeof(genre_raw)) ||
+                 !url_decode_checked(genre_raw, genre_filter, sizeof(genre_filter)))) {
+                send_response(cfd, "400 Bad Request", "application/json",
+                              "{\"error\":\"invalid_genre_filter\"}");
+                return;
+            }
             char * json = malloc(65536);
             if (json) {
-                build_library_json(query, artist_filter, album_artist_filter, album_filter, offset, limit, json,
+                build_library_json(query, artist_filter, album_artist_filter, album_filter, genre_filter, offset, limit, json,
                                     65536);
                 send_response(cfd, "200 OK", "application/json", json);
                 free(json);
@@ -1218,9 +1350,25 @@ static void handle_connection(int cfd) {
             } else {
                 send_response(cfd, "500 Internal Server Error", "text/plain", "Out of memory");
             }
+        } else if (strcmp(path_only, "/api/library/genres") == 0) {
+            char * json = malloc(65536);
+            if (json) {
+                build_genres_json(json, 65536);
+                send_response(cfd, "200 OK", "application/json", json);
+                free(json);
+            } else {
+                send_response(cfd, "500 Internal Server Error", "text/plain", "Out of memory");
+            }
         } else if (strcmp(path_only, "/api/library/albums") == 0) {
             char artist_raw[128] = {0}, artist_filter[128] = {0};
             char album_artist_raw[128] = {0}, album_artist_filter[128] = {0};
+            bool query_ok = (!query_param_present(path, "artist") || query_param_str(path, "artist", artist_raw, sizeof(artist_raw))) &&
+                            (!query_param_present(path, "album_artist") || query_param_str(path, "album_artist", album_artist_raw, sizeof(album_artist_raw)));
+            if (!query_ok) {
+                send_response(cfd, "400 Bad Request", "application/json",
+                              "{\"error\":\"query_parameter_too_long\"}");
+                return;
+            }
             if (query_param_str(path, "artist", artist_raw, sizeof(artist_raw))) {
                 url_decode(artist_raw, artist_filter, sizeof(artist_filter));
             }
@@ -1238,9 +1386,18 @@ static void handle_connection(int cfd) {
         } else if (strcmp(path_only, "/api/art") == 0) {
             handle_art_request(cfd, path);
         } else if (strcmp(path_only, "/api/playlists") == 0) {
-            char json[8192];
-            build_playlists_json(json, sizeof(json));
-            send_response(cfd, "200 OK", "application/json", json);
+            /* Heap, not stack: this runs on the remote listener / RFCOMM worker
+             * thread (default 128 KiB stack), and keeping large JSON buffers off
+             * the frame keeps handle_connection well clear of stack exhaustion
+             * on the deep metadata_db query paths below. */
+            char * json = malloc(8192);
+            if (json) {
+                build_playlists_json(json, 8192);
+                send_response(cfd, "200 OK", "application/json", json);
+                free(json);
+            } else {
+                send_response(cfd, "500 Internal Server Error", "text/plain", "Out of memory");
+            }
         } else if (strcmp(path_only, "/api/playlists/songs") == 0) {
             handle_playlist_songs_request(cfd, path);
         } else if (strcmp(path_only, "/api/queue") == 0) {
@@ -1248,9 +1405,17 @@ static void handle_connection(int cfd) {
             if (query_param_int(path, "offset", &offset) && offset < 0) offset = 0;
             if (query_param_int(path, "limit", &limit) && limit < 1) limit = 25;
             if (limit > 25) limit = 25;
-            char json[65536];
-            build_queue_json(json, sizeof(json), offset, limit);
-            send_response(cfd, "200 OK", "application/json", json);
+            /* Heap, not stack: a 64 KiB frame here on a 128 KiB worker-thread
+             * stack left too little headroom for the metadata_db query paths
+             * build_queue_json() reaches. */
+            char * json = malloc(65536);
+            if (json) {
+                build_queue_json(json, 65536, offset, limit);
+                send_response(cfd, "200 OK", "application/json", json);
+                free(json);
+            } else {
+                send_response(cfd, "500 Internal Server Error", "text/plain", "Out of memory");
+            }
         } else if (strcmp(path_only, "/assets/icon") == 0) {
             handle_icon_request(cfd, path);
         } else if (strcmp(path_only, "/") == 0) {

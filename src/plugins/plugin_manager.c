@@ -34,6 +34,7 @@
 #include <stdatomic.h>
 #include <limits.h>
 #include <unistd.h>
+#include <setjmp.h>
 
 #ifdef HOST_BUILD
   #define MUSIC_ROOT_DIR "./music"
@@ -98,6 +99,10 @@ typedef struct {
     char name[96];
     char version[32];
     bool defined;
+    /* Set when a plugin call blew past the hard time budget and was
+     * longjmp-aborted (see plugin_call()). Its lua_State is then left frozen
+     * mid-execution and must never be run again. */
+    bool aborted;
     time_t last_library_refresh;
     /* Source filename (basename, e.g. "Themes.lua"), not just the derived
      * plugin id -- needed by plugin_manager_scan_available() to map a
@@ -3709,8 +3714,16 @@ static const luaL_Reg plugin_secrets_funcs[] = {
 };
 
 #define PLUGIN_CALL_MAX_MS 2000
+/* One second of grace past the soft budget. A well-behaved plugin sees the
+ * catchable luaL_error at PLUGIN_CALL_MAX_MS and unwinds; a plugin that keeps
+ * running past this (e.g. by wrapping its loop body in its own pcall() and
+ * swallowing that error) is hard-aborted via longjmp so it cannot pin the UI
+ * thread indefinitely. */
+#define PLUGIN_CALL_HARD_MS 3000
 
 static struct timespec plugin_call_deadline_start;
+static jmp_buf plugin_call_abort_jmp;
+static volatile int plugin_call_abort_armed = 0;
 
 /* Adds time spent executing inside native C functions to the deadline start. */
 static void plugin_call_exclude_native_elapsed(const struct timespec * started) {
@@ -3908,6 +3921,16 @@ static void plugin_call_timeout_hook(lua_State * L, lua_Debug * ar) {
     clock_gettime(CLOCK_MONOTONIC, &now);
     long elapsed_ms = (now.tv_sec - plugin_call_deadline_start.tv_sec) * 1000L +
                       (now.tv_nsec - plugin_call_deadline_start.tv_nsec) / 1000000L;
+    if (elapsed_ms > PLUGIN_CALL_HARD_MS && plugin_call_abort_armed) {
+        /* Jump straight out to plugin_call(), past any pcall the plugin itself
+         * installed. The catchable luaL_error below is not enough on its own:
+         * a plugin can wrap its work in pcall() and swallow it, so without this
+         * a runaway loop would keep the UI thread busy forever. The VM is at an
+         * instruction boundary here, so its stack is consistent for the
+         * cleanup plugin_call() does after catching this. */
+        plugin_call_abort_armed = 0;
+        longjmp(plugin_call_abort_jmp, 1);
+    }
     if (elapsed_ms > PLUGIN_CALL_MAX_MS) {
         luaL_error(L, "plugin call exceeded %dms time budget -- aborted to keep the UI responsive", PLUGIN_CALL_MAX_MS);
     }
@@ -3915,12 +3938,48 @@ static void plugin_call_timeout_hook(lua_State * L, lua_Debug * ar) {
 
 /* Executes a Lua protected call with a wall-clock timeout enforced by an
  * instruction count hook. Time spent in native C functions is added to the
- * deadline to avoid penalizing I/O. */
+ * deadline to avoid penalizing I/O. A plugin that blows past the hard budget
+ * (PLUGIN_CALL_HARD_MS) is longjmp-aborted from the hook, bypassing any pcall
+ * it installed, and permanently disabled -- its lua_State is left frozen and
+ * never run again. */
 static int plugin_call(lua_State * L, int nargs, int nresults, int errfunc) {
+    plugin_instance_t * inst = plugin_instance_for_state(L);
+    if (inst && inst->aborted) {
+        lua_pushliteral(L, "plugin disabled after exceeding its time budget");
+        return LUA_ERRRUN;
+    }
+
+    /* Save/restore so a nested plugin_call (should one ever exist) can't lose
+     * the outer call's abort target or deadline. */
+    struct timespec saved_deadline = plugin_call_deadline_start;
+    int saved_armed = plugin_call_abort_armed;
+    jmp_buf saved_jmp;
+    memcpy(saved_jmp, plugin_call_abort_jmp, sizeof(jmp_buf));
+
     clock_gettime(CLOCK_MONOTONIC, &plugin_call_deadline_start);
     lua_sethook(L, plugin_call_timeout_hook, LUA_MASKCOUNT, 10000);
-    int result = lua_pcall(L, nargs, nresults, errfunc);
+
+    int result;
+    if (setjmp(plugin_call_abort_jmp) == 0) {
+        plugin_call_abort_armed = 1;
+        result = lua_pcall(L, nargs, nresults, errfunc);
+    } else {
+        /* Hard-aborted from the hook. L is at a VM instruction boundary, so its
+         * stack pointers are consistent: reset the stack and leave a readable
+         * error for the caller's usual lua_tostring()/lua_pop(). Mark the
+         * plugin dead and never call back into this state -- it is deliberately
+         * not lua_close()d (a half-unwound VM), just frozen and leaked, the
+         * same lifetime every other plugin state already has in this file. */
+        if (inst) inst->aborted = true;
+        lua_settop(L, 0);
+        lua_pushliteral(L, "plugin call hard-aborted after exceeding its time budget");
+        result = LUA_ERRRUN;
+    }
+
     lua_sethook(L, NULL, 0, 0); /* stop checking between plugin calls -- no cost while idle */
+    plugin_call_abort_armed = saved_armed;
+    memcpy(plugin_call_abort_jmp, saved_jmp, sizeof(jmp_buf));
+    plugin_call_deadline_start = saved_deadline;
     return result;
 }
 
@@ -3928,7 +3987,10 @@ static int plugin_call(lua_State * L, int nargs, int nresults, int errfunc) {
 static void discard_failed_plugin_load(plugin_instance_t * inst, lua_State * L,
                                         bool prev_curve_active, const uint8_t * prev_curve) {
     audio_stage_custom_hw_volume_curve(prev_curve_active, prev_curve_active ? prev_curve : NULL);
-    lua_close(L);
+    /* A hard-aborted state (load-time top-level code ran past the budget) was
+     * longjmp'd out of mid-execution; closing it could run finalizers on a
+     * half-unwound VM, so leave it frozen and leaked instead. */
+    if (!inst->aborted) lua_close(L);
     memset(inst, 0, sizeof(*inst));
     loading_plugin_slot = -1;
 }

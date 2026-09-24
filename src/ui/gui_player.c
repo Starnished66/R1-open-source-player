@@ -13,6 +13,8 @@
 static char ** playlist = NULL;
 static int playlist_count = 0;
 static int playlist_index = -1;
+static char now_playing_genre[128];
+static int now_playing_track_number;
 static int * playlist_lazy_sort_order = NULL;
 static bool playlist_lazy_order_is_recency = false;
 static struct tagcache_snapshot * playlist_lazy_snapshot = NULL;
@@ -1637,6 +1639,10 @@ void apply_track_metadata_to_ui(int index, track_metadata_t * out_meta) {
     const char * title_text = out_meta->has_title ? out_meta->title : title;
     const char * folder_text = out_meta->has_artist ? out_meta->artist : folder;
     const char * album_text = out_meta->has_album ? out_meta->album : "";
+    snprintf(now_playing_genre, sizeof(now_playing_genre), "%s", out_meta->has_genre ? out_meta->genre : "");
+    now_playing_track_number = out_meta->has_track_number && out_meta->track_number > 0 ? out_meta->track_number : 0;
+    if (is_subsonic_stream && subsonic_stream_meta[index].track > 0)
+        now_playing_track_number = subsonic_stream_meta[index].track;
 
     lv_label_set_text(song_title_label, title_text);
     if (album_label) lv_label_set_text(album_label, album_text);
@@ -1786,6 +1792,8 @@ static void delete_song_confirm_cb(lv_event_t * e) {
         set_play_button_state(false);
         lv_label_set_text(song_title_label, "No track loaded");
         if (album_label) lv_label_set_text(album_label, "");
+        now_playing_genre[0] = '\0';
+        now_playing_track_number = 0;
         if (artist_label) lv_label_set_text(artist_label, "");
         nav_pop(); /* nothing left to show on the player screen */
     } else {
@@ -4730,6 +4738,8 @@ void gui_player_handle_sd_unmount(void) {
     set_play_button_state(false);
     if (song_title_label) lv_label_set_text(song_title_label, "No track loaded");
     if (album_label) lv_label_set_text(album_label, "");
+    now_playing_genre[0] = '\0';
+    now_playing_track_number = 0;
     if (artist_label) lv_label_set_text(artist_label, "");
     if (lv_screen_active() == player_screen) nav_pop();
 }
@@ -4904,7 +4914,7 @@ bool build_saved_resume_playlist(char *** out_playlist, int * out_count, int * o
 
     if (indexed && current_settings.last_source_kind == 2 && current_settings.last_source_name[0] &&
         strcasecmp(current.tags.album, current_settings.last_source_name) == 0) {
-        int64_t count64 = metadata_db_count_songs_filtered(NULL, NULL, current.tags.album_artist, current.tags.album);
+        int64_t count64 = metadata_db_count_songs_filtered(NULL, NULL, current.tags.album_artist, current.tags.album, NULL);
         if (count64 > 0 && count64 <= INT_MAX) {
             int count = (int) count64;
             group_song_entry_t * entries = calloc((size_t) count, sizeof(*entries));
@@ -4915,7 +4925,7 @@ bool build_saved_resume_playlist(char *** out_playlist, int * out_count, int * o
                 int want = count - loaded;
                 if (want > 64) want = 64;
                 int got = metadata_db_get_songs_filtered_page(NULL, NULL, current.tags.album_artist,
-                                                               current.tags.album, loaded, want, rows);
+                                                               current.tags.album, NULL, loaded, want, rows);
                 if (got <= 0) break;
                 for (int i = 0; i < got; i++) {
                     char title[128];
@@ -5574,6 +5584,18 @@ const char * gui_player_get_now_playing_title(void) {
 
 const char * gui_player_get_now_playing_folder(void) {
     return artist_label ? lv_label_get_text(artist_label) : "";
+}
+
+const char * gui_player_get_now_playing_album(void) {
+    return album_label ? lv_label_get_text(album_label) : "";
+}
+
+const char * gui_player_get_now_playing_genre(void) {
+    return now_playing_genre;
+}
+
+int gui_player_get_now_playing_track_number(void) {
+    return now_playing_track_number;
 }
 
 

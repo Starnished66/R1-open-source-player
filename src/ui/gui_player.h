@@ -154,6 +154,9 @@ void gui_player_set_volume_percent(int32_t percent);
 bool gui_player_volume_is_being_adjusted(void);
 const char * gui_player_get_now_playing_title(void);
 const char * gui_player_get_now_playing_folder(void);
+const char * gui_player_get_now_playing_album(void);
+const char * gui_player_get_now_playing_genre(void);
+int gui_player_get_now_playing_track_number(void);
 
 
 void gui_player_handle_auto_advance(void);

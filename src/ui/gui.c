@@ -519,6 +519,13 @@ static void update_timer_cb(lv_timer_t * timer) {
      * safe to do unconditionally every tick rather than hunting down every
      * call site that can change play state. */
     bt_media_player_notify_playback_state(audio_is_playing());
+    bool has_track = gui_player_has_active_track();
+    bt_media_player_notify_track(has_track ? gui_player_get_now_playing_title() : "",
+                                 has_track ? gui_player_get_now_playing_folder() : "",
+                                 has_track ? gui_player_get_now_playing_album() : "",
+                                 has_track ? gui_player_get_now_playing_genre() : "",
+                                 has_track ? gui_player_get_now_playing_track_number() : 0,
+                                 audio_get_position_seconds(), audio_get_duration_seconds());
 #endif
 
     /* Accessory-originated AVRCP volume changes arrive on bluealsa's
@@ -956,14 +963,12 @@ static void update_timer_cb(lv_timer_t * timer) {
          * are this app's own single source of truth for title/artist (see
          * apply_track_metadata_to_ui()), so read them back rather than
          * standing up a second copy of the same state just for this.
-         * Album isn't tracked anywhere after the initial metadata_read()
-         * call, so it's left blank here -- a real gap, not an oversight,
-         * see remote_control.h's own Phase 1 scope note. */
+         * album_label is read back the same way below. */
         const char * now_playing_path = gui_player_has_active_track()
                 ? gui_player_get_current_track_path()
                 : NULL;
         remote_control_notify_status(audio_is_playing(), audio_is_paused(), gui_player_get_now_playing_title(),
-                                      gui_player_get_now_playing_folder(), "", now_playing_path,
+                                      gui_player_get_now_playing_folder(), gui_player_get_now_playing_album(), now_playing_path,
                                       (int) audio_get_position_seconds(), (int) audio_get_duration_seconds(),
                                       audio_get_volume(), current_settings.play_mode);
     }

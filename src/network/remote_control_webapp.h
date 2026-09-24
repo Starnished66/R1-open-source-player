@@ -133,7 +133,7 @@ static const char * const REMOTE_CONTROL_APP_HTML =
     /* One fetch wrapper keeps browser requests on the same PIN contract as the Android client. */
     "var rcNativeFetch=window.fetch.bind(window),rcPinKey='compas-remote-pin',rcPinPrompt=null,rcPinPromptUntil=0;"
     "function rcAskPin(){if(rcPinPrompt)return rcPinPrompt;if(Date.now()<rcPinPromptUntil)return Promise.resolve(null);rcPinPrompt=new Promise(function(resolve){"
-    "var value=window.prompt('Enter the Remote Control PIN shown on your player (default: 0000)');"
+    "var value=window.prompt('Enter the PIN shown on your player under Wireless > Remote Control');"
     "resolve(value&&/^\\d{4,12}$/.test(value)?value:null);});setTimeout(function(){rcPinPrompt=null;rcPinPromptUntil=Date.now()+30000;},4000);return rcPinPrompt;}"
     "window.fetch=function(input,init){var url=typeof input==='string'?input:input.url;"
     "if(url==='/'||url.indexOf('/api/v1/capabilities')===0)return rcNativeFetch(input,init);"

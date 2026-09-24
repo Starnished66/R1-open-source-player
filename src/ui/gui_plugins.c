@@ -836,8 +836,8 @@ int gui_plugin_library_get_songs(const char * query, const char * artist, const 
                                   int64_t * out_total) {
     if (offset < 0) offset = 0;
     limit = gui_plugin_library_clamp_limit(limit);
-    if (out_total) *out_total = metadata_db_count_songs_filtered(query, artist, album_artist, album);
-    return metadata_db_get_songs_filtered_page(query, artist, album_artist, album, offset, limit, out_rows);
+    if (out_total) *out_total = metadata_db_count_songs_filtered(query, artist, album_artist, album, NULL);
+    return metadata_db_get_songs_filtered_page(query, artist, album_artist, album, NULL, offset, limit, out_rows);
 }
 
 int gui_plugin_library_search(const char * query, int limit, song_row_t * out_rows) {

@@ -263,6 +263,19 @@ LVGL_FBDEV_SYMBOLS := lv_linux_fbdev_get_active_page lv_linux_fbdev_get_inactive
 ifeq ($(wildcard $(DR_LIBS_DIR)),)
 $(info Cloning dr_libs (dr_flac)...)
 $(shell git clone --depth 1 https://github.com/mackron/dr_libs.git)
+# dr_libs is a fresh upstream clone (gitignored, not tracked), so vendored
+# fixes to it must be reapplied here rather than committed. This patch bounds
+# dr_wav's metadata chunk seek so a crafted WAV/AIFC chunk size cannot spin
+# drwav__seek_forward forever -- reachable in-process on the UI thread via
+# read_wav_metadata() when a malformed file is played. Applied right after the
+# clone (pristine tree, so it always applies cleanly); a loud warning rather
+# than a silent build if upstream ever drifts, since the miss is a security
+# hardening regression, not a compile error.
+$(info Hardening dr_libs metadata parser...)
+DR_LIBS_PATCH_RESULT := $(shell patch -p1 --forward --fuzz=0 -i patches/dr_libs_metadata_hardening.patch >/dev/null 2>&1 && echo ok || echo FAILED)
+ifneq ($(DR_LIBS_PATCH_RESULT),ok)
+$(warning dr_libs metadata-hardening patch did not apply -- WAV/AIFF metadata DoS hardening is NOT in effect; check patches/dr_libs_metadata_hardening.patch against the current upstream dr_wav.h)
+endif
 endif
 
 # tinyalsa (minimal ALSA userspace library, used on target only for audio output)
@@ -432,7 +445,14 @@ endif
 # *.d files near the bottom of this Makefile is what actually feeds these
 # back in on the next invocation -- this flag alone does nothing without
 # that companion include.
-CFLAGS = -O3 -g -Wall -MMD -MP -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -Isrc/plugins -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(OPUS_DIR)/include -I$(LUA_DIR)/src -I$(STB_VORBIS_DIR) -Ijpeg_vendor_config -I$(JPEG_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
+# -fwrapv: define signed integer overflow as two's-complement wraparound
+# instead of undefined behavior. The vendored single-header media decoders
+# (stb_vorbis, dr_flac, ...) assemble little-endian integers with expressions
+# like `byte << 24` that technically overflow a signed int; they are correct on
+# the target but are UB by the letter of the standard, which a future optimizer
+# could exploit. This makes that whole class defined for every file we build,
+# at negligible cost, rather than patching each vendored decoder.
+CFLAGS = -O3 -g -Wall -fwrapv -MMD -MP -I. -Isrc/audio -Isrc/network -Isrc/library -Isrc/hardware -Isrc/ui -Isrc/core -Isrc/plugins -I$(LVGL_DIR) -I$(DR_LIBS_DIR) -I$(FAAD2_DIR)/include -I$(ALAC_DIR)/codec -I$(MBEDTLS_DIR)/include -I$(CJSON_DIR) -I$(OPUS_DIR)/include -I$(LUA_DIR)/src -I$(STB_VORBIS_DIR) -Ijpeg_vendor_config -I$(JPEG_DIR) -DLV_CONF_INCLUDE_SIMPLE=1
 CXXFLAGS = $(filter-out -Wall,$(CFLAGS)) -std=c++11
 HOST_CFLAGS = $(CFLAGS) -DHOST_BUILD=1 $(BOARD_DEFINE) $(shell sdl2-config --cflags) -I$(TINFL_DIR) -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS
 HOST_CXXFLAGS = $(CXXFLAGS) -DHOST_BUILD=1 $(BOARD_DEFINE) $(shell sdl2-config --cflags) -I$(TINFL_DIR) -DMINIZ_NO_DEFLATE_APIS -DMINIZ_NO_ARCHIVE_APIS
@@ -907,6 +927,20 @@ remote-control-mdns-selftest:
 	$(CC) -O0 -g -Wall -Wextra -Isrc/network src/network/remote_control_mdns_test.c -pthread \
 	    -o $(BUILD_TARGET_DIR)/remote_control_mdns_test
 	./$(BUILD_TARGET_DIR)/remote_control_mdns_test
+
+# Remote Control PIN lifecycle: random 6-digit PIN generated once and reused,
+# "0000" placeholder migration, Generate New PIN clearing a lockout. Includes
+# the real remote_control.c; section GC discards the unreached server code.
+.PHONY: remote-control-pin-selftest
+remote-control-pin-selftest:
+	@mkdir -p $(BUILD_TARGET_DIR)
+	$(CC) -O0 -g -Wall -Wextra -ffunction-sections -fdata-sections -DHOST_BUILD=1 \
+	    -I. -Isrc/network -Isrc/core -Isrc/audio -Isrc/library -Isrc/ui \
+	    -Ilvgl -Idr_libs -Ifaad2/include -Ialac/codec -Imbedtls/include -IcJSON -Iopus/include \
+	    -Ilua/src -Istb_vorbis -Ijpeg_vendor_config -Ijpeg -Itinfl -DLV_CONF_INCLUDE_SIMPLE=1 \
+	    src/network/remote_control_pin_test.c -Wl,--gc-sections -lpthread \
+	    -o $(BUILD_TARGET_DIR)/remote_control_pin_test
+	./$(BUILD_TARGET_DIR)/remote_control_pin_test
 
 subprocess-timeout-selftest:
 	@mkdir -p $(BUILD_TARGET_DIR)

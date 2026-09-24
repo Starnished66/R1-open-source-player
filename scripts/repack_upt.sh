@@ -73,10 +73,13 @@ cat "${root_chunks[@]}" > "$work/rootfs.squashfs"
 cat "${kernel_chunks[@]}" > "$work/xImage"
 unsquashfs -no-xattrs -d "$work/root" "$work/rootfs.squashfs" >/dev/null
 
+# Board identity comes from the firmware's device config ("device":"R1" or
+# "R3PROII"), not the stock player binary, which base images no longer ship.
 if [[ $board == r3proii ]]; then
-    stock_player="$work/root/usr/bin/hiby_player"
-    if [[ ! -s "$stock_player" ]] || ! grep -aFq 'R3PROII' "$stock_player"; then
-        echo "Base OTA does not contain an R3 Pro II stock player; refusing a cross-board image" >&2
+    board_config="$work/root/usr/resource/config.json"
+    if [[ ! -s "$board_config" ]] ||
+        ! grep -Eq '"device"[[:space:]]*:[[:space:]]*"R3PROII"' "$board_config"; then
+        echo "Base OTA is not identified as an R3 Pro II; refusing a cross-board image" >&2
         exit 1
     fi
 fi

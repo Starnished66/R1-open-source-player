@@ -3466,7 +3466,7 @@ static void open_dlna_screen(void) {
 /* ---- Remote Control screen (Wireless -> "Open Link") -- exposes the
  * HTTP address over Wi-Fi and the RFCOMM service name over Bluetooth.
  * Built on the same flex list as the DLNA/Wi-Fi screens: standard toggle
- * row, a "Connection PIN" row, a "Generate New PIN" action row, then the
+ * row, a "Connection PIN" row with a refresh icon to replace the PIN, then the
  * QR/URL lines styled like build_import_wifi_screen()'s -- the same
  * "here's an address, scan or type it" moment for a different feature. ---- */
 
@@ -3633,9 +3633,10 @@ static void remote_control_toggle_cb(lv_event_t * e) {
     gui_network_toggle_remote_control();
 }
 
-/* ---- "Generate new PIN" confirmation. Regenerating immediately locks out
- * every app and browser still using the old PIN, so it asks first, like the
- * other disruptive actions in this file (bt_dac_leave_popup). Built once in
+/* ---- New-PIN confirmation for the PIN row's refresh icon. Regenerating
+ * immediately locks out every app and browser still using the old PIN, so it
+ * asks first, like the other disruptive actions in this file
+ * (bt_dac_leave_popup). Built once in
  * gui_network_init() on lv_layer_top(), torn down in gui_network_teardown(). */
 static gui_popup_t remote_control_new_pin_popup;
 
@@ -3655,7 +3656,7 @@ static void remote_control_new_pin_confirm_cb(lv_event_t * e) {
     show_info_toast("New PIN generated");
 }
 
-static void remote_control_generate_pin_row_cb(lv_event_t * e) {
+static void remote_control_regenerate_pin_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     gui_popup_show(&remote_control_new_pin_popup);
 }
@@ -3671,8 +3672,8 @@ static void build_remote_control_new_pin_popup(void) {
 
 /* Standard settings-list layout (build_subsonic_list_screen(), the same
  * flex column as the Wi-Fi and Bluetooth screens): the on/off toggle row,
- * the PIN on its own row, and a separate action row to replace it. The
- * connection details follow as wrapped text lines. */
+ * then the PIN row with a refresh icon to replace the PIN. The connection
+ * details follow as wrapped text lines. */
 static lv_obj_t * build_remote_control_screen(void) {
     lv_obj_t * title_label;
     lv_obj_t * list;
@@ -3685,16 +3686,31 @@ static lv_obj_t * build_remote_control_screen(void) {
     remote_control_toggle_img = lv_obj_get_child(toggle_row, -1);
 
     lv_obj_t * pin_row = add_pill_row_base(list, "Connection PIN");
+
+    /* Refresh icon at the row's trailing edge (same -20 inset as the toggle
+     * and chevron rows) regenerates the PIN; LV_SYMBOL_REFRESH comes from the
+     * Montserrat fallback chain behind the app font. The glyph is small, so
+     * widen its touch area. */
+    lv_obj_t * regenerate_icon = lv_label_create(pin_row);
+    lv_label_set_text(regenerate_icon, LV_SYMBOL_REFRESH);
+    lv_obj_set_style_text_color(regenerate_icon, accent_lv_color(), 0);
+    lv_obj_set_style_text_font(regenerate_icon, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_obj_align(regenerate_icon, LV_ALIGN_RIGHT_MID, -20, 0);
+    lv_obj_add_flag(regenerate_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(regenerate_icon, BOARD_SCALE_PX(20));
+    lv_obj_add_event_cb(regenerate_icon, remote_control_regenerate_pin_cb, LV_EVENT_CLICKED, NULL);
+
+    /* The PIN sits just left of the icon. lv_obj_align() (unlike
+     * lv_obj_align_to()) keeps the right-edge anchor as the text changes
+     * between a PIN and "Unavailable". */
+    lv_obj_update_layout(regenerate_icon);
+    int32_t icon_width = lv_obj_get_width(regenerate_icon);
     remote_control_pin_label = lv_label_create(pin_row);
     lv_obj_add_style(remote_control_pin_label, &style_theme_text_primary, 0);
     lv_obj_set_style_text_font(remote_control_pin_label, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
-    lv_obj_align(remote_control_pin_label, LV_ALIGN_RIGHT_MID, -20, 0);
+    lv_obj_align(remote_control_pin_label, LV_ALIGN_RIGHT_MID, -20 - icon_width - BOARD_SCALE_PX(16), 0);
     remote_control_displayed_pin_valid = false;
     remote_control_refresh_pin_label();
-
-    lv_obj_t * generate_row = add_pill_row_base(list, "Generate New PIN");
-    lv_obj_add_flag(generate_row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(generate_row, remote_control_generate_pin_row_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t * explanation = lv_label_create(list);
     lv_label_set_text(explanation,

@@ -133,7 +133,7 @@ typedef struct {
     bool query_cache_valid;
     uint64_t query_cache_block;
     uint32_t query_cache_values[TC_QUERY_BLOCK_VALUES];
-    struct { bool valid; int32_t slot; tagcache_song_t song; } sort_cache[READER_SORT_CACHE_ROWS];
+    struct { bool valid; int32_t slot; unsigned loaded; tagcache_song_t song; } sort_cache[READER_SORT_CACHE_ROWS];
 } reader_context_t;
 static reader_context_t committed_reader, scan_reader, build_reader;
 static _Thread_local reader_context_t *selected_reader;
@@ -243,6 +243,28 @@ static int ascii_casecmp(const char * a, const char * b) {
         if (ca != cb) return (int) ca - (int) cb;
         if (ca == 0) return 0;
     }
+}
+
+#define TAGCACHE_SORT_TEXT_PREFIX 40
+#define TAGCACHE_SORT_PATH_PREFIX 64
+
+/* Folded byte order matches ascii_casecmp; NUL padding proves equality only when a prefix terminates. */
+static bool tagcache_sort_prefix(const char *value, unsigned char *prefix, size_t width) {
+    if (!value || !prefix || !width) return false;
+    const char *end = memchr(value, '\0', TAGCACHE_PATH_MAX);
+    if (!end) return false;
+    memset(prefix, 0, width);
+    size_t length = (size_t)(end - value);
+    size_t copy = length < width ? length : width;
+    for (size_t i = 0; i < copy; i++) prefix[i] = ascii_fold((unsigned char)value[i]);
+    return true;
+}
+
+static int tagcache_sort_prefix_compare(const unsigned char *a, const unsigned char *b,
+                                       size_t width, bool *full_compare) {
+    int c = memcmp(a, b, width);
+    *full_compare = c == 0 && memchr(a, '\0', width) == NULL;
+    return c;
 }
 
 int tagcache_cmp_ascii(const char * a, const char * b) {
@@ -1917,7 +1939,10 @@ void tagcache_upsert(const char *path, int32_t mtime, int32_t size, const char *
     }
 }
 
-typedef struct { int32_t seek, slot; } commit_key_t;
+typedef struct {
+    int32_t seek, slot;
+    unsigned char key[TAGCACHE_SORT_TEXT_PREFIX];
+} commit_key_t;
 static int commit_source_tag;
 static bool commit_read_failed;
 static int32_t commit_tag_sources[TAGCACHE_REFS_COUNT];
@@ -1962,13 +1987,17 @@ static bool tag_output_matches(int tag, int source, int64_t count, int keys, int
 static int compare_commit_key(const void *a, const void *b, void *ctx) {
     (void) ctx;
     const commit_key_t *ka = a, *kb = b;
-    char sa[TAGCACHE_PATH_MAX], sb[TAGCACHE_PATH_MAX];
-    if (!reader_string(commit_source_tag, ka->seek, ka->slot, sa, sizeof(sa)) ||
-        !reader_string(commit_source_tag, kb->seek, kb->slot, sb, sizeof(sb))) {
-        commit_read_failed = true;
-        return (ka->slot > kb->slot) - (ka->slot < kb->slot);
+    bool full_compare;
+    int c = tagcache_sort_prefix_compare(ka->key, kb->key, sizeof(ka->key), &full_compare);
+    if (!c && full_compare) {
+        char sa[TAGCACHE_PATH_MAX], sb[TAGCACHE_PATH_MAX];
+        if (!reader_string(commit_source_tag, ka->seek, ka->slot, sa, sizeof(sa)) ||
+            !reader_string(commit_source_tag, kb->seek, kb->slot, sb, sizeof(sb))) {
+            commit_read_failed = true;
+            return (ka->slot > kb->slot) - (ka->slot < kb->slot);
+        }
+        c = ascii_casecmp(sa, sb);
     }
-    int c = ascii_casecmp(sa, sb);
     return c ? c : (ka->slot > kb->slot) - (ka->slot < kb->slot);
 }
 
@@ -1981,17 +2010,46 @@ static bool write_commit_tag(int tag, int32_t gen, int master) {
     int keys = reader_create_temp(), scratch = reader_create_temp();
     int fd = -1;
     bool ok = keys >= 0 && scratch >= 0;
+    size_t key_batch_capacity = (64u * 1024u) / sizeof(commit_key_t);
+    unsigned char *key_batch = NULL;
+    if (ok && key_batch_capacity == 0) ok = false;
+    size_t key_batch_used = 0;
     int64_t count = 0;
+    commit_source_tag = source;
+    commit_read_failed = false;
     for (int32_t slot = 0; ok && slot < ent_count; slot++) {
         struct index_entry idx;
         if (!reader_index(slot, &idx)) { ok = false; break; }
         if (idx.flag & FLAG_DELETED) continue;
-        commit_key_t key = {empty ? 0 : idx.tag_seek[source], slot};
-        ok = write_at(keys, &key, sizeof(key), (off_t) count * sizeof(key));
+        commit_key_t key = {0};
+        key.seek = empty ? 0 : idx.tag_seek[source];
+        key.slot = slot;
+        if (!empty && tag != tag_filename) {
+            char value[TAGCACHE_PATH_MAX];
+            if (!reader_string(source, key.seek, slot, value, sizeof(value)) ||
+                !tagcache_sort_prefix(value, key.key, sizeof(key.key))) {
+                commit_read_failed = true;
+                ok = false;
+                break;
+            }
+        }
+        if (key_batch == NULL) {
+            key_batch = (unsigned char *)malloc(64u * 1024u);
+            if (key_batch == NULL) { ok = false; break; }
+        }
+        memcpy(key_batch + key_batch_used * sizeof(key), &key, sizeof(key));
+        key_batch_used++;
         count++;
+        if (key_batch_used == key_batch_capacity) {
+            ok = tc_sort_io_write(keys, key_batch, key_batch_used * sizeof(key),
+                                  (off_t)(count - (int64_t)key_batch_used) * (off_t)sizeof(key));
+            if (ok) key_batch_used = 0;
+        }
     }
-    commit_source_tag = source;
-    commit_read_failed = false;
+    if (ok && key_batch_used != 0)
+        ok = tc_sort_io_write(keys, key_batch, key_batch_used * sizeof(commit_key_t),
+                              (off_t)(count - (int64_t)key_batch_used) * (off_t)sizeof(commit_key_t));
+    free(key_batch);
     if (ok && !empty && tag != tag_filename)
         ok = tc_sort_fd(keys, sizeof(commit_key_t), count, compare_commit_key, NULL, scratch) && !commit_read_failed;
     bool reuse = ok && tag_output_matches(tag, source, count, keys, disk_gen);

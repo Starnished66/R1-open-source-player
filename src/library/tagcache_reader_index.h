@@ -338,7 +338,10 @@ void tagcache_artist_primary(const char *raw, char *out, size_t size) {
 }
 
 static void reader_reset_cache(void) {
-    for (int i = 0; i < READER_SORT_CACHE_ROWS; i++) reader_sort_cache[i].valid = false;
+    for (int i = 0; i < READER_SORT_CACHE_ROWS; i++) {
+        reader_sort_cache[i].valid = false;
+        reader_sort_cache[i].loaded = 0;
+    }
 }
 
 static void reader_song_rebase(tagcache_song_t *s) {
@@ -347,14 +350,30 @@ static void reader_song_rebase(tagcache_song_t *s) {
     s->album_artist = s->album_artist_storage; s->genre = s->genre_storage;
 }
 
-static bool reader_sort_song(int32_t slot, tagcache_song_t *out) {
+static bool reader_sort_song_fields(int32_t slot, unsigned fields, tagcache_song_t *out) {
     unsigned bucket = (unsigned) slot % READER_SORT_CACHE_ROWS;
     const char *disabled = getenv("TAGCACHE_TEST_DISABLE_READER_CACHE");
-    if (disabled && atoi(disabled)) return reader_song(slot, out);
-    if (!reader_sort_cache[bucket].valid || reader_sort_cache[bucket].slot != slot) {
-        reader_sort_cache[bucket].valid = false;
-        if (!reader_song(slot, &reader_sort_cache[bucket].song)) return false;
+    if (disabled && atoi(disabled)) {
+        if (!reader_song_fields(slot, fields, out)) {
+            reader_sort_failed = true;
+            return false;
+        }
+        return true;
+    }
+    bool hit = reader_sort_cache[bucket].valid && reader_sort_cache[bucket].slot == slot;
+    unsigned loaded = hit ? reader_sort_cache[bucket].loaded : 0;
+    if (!hit || (loaded & fields) != fields) {
+        unsigned requested = loaded | fields;
+        tagcache_song_t song;
+        if (!reader_song_fields(slot, requested, &song)) {
+            reader_sort_failed = true;
+            return false;
+        }
+        if (requested & TAGCACHE_FIELD_ALBUM_ARTIST) requested |= TAGCACHE_FIELD_ARTIST;
+        reader_sort_cache[bucket].song = song;
+        reader_song_rebase(&reader_sort_cache[bucket].song);
         reader_sort_cache[bucket].slot = slot;
+        reader_sort_cache[bucket].loaded = requested;
         reader_sort_cache[bucket].valid = true;
     }
     *out = reader_sort_cache[bucket].song;
@@ -365,6 +384,27 @@ static bool reader_sort_song(int32_t slot, tagcache_song_t *out) {
 typedef struct { uint32_t hash; int32_t slot; } reader_path_key_t;
 typedef struct { int32_t slot, ordinal; } reader_member_t;
 typedef struct { reader_member_t representative; int32_t first_id, count, start; } reader_group_record_t;
+typedef struct { int32_t slot; unsigned char title[TAGCACHE_SORT_TEXT_PREFIX]; } reader_title_sort_t;
+typedef struct {
+    int32_t slot, first_seen;
+    unsigned char path[TAGCACHE_SORT_PATH_PREFIX];
+} reader_recency_sort_t;
+typedef struct {
+    reader_member_t member;
+    unsigned char name[TAGCACHE_SORT_TEXT_PREFIX], aa[TAGCACHE_SORT_TEXT_PREFIX];
+    union {
+        unsigned char album[TAGCACHE_SORT_TEXT_PREFIX];
+        struct { int32_t disc, track; } album_order;
+    } secondary;
+    unsigned char path[TAGCACHE_SORT_PATH_PREFIX];
+} reader_member_sort_t;
+
+_Static_assert(offsetof(reader_recency_sort_t, path) == 8, "recency path offset changed");
+_Static_assert(sizeof(reader_recency_sort_t) == 72, "recency sort layout changed");
+_Static_assert(offsetof(reader_member_sort_t, path) == 128, "member path offset changed");
+_Static_assert(sizeof(reader_member_sort_t) == 192, "member sort layout changed");
+
+#define READER_TEMP_BATCH_BYTES (64u * 1024u)
 
 static int reader_compare_path(const void *a, const void *b, void *context) {
     (void) context;
@@ -373,18 +413,67 @@ static int reader_compare_path(const void *a, const void *b, void *context) {
     return (ka->slot > kb->slot) - (ka->slot < kb->slot);
 }
 
+static int reader_compare_title_sort(const void *a, const void *b, void *context) {
+    (void) context;
+    const reader_title_sort_t *ka = a, *kb = b;
+    bool full_compare;
+    int c = tagcache_sort_prefix_compare(ka->title, kb->title, sizeof(ka->title), &full_compare);
+    if (!c && full_compare) {
+        tagcache_song_t sa, sb;
+        if (!reader_sort_song_fields(ka->slot, TAGCACHE_FIELD_TITLE, &sa) ||
+            !reader_sort_song_fields(kb->slot, TAGCACHE_FIELD_TITLE, &sb)) {
+            reader_sort_failed = true;
+            return (ka->slot > kb->slot) - (ka->slot < kb->slot);
+        }
+        c = ascii_casecmp(sa.title, sb.title);
+    }
+    return c ? c : (ka->slot > kb->slot) - (ka->slot < kb->slot);
+}
+
+static int reader_compare_recency_sort(const void *a, const void *b, void *context) {
+    (void) context;
+    const reader_recency_sort_t *ka = a, *kb = b;
+    if (ka->first_seen != kb->first_seen) return ka->first_seen > kb->first_seen ? -1 : 1;
+    if (!reader_compact_sort) {
+        bool full_compare;
+        int c = tagcache_sort_prefix_compare(ka->path, kb->path, sizeof(ka->path), &full_compare);
+        if (!c && full_compare) {
+            tagcache_song_t sa, sb;
+            if (!reader_sort_song_fields(ka->slot, TAGCACHE_FIELD_PATH, &sa) ||
+                !reader_sort_song_fields(kb->slot, TAGCACHE_FIELD_PATH, &sb)) {
+                reader_sort_failed = true;
+                return (ka->slot > kb->slot) - (ka->slot < kb->slot);
+            }
+            c = ascii_casecmp(sa.path, sb.path);
+        }
+        if (c) return c;
+    }
+    return (ka->slot > kb->slot) - (ka->slot < kb->slot);
+}
+
 static int reader_compare_order(const void *a, const void *b, void *context) {
     bool recency = *(bool *) context;
     int32_t ia = *(const int32_t *) a, ib = *(const int32_t *) b;
     tagcache_song_t sa, sb;
-    if (!reader_sort_song(ia, &sa) || !reader_sort_song(ib, &sb)) {
+    unsigned fields = recency ? 0 : TAGCACHE_FIELD_TITLE;
+    if (!reader_sort_song_fields(ia, fields, &sa) || !reader_sort_song_fields(ib, fields, &sb)) {
         reader_sort_failed = true;
         return (ia > ib) - (ia < ib);
     }
     int c;
     if (recency && sa.first_seen != sb.first_seen) return sa.first_seen > sb.first_seen ? -1 : 1;
-    c = recency && reader_compact_sort ? 0 :
-        ascii_casecmp(recency ? sa.path : sa.title, recency ? sb.path : sb.title);
+    if (recency) {
+        if (reader_compact_sort) c = 0;
+        else {
+            /* Paths are needed only when first_seen ties. */
+            if (!reader_sort_song_fields(ia, TAGCACHE_FIELD_PATH, &sa) ||
+                !reader_sort_song_fields(ib, TAGCACHE_FIELD_PATH, &sb)) {
+                reader_sort_failed = true;
+                return (ia > ib) - (ia < ib);
+            }
+            c = ascii_casecmp(sa.path, sb.path);
+        }
+    } else c = ascii_casecmp(sa.title, sb.title);
     return c ? c : (ia > ib) - (ia < ib);
 }
 
@@ -403,11 +492,126 @@ static void reader_member_names(int kind, const reader_member_t *member, const t
     }
 }
 
+static unsigned reader_member_name_field(int kind) {
+    return kind == TAGCACHE_GROUP_ARTIST ? TAGCACHE_FIELD_ARTIST :
+        kind == TAGCACHE_GROUP_ALBUM_ARTIST ? TAGCACHE_FIELD_ALBUM_ARTIST : TAGCACHE_FIELD_ALBUM;
+}
+
+static bool reader_member_sort_string(int kind, const reader_member_t *member, unsigned field,
+                                      bool album_artist, char *out) {
+    tagcache_song_t song;
+    if (!reader_sort_song_fields(member->slot, field, &song)) {
+        reader_sort_failed = true;
+        return false;
+    }
+    char name[TAGCACHE_PATH_MAX], aa[TAGCACHE_PATH_MAX];
+    reader_member_names(kind, member, &song, name, aa);
+    snprintf(out, TAGCACHE_PATH_MAX, "%s", album_artist ? aa : name);
+    return true;
+}
+
+static bool reader_make_member_sort(int kind, const reader_member_t *member,
+                                    const tagcache_song_t *song, reader_member_sort_t *key) {
+    char name[TAGCACHE_PATH_MAX], aa[TAGCACHE_PATH_MAX];
+    memset(key, 0, sizeof(*key));
+    key->member = *member;
+    reader_member_names(kind, member, song, name, aa);
+    if (!tagcache_sort_prefix(name, key->name, sizeof(key->name)) ||
+        !tagcache_sort_prefix(aa, key->aa, sizeof(key->aa))) {
+        reader_sort_failed = true;
+        return false;
+    }
+    if (kind == TAGCACHE_GROUP_ALBUM) {
+        key->secondary.album_order.disc = song->disc_number > 0 ? song->disc_number : 1;
+        key->secondary.album_order.track = song->track_number;
+    } else if (!tagcache_sort_prefix(song->album, key->secondary.album, sizeof(key->secondary.album))) {
+        reader_sort_failed = true;
+        return false;
+    }
+    if (!reader_compact_sort && !tagcache_sort_prefix(song->path, key->path, sizeof(key->path))) {
+        reader_sort_failed = true;
+        return false;
+    }
+    return true;
+}
+
+static int reader_compare_member_sort(const void *a, const void *b, void *context) {
+    int kind = *(const int *)context;
+    const reader_member_sort_t *ka = a, *kb = b;
+    bool full_compare;
+    int c = tagcache_sort_prefix_compare(ka->name, kb->name, sizeof(ka->name), &full_compare);
+    if (!c && full_compare) {
+        char na[TAGCACHE_PATH_MAX], nb[TAGCACHE_PATH_MAX];
+        if (!reader_member_sort_string(kind, &ka->member, reader_member_name_field(kind), false, na) ||
+            !reader_member_sort_string(kind, &kb->member, reader_member_name_field(kind), false, nb)) {
+            reader_sort_failed = true;
+            return (ka->member.slot > kb->member.slot) - (ka->member.slot < kb->member.slot);
+        }
+        c = ascii_casecmp(na, nb);
+    }
+    if (c) return c;
+
+    c = tagcache_sort_prefix_compare(ka->aa, kb->aa, sizeof(ka->aa), &full_compare);
+    if (!c && full_compare) {
+        char aa[TAGCACHE_PATH_MAX], ab[TAGCACHE_PATH_MAX];
+        if (!reader_member_sort_string(kind, &ka->member, TAGCACHE_FIELD_ALBUM_ARTIST, true, aa) ||
+            !reader_member_sort_string(kind, &kb->member, TAGCACHE_FIELD_ALBUM_ARTIST, true, ab)) {
+            reader_sort_failed = true;
+            return (ka->member.slot > kb->member.slot) - (ka->member.slot < kb->member.slot);
+        }
+        c = ascii_casecmp(aa, ab);
+    }
+    if (c) return c;
+
+    if (kind == TAGCACHE_GROUP_ALBUM) {
+        int32_t da = ka->secondary.album_order.disc, db = kb->secondary.album_order.disc;
+        if (da != db) return da < db ? -1 : 1;
+        int32_t ta = ka->secondary.album_order.track, tb = kb->secondary.album_order.track;
+        if (ta > 0 || tb > 0) {
+            if (ta <= 0) return 1;
+            if (tb <= 0) return -1;
+            if (ta != tb) return ta < tb ? -1 : 1;
+        }
+    } else {
+        c = tagcache_sort_prefix_compare(ka->secondary.album, kb->secondary.album,
+                                         sizeof(ka->secondary.album), &full_compare);
+        if (!c && full_compare) {
+            tagcache_song_t sa, sb;
+            if (!reader_sort_song_fields(ka->member.slot, TAGCACHE_FIELD_ALBUM, &sa) ||
+                !reader_sort_song_fields(kb->member.slot, TAGCACHE_FIELD_ALBUM, &sb)) {
+                reader_sort_failed = true;
+                return (ka->member.slot > kb->member.slot) - (ka->member.slot < kb->member.slot);
+            }
+            c = ascii_casecmp(sa.album, sb.album);
+        }
+        if (c) return c;
+    }
+
+    if (!reader_compact_sort) {
+        c = tagcache_sort_prefix_compare(ka->path, kb->path, sizeof(ka->path), &full_compare);
+        if (!c && full_compare) {
+            tagcache_song_t sa, sb;
+            if (!reader_sort_song_fields(ka->member.slot, TAGCACHE_FIELD_PATH, &sa) ||
+                !reader_sort_song_fields(kb->member.slot, TAGCACHE_FIELD_PATH, &sb)) {
+                reader_sort_failed = true;
+                return (ka->member.slot > kb->member.slot) - (ka->member.slot < kb->member.slot);
+            }
+            c = ascii_casecmp(sa.path, sb.path);
+        }
+        if (c) return c;
+    }
+    return (ka->member.slot > kb->member.slot) - (ka->member.slot < kb->member.slot);
+}
+
 static int reader_compare_member(const void *a, const void *b, void *context) {
     (void) context;
     const reader_member_t *ma = a, *mb = b;
     tagcache_song_t sa, sb;
-    if (!reader_sort_song(ma->slot, &sa) || !reader_sort_song(mb->slot, &sb)) {
+    unsigned fields = TAGCACHE_FIELD_ALBUM;
+    if (reader_sort_kind == TAGCACHE_GROUP_ARTIST) fields |= TAGCACHE_FIELD_ARTIST;
+    else fields |= TAGCACHE_FIELD_ALBUM_ARTIST;
+    if (!reader_sort_song_fields(ma->slot, fields, &sa) ||
+        !reader_sort_song_fields(mb->slot, fields, &sb)) {
         reader_sort_failed = true;
         return (ma->slot > mb->slot) - (ma->slot < mb->slot);
     }
@@ -430,7 +634,15 @@ static int reader_compare_member(const void *a, const void *b, void *context) {
         c = ascii_casecmp(sa.album, sb.album);
         if (c) return c;
     }
-    c = reader_compact_sort ? 0 : ascii_casecmp(sa.path, sb.path);
+    if (!reader_compact_sort) {
+        /* Path is only needed after every earlier member key ties. */
+        if (!reader_sort_song_fields(ma->slot, TAGCACHE_FIELD_PATH, &sa) ||
+            !reader_sort_song_fields(mb->slot, TAGCACHE_FIELD_PATH, &sb)) {
+            reader_sort_failed = true;
+            return (ma->slot > mb->slot) - (ma->slot < mb->slot);
+        }
+        c = ascii_casecmp(sa.path, sb.path);
+    } else c = 0;
     return c ? c : (ma->slot > mb->slot) - (ma->slot < mb->slot);
 }
 
@@ -460,55 +672,122 @@ static bool reader_write_group(int kind, const reader_group_record_t *record) {
 
 static bool reader_build_groups(int kind, int scratch) {
     int keys = reader_create_temp();
+    int sort_keys = reader_create_temp();
     reader_group_fd[kind] = reader_create_temp();
     reader_members_fd[kind] = reader_create_temp();
-    bool ok = keys >= 0 && reader_group_fd[kind] >= 0 && reader_members_fd[kind] >= 0;
+    bool ok = keys >= 0 && sort_keys >= 0 && reader_group_fd[kind] >= 0 && reader_members_fd[kind] >= 0;
+    size_t sort_record_size = reader_compact_sort ? offsetof(reader_member_sort_t, path) : sizeof(reader_member_sort_t);
+    size_t sort_batch_capacity = READER_TEMP_BATCH_BYTES / sort_record_size;
+    unsigned char *batch = NULL;
+    if (ok && sort_batch_capacity == 0) ok = false;
+    size_t batch_used = 0;
     int64_t count = 0;
+    unsigned fields = kind == TAGCACHE_GROUP_ARTIST ? TAGCACHE_FIELD_ARTIST | TAGCACHE_FIELD_ALBUM :
+        kind == TAGCACHE_GROUP_ALBUM_ARTIST ? TAGCACHE_FIELD_ALBUM_ARTIST | TAGCACHE_FIELD_ALBUM :
+        TAGCACHE_FIELD_ALBUM | TAGCACHE_FIELD_ALBUM_ARTIST;
+    if (!reader_compact_sort) fields |= TAGCACHE_FIELD_PATH;
+    reader_sort_kind = kind;
+    reader_sort_failed = false;
     for (int32_t slot = 0; ok && slot < ent_count; slot++) {
         struct index_entry idx;
         ok = reader_index(slot, &idx);
         if (!ok || (idx.flag & FLAG_DELETED)) continue;
+        tagcache_song_t song;
+        ok = reader_sort_song_fields(slot, fields, &song);
+        if (!ok) break;
         int n = 1;
         if (kind == TAGCACHE_GROUP_ARTIST) {
-            char names[TAGCACHE_ARTIST_SPLIT_MAX][TAGCACHE_PATH_MAX], artist[TAGCACHE_PATH_MAX];
-            ok = reader_string(tag_artist, idx.tag_seek[tag_artist], -1, artist, sizeof(artist));
-            if (!ok) break;
-            n = split_artist(artist, names);
+            char names[TAGCACHE_ARTIST_SPLIT_MAX][TAGCACHE_PATH_MAX];
+            n = split_artist(song.artist, names);
         }
         for (int j = 0; ok && j < n; j++) {
             reader_member_t member = {slot, j};
-            ok = tc_sort_io_write(keys, &member, sizeof(member), (off_t) count++ * sizeof(member));
+            reader_member_sort_t key;
+            ok = reader_make_member_sort(kind, &member, &song, &key);
+            if (ok && batch == NULL) {
+                batch = (unsigned char *)malloc(READER_TEMP_BATCH_BYTES);
+                if (batch == NULL) ok = false;
+            }
+            if (ok) {
+                memcpy(batch + batch_used * sort_record_size, &key, sort_record_size);
+                batch_used++;
+                count++;
+                if (batch_used == sort_batch_capacity) {
+                    ok = tc_sort_io_write(sort_keys, batch, batch_used * sort_record_size,
+                                          (off_t)(count - (int64_t)batch_used) * (off_t)sort_record_size);
+                    if (ok) batch_used = 0;
+                }
+            }
         }
     }
-    reader_sort_kind = kind;
-    reader_sort_failed = false;
-    if (ok) ok = tc_sort_fd(keys, sizeof(reader_member_t), count, reader_compare_member, NULL, scratch) && !reader_sort_failed;
+    if (ok && batch_used != 0)
+        ok = tc_sort_io_write(sort_keys, batch, batch_used * sort_record_size,
+                              (off_t)(count - (int64_t)batch_used) * (off_t)sort_record_size);
+    free(batch);
+    batch = NULL;
+    if (ok) ok = tc_sort_fd(sort_keys, sort_record_size, count,
+                            reader_compare_member_sort, &kind, scratch) && !reader_sort_failed;
+    if (ok && count != 0) {
+        batch = (unsigned char *)malloc(READER_TEMP_BATCH_BYTES);
+        if (batch == NULL) ok = false;
+    }
+    for (int64_t at = 0; ok && at < count;) {
+        size_t n = (size_t)(count - at);
+        size_t capacity = READER_TEMP_BATCH_BYTES / sort_record_size;
+        if (n > capacity) n = capacity;
+        ok = stats_read_at(sort_keys, batch, n * sort_record_size, (off_t)at * (off_t)sort_record_size) == STATS_READ_OK;
+        if (ok) {
+            for (size_t j = 0; j < n; j++) {
+                reader_member_t member;
+                memcpy(&member, batch + j * sort_record_size, sizeof(member));
+                memcpy(batch + j * sizeof(member), &member, sizeof(member));
+            }
+            ok = tc_sort_io_write(keys, batch, n * sizeof(reader_member_t),
+                                  (off_t)at * (off_t)sizeof(reader_member_t));
+        }
+        at += (int64_t)n;
+    }
     reader_group_record_t group = {0};
     char previous[TAGCACHE_PATH_MAX] = "", previous_aa[TAGCACHE_PATH_MAX] = "";
-    for (int64_t i = 0; ok && i < count; i++) {
-        reader_member_t member;
-        tagcache_song_t song;
-        char name[TAGCACHE_PATH_MAX], aa[TAGCACHE_PATH_MAX];
-        ok = stats_read_at(keys, &member, sizeof(member), (off_t) i * sizeof(member)) == STATS_READ_OK &&
-             reader_sort_song(member.slot, &song);
-        if (!ok) break;
-        reader_member_names(kind, &member, &song, name, aa);
-        if (!group.count || ascii_casecmp(previous, name) || ascii_casecmp(previous_aa, aa)) {
-            if (group.count) ok = reader_write_group(kind, &group);
-            group = (reader_group_record_t) {member, member.slot + 1, 0, (int32_t) i};
-            snprintf(previous, sizeof(previous), "%s", name);
-            snprintf(previous_aa, sizeof(previous_aa), "%s", aa);
+    unsigned name_fields = kind == TAGCACHE_GROUP_ARTIST ? TAGCACHE_FIELD_ARTIST :
+        kind == TAGCACHE_GROUP_ALBUM_ARTIST ? TAGCACHE_FIELD_ALBUM_ARTIST :
+        TAGCACHE_FIELD_ALBUM | TAGCACHE_FIELD_ALBUM_ARTIST;
+    size_t member_batch_capacity = READER_TEMP_BATCH_BYTES / sizeof(reader_member_t);
+    for (int64_t at = 0; ok && at < count;) {
+        size_t n = (size_t)(count - at);
+        if (n > member_batch_capacity) n = member_batch_capacity;
+        ok = stats_read_at(keys, batch, n * sizeof(reader_member_t),
+                           (off_t)at * (off_t)sizeof(reader_member_t)) == STATS_READ_OK;
+        for (size_t j = 0; ok && j < n; j++) {
+            reader_member_t member;
+            tagcache_song_t song;
+            char name[TAGCACHE_PATH_MAX], aa[TAGCACHE_PATH_MAX];
+            memcpy(&member, batch + j * sizeof(member), sizeof(member));
+            ok = reader_sort_song_fields(member.slot, name_fields, &song);
+            if (!ok) break;
+            reader_member_names(kind, &member, &song, name, aa);
+            if (!group.count || ascii_casecmp(previous, name) || ascii_casecmp(previous_aa, aa)) {
+                if (group.count) ok = reader_write_group(kind, &group);
+                group = (reader_group_record_t) {member, member.slot + 1, 0, (int32_t)(at + (int64_t)j)};
+                snprintf(previous, sizeof(previous), "%s", name);
+                snprintf(previous_aa, sizeof(previous_aa), "%s", aa);
+            }
+            group.count++;
+            if (member.slot + 1 < group.first_id) {
+                group.first_id = member.slot + 1;
+                group.representative = member;
+            }
+            int32_t id = member.slot + 1;
+            memcpy(batch + j * sizeof(id), &id, sizeof(id));
         }
-        group.count++;
-        if (member.slot + 1 < group.first_id) {
-            group.first_id = member.slot + 1;
-            group.representative = member;
-        }
-        int32_t id = member.slot + 1;
-        if (ok) ok = tc_sort_io_write(reader_members_fd[kind], &id, sizeof(id), (off_t) i * sizeof(id));
+        if (ok) ok = tc_sort_io_write(reader_members_fd[kind], batch, n * sizeof(int32_t),
+                                      (off_t)at * (off_t)sizeof(int32_t));
+        at += (int64_t)n;
     }
     if (ok && group.count) ok = reader_write_group(kind, &group);
+    free(batch);
     if (keys >= 0) close(keys);
+    if (sort_keys >= 0) close(sort_keys);
     return ok;
 }
 
@@ -520,30 +799,108 @@ static bool reader_build_indexes(void) {
     reader_title_fd = reader_create_temp();
     reader_recency_fd = reader_create_temp();
     reader_path_fd = reader_create_temp();
+    int title_keys = reader_create_temp();
+    int recency_keys = reader_create_temp();
     int scratch = reader_create_temp();
-    bool ok = reader_artist_names_fd >= 0 && reader_title_fd >= 0 && reader_recency_fd >= 0 && reader_path_fd >= 0 && scratch >= 0;
+    bool ok = reader_artist_names_fd >= 0 && reader_title_fd >= 0 && reader_recency_fd >= 0 && reader_path_fd >= 0 &&
+              title_keys >= 0 && recency_keys >= 0 && scratch >= 0;
+    size_t title_record_size = sizeof(reader_title_sort_t);
+    size_t recency_record_size = reader_compact_sort ? offsetof(reader_recency_sort_t, path) : sizeof(reader_recency_sort_t);
+    size_t path_record_size = sizeof(reader_path_key_t);
+    size_t decorate_capacity = READER_TEMP_BATCH_BYTES / (title_record_size + recency_record_size + path_record_size);
+    unsigned char *batch = NULL;
+    if (ok && decorate_capacity == 0) ok = false;
+    size_t batch_used = 0;
     live_count = 0;
+    reader_sort_failed = false;
     for (int32_t slot = 0; ok && slot < ent_count; slot++) {
         struct index_entry idx;
         ok = reader_index(slot, &idx);
         if (!ok || (idx.flag & FLAG_DELETED)) continue;
         tagcache_song_t song;
-        ok = reader_song(slot, &song);
-        if (!ok || !song.path[0]) { ok = false; break; }
+        ok = reader_sort_song_fields(slot, TAGCACHE_FIELD_TITLE | TAGCACHE_FIELD_PATH, &song);
+        if (!ok || !song.path[0]) { reader_sort_failed = true; ok = false; break; }
+        reader_title_sort_t title = {0};
+        reader_recency_sort_t recency = {0};
+        title.slot = slot;
+        recency.slot = slot;
+        recency.first_seen = idx.tag_seek[tag_commitid];
+        if (!tagcache_sort_prefix(song.title, title.title, sizeof(title.title)) ||
+            (!reader_compact_sort && !tagcache_sort_prefix(song.path, recency.path, sizeof(recency.path)))) {
+            reader_sort_failed = true;
+            ok = false;
+            break;
+        }
         reader_path_key_t path = {fnv1a(song.path, strlen(song.path)), slot};
-        ok = tc_sort_io_write(reader_title_fd, &slot, sizeof(slot), (off_t) live_count * sizeof(slot)) &&
-             tc_sort_io_write(reader_recency_fd, &slot, sizeof(slot), (off_t) live_count * sizeof(slot)) &&
-             tc_sort_io_write(reader_path_fd, &path, sizeof(path), (off_t) live_count * sizeof(path));
+        if (batch == NULL) {
+            batch = (unsigned char *)malloc(READER_TEMP_BATCH_BYTES);
+            if (batch == NULL) { ok = false; break; }
+        }
+        memcpy(batch + batch_used * title_record_size, &title, title_record_size);
+        unsigned char *recency_batch = batch + decorate_capacity * title_record_size;
+        unsigned char *path_batch = recency_batch + decorate_capacity * recency_record_size;
+        memcpy(recency_batch + batch_used * recency_record_size, &recency, recency_record_size);
+        memcpy(path_batch + batch_used * path_record_size, &path, path_record_size);
+        batch_used++;
         live_count++;
+        if (batch_used == decorate_capacity) {
+            off_t first = (off_t)(live_count - (int32_t)batch_used);
+            ok = tc_sort_io_write(title_keys, batch, batch_used * title_record_size,
+                                  first * (off_t)title_record_size) &&
+                 tc_sort_io_write(recency_keys, recency_batch, batch_used * recency_record_size,
+                                  first * (off_t)recency_record_size) &&
+                 tc_sort_io_write(reader_path_fd, path_batch, batch_used * path_record_size,
+                                  first * (off_t)path_record_size);
+            if (ok) batch_used = 0;
+        }
     }
-    bool recency = false;
-    reader_sort_failed = false;
-    if (ok) ok = tc_sort_fd(reader_title_fd, sizeof(int32_t), live_count, reader_compare_order, &recency, scratch) &&
-                 !reader_sort_failed;
-    recency = true;
-    if (ok) ok = tc_sort_fd(reader_recency_fd, sizeof(int32_t), live_count, reader_compare_order, &recency, scratch) &&
-                 !reader_sort_failed;
+    if (ok && batch_used != 0) {
+        unsigned char *recency_batch = batch + decorate_capacity * title_record_size;
+        unsigned char *path_batch = recency_batch + decorate_capacity * recency_record_size;
+        off_t first = (off_t)(live_count - (int32_t)batch_used);
+        ok = tc_sort_io_write(title_keys, batch, batch_used * title_record_size,
+                              first * (off_t)title_record_size) &&
+             tc_sort_io_write(recency_keys, recency_batch, batch_used * recency_record_size,
+                              first * (off_t)recency_record_size) &&
+             tc_sort_io_write(reader_path_fd, path_batch, batch_used * path_record_size,
+                              first * (off_t)path_record_size);
+    }
+    free(batch);
+    batch = NULL;
+    if (ok) ok = tc_sort_fd(title_keys, title_record_size, live_count,
+                            reader_compare_title_sort, NULL, scratch) && !reader_sort_failed;
+    if (ok) ok = tc_sort_fd(recency_keys, recency_record_size, live_count,
+                            reader_compare_recency_sort, NULL, scratch) && !reader_sort_failed;
     if (ok) ok = tc_sort_fd(reader_path_fd, sizeof(reader_path_key_t), live_count, reader_compare_path, NULL, scratch);
+    if (ok && live_count != 0) {
+        batch = (unsigned char *)malloc(READER_TEMP_BATCH_BYTES);
+        if (batch == NULL) ok = false;
+    }
+    size_t writeback_capacity = READER_TEMP_BATCH_BYTES / (title_record_size + recency_record_size);
+    unsigned char *title_batch = batch;
+    unsigned char *recency_batch = batch ? batch + writeback_capacity * title_record_size : NULL;
+    for (int32_t rank = 0; ok && rank < live_count;) {
+        size_t n = (size_t)(live_count - rank);
+        if (n > writeback_capacity) n = writeback_capacity;
+        ok = stats_read_at(title_keys, title_batch, n * title_record_size,
+                           (off_t)rank * (off_t)title_record_size) == STATS_READ_OK &&
+             stats_read_at(recency_keys, recency_batch, n * recency_record_size,
+                           (off_t)rank * (off_t)recency_record_size) == STATS_READ_OK;
+        if (ok) {
+            for (size_t j = 0; j < n; j++) {
+                int32_t slot;
+                memcpy(&slot, title_batch + j * title_record_size, sizeof(slot));
+                memcpy(title_batch + j * sizeof(slot), &slot, sizeof(slot));
+                memcpy(&slot, recency_batch + j * recency_record_size, sizeof(slot));
+                memcpy(recency_batch + j * sizeof(slot), &slot, sizeof(slot));
+            }
+            ok = tc_sort_io_write(reader_title_fd, title_batch, n * sizeof(int32_t),
+                                  (off_t)rank * (off_t)sizeof(int32_t)) &&
+                 tc_sort_io_write(reader_recency_fd, recency_batch, n * sizeof(int32_t),
+                                  (off_t)rank * (off_t)sizeof(int32_t));
+        }
+        rank += (int32_t)n;
+    }
     for (int kind = 0; ok && kind < 2; kind++) {
         reader_rank_fd[kind] = reader_create_temp();
         ok = reader_rank_fd[kind] >= 0 && ftruncate(reader_rank_fd[kind], (off_t) ent_count * sizeof(int32_t)) == 0;
@@ -556,6 +913,9 @@ static bool reader_build_indexes(void) {
     }
     for (int kind = 0; ok && kind < 3; kind++) ok = reader_build_groups(kind, scratch);
     if (scratch >= 0) close(scratch);
+    if (title_keys >= 0) close(title_keys);
+    if (recency_keys >= 0) close(recency_keys);
+    free(batch);
     reader_reset_cache();
     if (!ok) reader_close_indexes();
     return ok;

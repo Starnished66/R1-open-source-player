@@ -10,9 +10,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-/* The implementation deliberately keeps every working buffer inside this
- * fixed budget.  A run is stably sorted in memory, then merge passes use the
- * two files as alternating input and output streams. */
+/* A single arena is reused for stable run formation and k-way merge passes. */
 #define TC_SORT_BUFFER_BYTES (256u * 1024u)
 #define TC_SORT_RUN_BYTES (64u * 1024u)
 #define TC_SORT_MERGE_BYTES (32u * 1024u)
@@ -58,7 +56,13 @@ static bool tc_sort_io_write(int fd, const void *buf, size_t len, off_t off) {
 }
 
 static bool tc_sort_mul_off(int64_t a, size_t b, off_t *out) {
-    if (a < 0 || (uintmax_t)a > (uintmax_t)INT64_MAX / (uintmax_t)b) return false;
+    if (a < 0 || b == 0) return false;
+    if (a == 0) {
+        *out = 0;
+        return true;
+    }
+    if ((uintmax_t)b > (uintmax_t)INT64_MAX ||
+        (uintmax_t)a > (uintmax_t)INT64_MAX / (uintmax_t)b) return false;
     int64_t n = a * (int64_t)b;
     if ((off_t)n != n) return false;
     *out = (off_t)n;
@@ -139,38 +143,83 @@ static bool tc_sort_reader_advance(struct tc_sort_reader *r) {
     return true;
 }
 
+#define TC_SORT_MAX_FAN_IN 16
+
+static bool tc_sort_heap_before(const int *heap, int a, int b, struct tc_sort_reader *readers,
+                                int (*cmp)(const void *, const void *, void *), void *ctx) {
+    int c = cmp(tc_sort_reader_record(&readers[heap[a]]), tc_sort_reader_record(&readers[heap[b]]), ctx);
+    return c < 0 || (c == 0 && heap[a] < heap[b]);
+}
+
+static void tc_sort_heap_sift_up(int *heap, int at, struct tc_sort_reader *readers,
+                                int (*cmp)(const void *, const void *, void *), void *ctx) {
+    while (at > 0) {
+        int parent = (at - 1) / 2;
+        int tmp;
+        if (!tc_sort_heap_before(heap, at, parent, readers, cmp, ctx)) break;
+        tmp = heap[at];
+        heap[at] = heap[parent];
+        heap[parent] = tmp;
+        at = parent;
+    }
+}
+
+static void tc_sort_heap_sift_down(int *heap, int count, int at, struct tc_sort_reader *readers,
+                                  int (*cmp)(const void *, const void *, void *), void *ctx) {
+    for (;;) {
+        int left = at * 2 + 1;
+        int right = left + 1;
+        int best = at;
+        int tmp;
+        if (left < count && tc_sort_heap_before(heap, left, best, readers, cmp, ctx)) best = left;
+        if (right < count && tc_sort_heap_before(heap, right, best, readers, cmp, ctx)) best = right;
+        if (best == at) break;
+        tmp = heap[at];
+        heap[at] = heap[best];
+        heap[best] = tmp;
+        at = best;
+    }
+}
+
 static bool tc_sort_merge_pass(int in_fd, int out_fd, int64_t count, int64_t run_len, size_t rs,
-                               unsigned char *left_buf, unsigned char *right_buf, size_t merge_cap,
+                               unsigned char *input_bufs, size_t input_cap, int fan_in,
                                unsigned char *out_buf, size_t out_cap,
                                int (*cmp)(const void *, const void *, void *), void *ctx) {
-    int64_t left_start;
-    size_t out_used = 0;
+    int64_t group_start = 0;
     int64_t out_record = 0;
-    for (left_start = 0; left_start < count; left_start += run_len * 2) {
-        int64_t mid = left_start + run_len < count ? left_start + run_len : count;
-        int64_t right_end = mid + run_len < count ? mid + run_len : count;
-        struct tc_sort_reader left = {in_fd, rs, left_buf, merge_cap, 0, 0, left_start, mid};
-        struct tc_sort_reader right = {in_fd, rs, right_buf, merge_cap, 0, 0, mid, right_end};
-        int64_t total = right_end - left_start;
-        int64_t emitted;
-        if (!tc_sort_reader_fill(&left) || !tc_sort_reader_fill(&right)) return false;
-        for (emitted = 0; emitted < total; ++emitted) {
-            const unsigned char *chosen;
-            bool take_left = left.next - (int64_t)left.have + (int64_t)left.pos < mid;
-            bool take_right = right.next - (int64_t)right.have + (int64_t)right.pos < right_end;
-            if (!take_left) chosen = tc_sort_reader_record(&right);
-            else if (!take_right) chosen = tc_sort_reader_record(&left);
-            else if (cmp(tc_sort_reader_record(&left), tc_sort_reader_record(&right), ctx) <= 0)
-                chosen = tc_sort_reader_record(&left);
-            else
-                chosen = tc_sort_reader_record(&right);
-            memcpy(out_buf + out_used * rs, chosen, rs);
-            ++out_used;
-            if (chosen == tc_sort_reader_record(&left)) {
-                if (!tc_sort_reader_advance(&left)) return false;
-            } else if (!tc_sort_reader_advance(&right)) {
-                return false;
+    size_t out_used = 0;
+    while (group_start < count) {
+        struct tc_sort_reader readers[TC_SORT_MAX_FAN_IN];
+        int heap[TC_SORT_MAX_FAN_IN];
+        int heap_count = 0;
+        int i;
+        for (i = 0; i < fan_in && group_start < count; i++) {
+            int64_t n = count - group_start;
+            if (n > run_len) n = run_len;
+            readers[i] = (struct tc_sort_reader){
+                in_fd, rs, input_bufs + (size_t)i * input_cap * rs, input_cap,
+                0, 0, group_start, group_start + n
+            };
+            group_start += n;
+            if (!tc_sort_reader_fill(&readers[i])) return false;
+            if (readers[i].pos < readers[i].have) {
+                heap[heap_count] = i;
+                tc_sort_heap_sift_up(heap, heap_count, readers, cmp, ctx);
+                heap_count++;
             }
+        }
+        while (heap_count != 0) {
+            int chosen_index = heap[0];
+            const unsigned char *chosen = tc_sort_reader_record(&readers[chosen_index]);
+            memcpy(out_buf + out_used * rs, chosen, rs);
+            out_used++;
+            if (!tc_sort_reader_advance(&readers[chosen_index])) return false;
+            if (readers[chosen_index].pos == readers[chosen_index].have) {
+                heap_count--;
+                if (heap_count != 0) heap[0] = heap[heap_count];
+            }
+            if (heap_count != 0)
+                tc_sort_heap_sift_down(heap, heap_count, 0, readers, cmp, ctx);
             if (out_used == out_cap) {
                 off_t off;
                 if (!tc_sort_mul_off(out_record, rs, &off) ||
@@ -182,30 +231,29 @@ static bool tc_sort_merge_pass(int in_fd, int out_fd, int64_t count, int64_t run
     }
     if (out_used != 0) {
         off_t off;
-        if (!tc_sort_mul_off(out_record, rs, &off) || !tc_sort_io_write(out_fd, out_buf, out_used * rs, off)) return false;
+        if (!tc_sort_mul_off(out_record, rs, &off) ||
+            !tc_sort_io_write(out_fd, out_buf, out_used * rs, off)) return false;
     }
     return true;
 }
 
-static bool tc_sort_copy(int in_fd, int out_fd, int64_t count, size_t rs, unsigned char *buf, size_t cap) {
-    int64_t at = 0;
-    while (at < count) {
-        size_t n = (size_t)(count - at);
-        off_t in_off, out_off;
-        if (n > cap) n = cap;
-        if (!tc_sort_mul_off(at, rs, &in_off) || !tc_sort_mul_off(at, rs, &out_off) ||
-            !tc_sort_io_read(in_fd, buf, n * rs, in_off) || !tc_sort_io_write(out_fd, buf, n * rs, out_off)) return false;
-        at += (int64_t)n;
+static bool tc_sort_power_reaches(int base, int exponent, int64_t target) {
+    int64_t value = 1;
+    for (int i = 0; i < exponent; i++) {
+        if (value > target / base) return true;
+        value *= base;
     }
-    return true;
+    return value >= target;
 }
 
 static bool tc_sort_fd(int fd, size_t record_size, int64_t count,
                        int (*cmp)(const void *, const void *, void *), void *ctx, int scratch_fd) {
-    size_t run_cap, merge_cap, out_cap;
-    unsigned char *run = NULL, *tmp = NULL, *left = NULL, *right = NULL, *out = NULL;
-    int in_fd = fd, out_fd = scratch_fd;
-    int64_t run_len;
+    size_t budget, run_cap, run_bytes, out_cap, out_bytes, input_records;
+    size_t preferred_records, fan_cap, input_cap;
+    unsigned char *arena = NULL, *run, *tmp, *out, *input_bufs;
+    int64_t run_count, run_len;
+    int fan_in = 0, passes = 0;
+    int run_fd, in_fd, out_fd;
     bool ok = false;
     bool large = false;
     off_t total_bytes;
@@ -214,58 +262,86 @@ static bool tc_sort_fd(int fd, size_t record_size, int64_t count,
     const char *disable_large = getenv("TAGCACHE_DISABLE_LARGE_SORT");
     large = (!disable_large || disable_large[0] == '\0' || disable_large[0] == '0') &&
             TC_SORT_AVAILABLE_BYTES() >= (size_t) TC_SORT_LARGE_TOTAL_BYTES + (16u * 1024u * 1024u);
-    run_cap = (large ? TC_SORT_LARGE_RUN_BYTES : TC_SORT_RUN_BYTES) / record_size;
-    merge_cap = (large ? TC_SORT_LARGE_MERGE_BYTES : TC_SORT_MERGE_BYTES) / record_size;
-    out_cap = (large ? TC_SORT_LARGE_OUTPUT_BYTES : TC_SORT_OUTPUT_BYTES) / record_size;
-    if (run_cap == 0 || merge_cap == 0 || out_cap == 0) return false;
-    run = (unsigned char *)malloc(run_cap * record_size);
-    tmp = (unsigned char *)malloc(run_cap * record_size);
-    left = (unsigned char *)malloc(merge_cap * record_size);
-    right = (unsigned char *)malloc(merge_cap * record_size);
-    out = (unsigned char *)malloc(out_cap * record_size);
-    if (run == NULL || tmp == NULL || left == NULL || right == NULL || out == NULL) {
-        free(out); free(right); free(left); free(tmp); free(run);
-        out = right = left = tmp = run = NULL;
+    budget = large ? TC_SORT_LARGE_TOTAL_BYTES : TC_SORT_BUFFER_BYTES;
+    arena = (unsigned char *)malloc(budget);
+    if (arena == NULL) {
         if (!large) goto done;
         large = false;
-        run_cap = TC_SORT_RUN_BYTES / record_size;
-        merge_cap = TC_SORT_MERGE_BYTES / record_size;
-        out_cap = TC_SORT_OUTPUT_BYTES / record_size;
-        if (run_cap == 0 || merge_cap == 0 || out_cap == 0) goto done;
-        run = (unsigned char *)malloc(run_cap * record_size);
-        tmp = (unsigned char *)malloc(run_cap * record_size);
-        left = (unsigned char *)malloc(merge_cap * record_size);
-        right = (unsigned char *)malloc(merge_cap * record_size);
-        out = (unsigned char *)malloc(out_cap * record_size);
-        if (run == NULL || tmp == NULL || left == NULL || right == NULL || out == NULL) goto done;
+        budget = TC_SORT_BUFFER_BYTES;
+        arena = (unsigned char *)malloc(budget);
+        if (arena == NULL) goto done;
     }
-    for (int64_t at = 0; at < count; at += (int64_t)run_cap) {
+
+    /* Keep the old record-size limits even though merge buffers now share an arena. */
+    if ((large ? TC_SORT_LARGE_MERGE_BYTES : TC_SORT_MERGE_BYTES) / record_size == 0) goto done;
+    run_cap = (budget / 2u) / record_size;
+    out_cap = (large ? TC_SORT_LARGE_OUTPUT_BYTES : TC_SORT_OUTPUT_BYTES) / record_size;
+    if (run_cap == 0 || out_cap == 0) goto done;
+    run_bytes = run_cap * record_size;
+    out_bytes = out_cap * record_size;
+    input_records = (budget - out_bytes) / record_size;
+    if (input_records < 2) goto done;
+
+    if (count == 0) {
+        if (ftruncate(fd, total_bytes) != 0) goto done;
+        ok = true;
+        goto done;
+    }
+    run_count = count / (int64_t)run_cap + (count % (int64_t)run_cap != 0);
+    if (run_count > 1) {
+        preferred_records = 4096u / record_size + (4096u % record_size != 0);
+        if (preferred_records < 4) preferred_records = 4;
+        fan_cap = input_records / preferred_records;
+        if (fan_cap < 2) fan_cap = input_records;
+        if (fan_cap > TC_SORT_MAX_FAN_IN) fan_cap = TC_SORT_MAX_FAN_IN;
+        if (run_count < (int64_t)fan_cap) fan_cap = (size_t)run_count;
+        if (fan_cap < 2) goto done;
+        while (!tc_sort_power_reaches((int)fan_cap, passes, run_count)) passes++;
+        for (fan_in = 2; fan_in <= (int)fan_cap; fan_in++)
+            if (tc_sort_power_reaches(fan_in, passes, run_count)) break;
+        if (fan_in > (int)fan_cap) goto done;
+        input_cap = input_records / (size_t)fan_in;
+        if (input_cap == 0) goto done;
+    } else {
+        input_cap = 0;
+    }
+
+    run = arena;
+    tmp = arena + run_bytes;
+    out = arena;
+    input_bufs = arena + out_bytes;
+    run_fd = (passes & 1) ? scratch_fd : fd;
+    if (run_fd != fd && ftruncate(run_fd, 0) != 0) goto done;
+    for (int64_t at = 0; at < count;) {
         size_t n = (size_t)(count - at);
         off_t off;
         if (n > run_cap) n = run_cap;
         if (!tc_sort_mul_off(at, record_size, &off) || !tc_sort_io_read(fd, run, n * record_size, off) ||
             !tc_sort_stable_runsort(run, tmp, n, record_size, cmp, ctx) ||
-            !tc_sort_io_write(fd, run, n * record_size, off)) goto done;
+            !tc_sort_io_write(run_fd, run, n * record_size, off)) goto done;
+        at += (int64_t)n;
     }
+    in_fd = run_fd;
+    out_fd = run_fd == fd ? scratch_fd : fd;
     run_len = (int64_t)run_cap;
-    while (run_len < count) {
+    for (int pass = 0; pass < passes; pass++) {
         if (ftruncate(out_fd, 0) != 0 ||
-            !tc_sort_merge_pass(in_fd, out_fd, count, run_len, record_size, left, right, merge_cap, out, out_cap, cmp, ctx))
+            !tc_sort_merge_pass(in_fd, out_fd, count, run_len, record_size, input_bufs, input_cap,
+                                fan_in, out, out_cap, cmp, ctx))
             goto done;
-        in_fd = out_fd;
-        out_fd = (out_fd == scratch_fd) ? fd : scratch_fd;
-        if (run_len > count / 2) run_len = count;
-        else run_len *= 2;
+        {
+            int swap_fd = in_fd;
+            in_fd = out_fd;
+            out_fd = swap_fd;
+        }
+        if (run_len > count / fan_in) run_len = count;
+        else run_len *= fan_in;
     }
-    if (in_fd != fd && !tc_sort_copy(in_fd, fd, count, record_size, out, out_cap)) goto done;
+    if (in_fd != fd) goto done;
     if (ftruncate(fd, total_bytes) != 0) goto done;
     ok = true;
 done:
-    free(out);
-    free(right);
-    free(left);
-    free(tmp);
-    free(run);
+    free(arena);
     return ok;
 }
 

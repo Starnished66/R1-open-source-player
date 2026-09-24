@@ -919,11 +919,15 @@ static void update_timer_cb(lv_timer_t * timer) {
             !audio_is_playing() && !battery_is_charging() && !shutdown_background_work_active() &&
             lv_tick_elaps(screen_off_since_tick) >= (uint32_t) current_settings.idle_shutdown_minutes * 60 * 1000) {
             if (current_settings.idle_suspend_enabled) {
+                plugin_manager_notify_suspending();
+                led_control_suspend();
                 power_suspend_now();
+                led_control_resume(current_settings.led_indicator_enabled);
 
                 /* Restore UI state and reset inactivity timers on resume so the
                  * display does not immediately time out again. */
                 resume_from_suspend_fixups();
+                plugin_manager_notify_system_resumed();
 
                 /* Unlike idle_shutdown_now() (which never returns --
                  * poweroff ends the process), this call CAN legitimately
@@ -954,6 +958,11 @@ static void update_timer_cb(lv_timer_t * timer) {
     charge_limiter_poll(current_settings.charge_limiter_enabled, false);
     safe_charging_poll(current_settings.safe_charging_enabled, false);
     led_control_poll(current_settings.led_indicator_enabled);
+    int volume_percent = (int) (audio_get_volume() * 100.0f + 0.5f);
+    if (volume_percent < 0) volume_percent = 0;
+    if (volume_percent > 100) volume_percent = 100;
+    plugin_manager_notify_volume_changed(volume_percent);
+    plugin_manager_poll_battery();
     headphone_status_refresh_earpods_adc();
 
     if (current_settings.remote_control_enabled) {

@@ -73,6 +73,8 @@ local CATEGORIES = {
                 "plugin.prev_track()",
                 "plugin.seek(seconds)",
                 "plugin.set_volume(0..100)",
+                "plugin.get_volume() -> 0..100",
+                "plugin.get_battery() -> table",
                 "plugin.is_playing() -> bool",
                 "plugin.is_paused() -> bool",
                 "plugin.get_position() -> sec",
@@ -103,6 +105,20 @@ local CATEGORIES = {
         get_rows = function()
             return {
                 "plugin.set_hw_volume_curve(curve_or_nil)",
+            }
+        end
+    },
+    {
+        title = "Hardware LED APIs",
+        get_rows = function()
+            return {
+                "plugin.led_available() -> bool",
+                "plugin.led_set(color, on_or_level)",
+                "plugin.led_blink(color, on_ms, off_ms, [level])",
+                "plugin.led_breathe(color, period_ms_or_bpm, [level])",
+                "plugin.led_get(color) -> {mode, level}",
+                "plugin.led_status([color])",
+                "plugin.led_release()",
             }
         end
     },
@@ -196,6 +212,8 @@ local CATEGORIES = {
                 "plugin.has_capability(name) -> bool",
                 "plugin.get_app_info() -> table",
                 "plugin.on(event, handler)",
+                "volume_changed / battery_changed events",
+                "suspending / system_resumed events",
                 "plugin.set_interval(sec, handler) -> handle",
                 "plugin.clear_interval(handle)",
                 "plugin.json_decode(str, [limits]) -> table",

@@ -3,24 +3,42 @@
 
 #include <stdbool.h>
 
-/* R1 Pro charge-status LEDs (/sys/class/leds/{red,blue}).
- * Uses brightness 50 for a stable visible level.
- * Gated by charge_limiter_is_confirmed_off() and external power state to
- * ensure red indicates active charging and blue indicates full or capped charging
- * while connected to power. */
+typedef enum {
+    LED_CONTROL_RED = 0,
+    LED_CONTROL_BLUE
+} led_control_color_t;
 
-/* Call once at startup and whenever the user flips the settings toggle --
- * forces trigger=none on both LEDs (taking exclusive manual control away
- * from the kernel) and applies the current state immediately rather than
- * waiting for the next poll tick. enabled=false turns both LEDs off and
- * leaves them off regardless of charge state until re-enabled. */
+typedef enum {
+    LED_CONTROL_MODE_OFF = 0,
+    LED_CONTROL_MODE_ON,
+    LED_CONTROL_MODE_BLINK,
+    LED_CONTROL_MODE_BREATHE,
+    LED_CONTROL_MODE_STATUS
+} led_control_mode_t;
+
+/* R1 Pro charge-status LEDs (/sys/class/leds/{red,blue}). Normal charge
+ * indication keeps its existing raw brightness of 50 for both colors and
+ * only lights while connected to external power. */
 void led_control_apply(bool enabled);
+bool led_control_available(void);
 
-/* Call on every timer tick regardless of enabled state (matches
- * charge_limiter_poll()'s own calling convention) -- re-reads real charge
- * state and updates brightness only when it actually changed, so this is
- * cheap to call unconditionally. No-op whenever enabled is false (the LEDs
- * were already forced off by the most recent led_control_apply(false)). */
+/* Plugin override operations. User levels are 0..100 and are mapped to each
+ * color's hardware-safe range in led_control.c. Effects use LVGL timers, so
+ * these functions and their timer callbacks must run on the UI thread. */
+void led_control_set_override(led_control_color_t color, int level);
+bool led_control_blink(led_control_color_t color, int on_ms, int off_ms, int level);
+bool led_control_breathe(led_control_color_t color, int period_ms, int level);
+void led_control_set_status(led_control_color_t color);
+void led_control_set_all_status(void);
+void led_control_clear_override(void);
+void led_control_suspend(void);
+void led_control_resume(bool enabled);
+led_control_mode_t led_control_get_mode(led_control_color_t color);
+int led_control_get_level(led_control_color_t color);
+
+/* Call on every control tick. Updates normal status colors and colors that a
+ * plugin explicitly returned to status mode, while leaving other plugin
+ * effects alone. */
 void led_control_poll(bool enabled);
 
 #endif /* LED_CONTROL_H */

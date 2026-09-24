@@ -220,6 +220,7 @@ from the moment your script starts running (injected before
 | Area | Main APIs |
 |---|---|
 | Identity | `define`, `api_version`, `has_capability`, `get_app_info`, `media_capabilities` |
+| Hardware | `led_available`, `led_set`, `led_blink`, `led_breathe`, `led_get`, `led_status`, `led_release` |
 | UI | `register_list_item`, `register_stream_media_tile`, `register_home_tile`, `register_quick_toggle`, `set_quick_toggle`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
 | Theme | `set_icon`, `set_background_color`, `set_text_color`, `set_home_layout`, `refresh_theme`, `reload_ui` |
 | Playback | `play_file`, `play_list`, `play_remote`, `queue_remote_list`, transport controls, playback state |
@@ -259,7 +260,7 @@ plugin's own file path (stable across reloads) rather than by load order.
 Existing plugins without `define()` remain supported as legacy plugins
 using an identity derived from their filename.
 
-- `plugin.api_version()` returns the current integer plugin API version (currently `12`).
+- `plugin.api_version()` returns the current integer plugin API version (currently `13`).
 - `plugin.has_capability(name)` reports whether an optional interface exists.
   Supported capability tokens:
   - UI: `ui.list`, `ui.settings`, `ui.row_width`, `ui.text_input`, `ui.toast`, `ui.theme`, `ui.home_layout`, `ui.launcher_layout`, `ui.home_background`, `ui.lock_screen`
@@ -269,6 +270,8 @@ using an identity derived from their filename.
   - Network: `network.http.sync`, `network.http.async`, `network.http.download`
   - Data & Crypto: `data.json`, `crypto.md5`
   - Library: `library.artist_albums`, `library.paged`, `library.refresh`
+- LED availability varies by board, so use `plugin.led_available()` instead
+  of `plugin.has_capability()` to check for the red and blue charge LEDs.
 - `plugin.get_app_info()` returns `version`, `build`, `platform`, and
   `plugin_api` fields.
 
@@ -378,6 +381,14 @@ Wi-Fi/Bluetooth/Sleep/Crossfade ones. Purely additive, no breaking changes
 bundled into this window. A plugin that only needs this can feature-detect
 it with `plugin.has_capability("ui.quick_toggle")` instead of bumping
 `api_min`.
+
+#### API version 13 changelog
+
+New in API 13: the plugin LED controls, `plugin.get_volume()`,
+`plugin.get_battery()`, and the `volume_changed`, `battery_changed`,
+`suspending`, and `system_resumed` events. LED hardware presence is
+board-specific, so there is no static `led` capability token; use
+`plugin.led_available()` for the actual sysfs nodes.
 
 ### `plugin.register_quick_toggle(id, label, on_change, options)`
 
@@ -1229,6 +1240,58 @@ real firmware also defines a third "Medium" curve, omitted there because
 it's numerically identical to Low on the real device it was extracted
 from).
 
+### Hardware LEDs
+
+Plugins can control the red and blue charge-status LEDs while the player is
+awake. All effect timers and sysfs writes run on the UI thread. The blue LED
+maps plugin brightness 0..100 onto raw hardware brightness 0..50; red maps
+0..100 onto raw 0..100. The normal charge indicator keeps its existing raw
+brightness of 50 for both colors.
+
+- **`plugin.led_available()`** returns `true` when both
+  `/sys/class/leds/red/brightness` and `/sys/class/leds/blue/brightness`
+  exist on this board.
+- **`plugin.led_set(color, on_or_level)`** accepts `color` as exactly
+  `"red"` or `"blue"`. The second argument can be `true` for full user
+  brightness, `false` for off, or an integer brightness 0..100 (clamped).
+  Setting a color cancels its current effect. A plugin override can light an
+  LED while the user's LED Indicator setting is off.
+- **`plugin.led_blink(color, on_ms, off_ms [, level])`** runs a software
+  blink on an LVGL timer. Each phase is clamped to 50..60000ms; `level`
+  defaults to 100 and is clamped to 0..100.
+- **`plugin.led_breathe(color, period_ms_or_bpm [, level])`** pulses the LED.
+  Numeric values 1..600 mean breaths per minute; values above 600 mean a
+  period in milliseconds (clamped to 120000ms). Red at peak level 100 uses
+  the kernel `breathing` trigger. Blue and partial peaks use software
+  brightness stepping at no more than 25Hz, capped to that color's safe raw
+  maximum. Leaving the kernel trigger restores `none` before software
+  brightness is written.
+- **`plugin.led_get(color)`** returns `{ mode = "off"|"on"|"blink"|"breathe"|"status", level = 0..100 }`.
+  For effects, `level` is their configured peak; in `status` mode it is the
+  current normal-indicator brightness. This is software state and does not
+  read sysfs back.
+- **`plugin.led_status([color])`** cancels that color's effect and returns it
+  to normal charge-status indication. Omit the color or pass `nil` to return
+  both LEDs; the other LED keeps its plugin override.
+- **`plugin.led_release()`** stops every effect, clears the shared override,
+  and reapplies the current LED Indicator setting.
+
+The most recent plugin to call a control function owns the shared override;
+only that plugin can release it. The owner is released after a Lua call error,
+a failed script load, plugin manager teardown, or `plugin.reload_ui()`. Effect
+timers are deleted on release and teardown. They are paused before suspend
+and the saved LED state and effects are reasserted after resume. Suspend-to-RAM
+still turns both LEDs off; effects do not run during suspend.
+
+```lua
+if plugin.led_available() then
+    plugin.led_set("blue", 35)
+    plugin.led_blink("red", 300, 700, 80)
+    -- Later, when this plugin no longer needs the override:
+    plugin.led_release()
+end
+```
+
 ### ⏯️ Playback Control
 
 Unlike the EQ functions above, these **do** go through `gui.c` bridges
@@ -1254,6 +1317,11 @@ button/remote-control-driven one.
   hardware volume-button press.
 - **`plugin.is_playing()` / `plugin.is_paused()`** -> bool.
 - **`plugin.get_position()` / `plugin.get_duration()`** -> number (seconds).
+- **`plugin.get_volume()`** -> current applied volume, integer 0..100.
+- **`plugin.get_battery()`** -> `{ level = 0..100, charging = bool, full = bool,
+  external_power = bool }`. A missing battery reports level 0. `charging` and
+  `full` use the same charge-limiter and power-supply status logic as the
+  built-in charge LED.
 
 These are always called from inside a plugin callback (`on_open`,
 `on_select`, a tile click), which is itself already dispatched synchronously
@@ -1733,7 +1801,7 @@ Subscribes to a playback or device lifecycle change your plugin didn't
 itself cause. Unlike `register_list_item()` (where each plugin's row
 coexists as its own list entry), an event has no UI real estate to divide
 up -- **every** plugin subscribed to a given event fires, not just the
-first or the most recent. Six recognized events:
+first or the most recent. The recognized events are:
 
 - `"track_started"` -- `callback(title, artist, album, duration_seconds,
   provider, track_id)`. Fires whenever a new track begins playing, whatever
@@ -1769,6 +1837,19 @@ first or the most recent. Six recognized events:
   (see the "stopped" event's own Known gap note above) -- useful for anything
   that wants to continue playback past the edge of the current playlist, such as
   jumping to a next album/folder.
+- `"volume_changed"` -- `callback(percent)`, integer 0..100. Fires when the
+  applied volume changes from any source. The player samples and dispatches it
+  on its existing 500ms UI tick, so a slider drag is coalesced to at most one
+  notification per tick.
+- `"battery_changed"` -- `callback(info)`, with the same fields as
+  `plugin.get_battery()`. Fires only when one or more fields changes, polled on
+  the existing UI tick.
+- `"suspending"` -- `callback()`, just before idle suspend-to-RAM. It is a
+  notification only; it cannot cancel suspend and uses the normal plugin call
+  time budget.
+- `"system_resumed"` -- `callback()`, after suspend-to-RAM returns and the
+  player's UI/LED state is restored. This name is separate from `"resumed"`,
+  which continues to mean playback resumed.
 
 Passing an unrecognized event name raises a Lua error immediately, same
 convention as an unrecognized `list_id`. Capped at 8 subscribers per event,

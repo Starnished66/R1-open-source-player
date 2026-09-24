@@ -7,7 +7,7 @@
 /* Plugin API version definition.
  * Plugins can declare api_min to require specific API features.
  * Sandboxed Lua states restrict filesystem and OS execution access. */
-#define PLUGIN_API_VERSION 12
+#define PLUGIN_API_VERSION 13
 #define PLUGIN_LIST_SCREEN_POOL_SIZE 4
 
 /* Third-party Lua plugin support. Every *.lua file under
@@ -167,9 +167,9 @@
 
 /* Upper bound on how many plugin.on() subscriptions any ONE event may have,
  * across every loaded plugin combined -- luaL_error()s past this, same
- * cap-and-fail-loudly convention as PLUGIN_MAX_STREAM_TILES. Four events
- * (track_started/paused/resumed/stopped) each get their own array sized off
- * this, in plugin_manager.c. */
+ * cap-and-fail-loudly convention as PLUGIN_MAX_STREAM_TILES. Each playback,
+ * device, volume, and battery event gets its own array sized off this in
+ * plugin_manager.c. */
 #define PLUGIN_MAX_EVENT_SUBSCRIBERS 8
 
 /* ---- plugin.set_interval(seconds, callback) / plugin.clear_interval(handle)
@@ -396,11 +396,10 @@ void plugin_manager_settings_list_toggled(int slot, int row, bool new_value);
  * tick -- see gui.c's plugin_settings_slider_event_cb()'s own comment. */
 void plugin_manager_settings_list_slid(int slot, int row, int new_value);
 
-/* ---- Dispatchers for plugin.on() event subscribers -- called from gui.c
- * at the exact points each event actually happens (see plugin_manager.h's
- * own PLUGIN_MAX_EVENT_SUBSCRIBERS comment above for the hook-point list).
- * Each loops every plugin currently subscribed to that event and
- * lua_pcall()s it -- a no-op if nothing is subscribed. ---- */
+/* ---- Dispatchers for plugin.on() event subscribers. Playback and suspend
+ * transitions are called from gui.c at their transition points; volume and
+ * battery state are sampled on its existing control tick. Each loops every
+ * subscriber and calls it through plugin_call() on the UI thread. ---- */
 /* provider/track_id are "" for a local/Subsonic track -- non-empty only for
  * a remote-provider one (plugin.play_remote(), see remote_track.h), purely
  * additive on top of the original 4-arg event so an existing subscriber
@@ -413,6 +412,10 @@ void plugin_manager_notify_resumed(void);
 void plugin_manager_notify_stopped(void);
 void plugin_manager_notify_screen_woke(void);
 void plugin_manager_notify_queue_exhausted(int direction);
+void plugin_manager_notify_volume_changed(int percent);
+void plugin_manager_poll_battery(void);
+void plugin_manager_notify_suspending(void);
+void plugin_manager_notify_system_resumed(void);
 
 /* ---- plugin.register_quick_toggle() -- a toggle in the quick drawer's
  * expanded area (gui_shell.c's build_quick_drawer(), third toggle row),

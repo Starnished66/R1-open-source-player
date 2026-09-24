@@ -166,7 +166,7 @@ static sd_ready_probes_t fake_probes(fake_ctx_t * f) {
 
 static sd_ready_result_t run(fake_ctx_t * f) {
     sd_ready_probes_t probes = fake_probes(f);
-    const char * exec_candidates[] = { "STOCK", "UPDATE" };
+    const char * exec_candidates[] = { "UPDATE", "LEGACY_UPDATE" };
     return wait_for_sd_ready(&probes, "PARTITION", "WHOLE", exec_candidates, 2, SHORT_MS, EXTENDED_MS, HARD_MS,
                               POLL_MS, EXEC_GRACE_MS);
 }

@@ -21,9 +21,9 @@ static int fb_stride_pixels = 0; /* line_length in PIXELS, not bytes -- see fb_o
 static int fb_base_offset_pixels = 0;
 
 /* Compact (no stride padding) heap copy of the decoded background, for
- * fb_restore_background()'s fast per-frame blit -- see fb_draw.h's own
- * doc comment on why this exists instead of re-decoding the JPEG on every
- * redraw tick. NULL until fb_draw_background_jpeg() succeeds at least
+ * fb_restore_background()'s fast blit -- see fb_draw.h's own doc comment on
+ * why this exists instead of re-decoding the JPEG on each redraw. NULL until
+ * fb_draw_background_jpeg() succeeds at least
  * once. Freed by fb_close() -- this bootloader stays alive as the
  * fork/waitpid supervisor for however long the chosen player runs (see
  * main.c's own run_player_supervised()), so this 768000-byte allocation
@@ -37,11 +37,9 @@ static uint16_t * bg_cache = NULL;
  * blitting to the visible framebuffer in fb_flush(). */
 static uint16_t * back_buffer = NULL;
 
-/* 5x7 dot-matrix font, uppercase + digits + space + ':', '-', and '_' only. Deliberately not a
- * full ASCII table -- every string this bootloader ever draws is
- * hand-written UI text, known in full at the time this was written (see
- * main.c's own string literals), so the font only needs to cover the
- * characters those strings actually use. Each glyph is 7 bytes, one per
+/* 5x7 dot-matrix font, uppercase + digits + space + ':', '-', and '_' only.
+ * Deliberately not a full ASCII table -- the installer status strings are
+ * hand-written and need only this character set. Each glyph is 7 bytes, one per
  * row top-to-bottom, bits 4..0 = leftmost..rightmost column. The ASCII-art
  * comment above each glyph is the source of truth this was transcribed
  * from -- if a character ever looks wrong on real hardware, compare
@@ -144,9 +142,7 @@ static bool is_rgb565_layout(const struct fb_var_screeninfo * vinfo) {
  * settled, and a bootloader runs even earlier in boot than the main
  * player (which already needed this same retry). fb_draw.h's own doc
  * comment promises this; an earlier version of this function opened once
- * and gave up immediately, silently falling back to booting the persisted
- * default with no menu shown on what was actually just a transient,
- * recoverable startup race. */
+ * and gave up immediately on a transient, recoverable startup race. */
 #define FB_READY_MAX_ATTEMPTS 50
 #define FB_READY_DELAY_MS 100
 
@@ -175,8 +171,7 @@ bool fb_open(void) {
     /* Confirmed geometry/format (see fb_draw.h's own comment) -- refusing
      * to draw into anything else is deliberate: a bootloader guessing
      * wrong about pixel format would silently corrupt the display instead
-     * of failing loudly, and main.c's own fast-path (no menu needed) still
-     * works fine even if this returns false. */
+     * of failing loudly. The player can still boot if this returns false. */
     if (vinfo.xres != FB_WIDTH || vinfo.yres != FB_HEIGHT || vinfo.bits_per_pixel != 16 || !is_rgb565_layout(&vinfo)) {
         fprintf(stderr, "fb_draw: unexpected fb format %ux%u @ %ubpp r%u:%u g%u:%u b%u:%u (expected %dx%d RGB565)\n",
                 vinfo.xres, vinfo.yres, vinfo.bits_per_pixel, vinfo.red.offset, vinfo.red.length,
@@ -305,11 +300,6 @@ static inline void put_pixel(int x, int y, fb_color_t color) {
     back_buffer[(size_t) y * FB_WIDTH + x] = color;
 }
 
-static inline fb_color_t get_pixel(int x, int y) {
-    if (!back_buffer || x < 0 || y < 0 || x >= FB_WIDTH || y >= FB_HEIGHT) return 0;
-    return back_buffer[(size_t) y * FB_WIDTH + x];
-}
-
 void fb_fill(fb_color_t color) {
     fb_fill_rect(0, 0, FB_WIDTH, FB_HEIGHT, color);
 }
@@ -325,47 +315,8 @@ void fb_fill_rect(int x, int y, int w, int h, fb_color_t color) {
     }
 }
 
-/* Blends `color` over whatever is already on screen -- alpha 0 leaves the
- * existing pixel untouched, 255 is equivalent to fb_fill_rect(). Blends in
- * RGB565's own 5/6/5 precision directly (no round-trip through 8-bit per
- * channel) -- plenty for a UI overlay effect, and avoids fb_rgb()'s own
- * packing/unpacking for every pixel of every card, every redraw tick. */
-void fb_fill_rect_alpha(int x, int y, int w, int h, fb_color_t color, uint8_t alpha) {
-    if (w <= 0 || h <= 0) return;
-    if (alpha == 255) { fb_fill_rect(x, y, w, h, color); return; }
-    if (alpha == 0) return;
-
-    int x0 = x < 0 ? 0 : x;
-    int y0 = y < 0 ? 0 : y;
-    int x1 = x + w > FB_WIDTH ? FB_WIDTH : x + w;
-    int y1 = y + h > FB_HEIGHT ? FB_HEIGHT : y + h;
-
-    uint16_t cr = (color >> 11) & 0x1F, cg = (color >> 5) & 0x3F, cb = color & 0x1F;
-    uint16_t inv_alpha = 255 - alpha;
-
-    for (int py = y0; py < y1; py++) {
-        for (int px = x0; px < x1; px++) {
-            fb_color_t bg = get_pixel(px, py);
-            uint16_t br = (bg >> 11) & 0x1F, bgc = (bg >> 5) & 0x3F, bb = bg & 0x1F;
-            uint8_t r = (uint8_t) ((cr * alpha + br * inv_alpha) / 255);
-            uint8_t g = (uint8_t) ((cg * alpha + bgc * inv_alpha) / 255);
-            uint8_t b = (uint8_t) ((cb * alpha + bb * inv_alpha) / 255);
-            put_pixel(px, py, (fb_color_t) ((r << 11) | (g << 5) | b));
-        }
-    }
-}
-
-void fb_draw_rect_border(int x, int y, int w, int h, int thickness, fb_color_t color) {
-    if (thickness <= 0) return;
-    fb_fill_rect(x, y, w, thickness, color);                       /* top */
-    fb_fill_rect(x, y + h - thickness, w, thickness, color);       /* bottom */
-    fb_fill_rect(x, y, thickness, h, color);                       /* left */
-    fb_fill_rect(x + w - thickness, y, thickness, h, color);       /* right */
-}
-
-/* scale=3 keeps each font pixel a visible 3x3 block on this 480x800 panel
- * without needing anti-aliasing -- a plain, blocky look is fine for a boot
- * menu and matches the deliberately minimal font above. */
+/* scale=3 keeps the status text readable on either supported panel without
+ * needing anti-aliasing. */
 #define GLYPH_SCALE 3
 
 void fb_draw_text(int x, int y, const char * text, fb_color_t color) {

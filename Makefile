@@ -851,13 +851,12 @@ $(TARGET_BIN): $(TARGET_OBJS)
 	$(CROSS_STRIP) -s -o $@ $(BUILD_TARGET_DIR)/$(TARGET_BIN)_unstripped
 	@echo "Target build complete: File ready at '$(TARGET_BIN)'"
 
-# Standalone boot selector -- see src/bootloader/main.c's own top comment.
+# Standalone bootloader -- see src/bootloader/main.c's own top comment.
 # Deliberately its own tiny static binary, not linked against LVGL/the main
-# TARGET_OBJS: input_device_utils.c, subprocess.c, and tjpgd.c (for the
-# /etc/logo1.jpeg background -- see fb_draw.c's own doc comment) are pulled
-# in directly (all already dependency-free -- see their own files) rather
-# than reusing TARGET_OBJS's build rule, so this never accidentally drags
-# in the rest of the player/LVGL.
+# TARGET_OBJS: subprocess.c and tjpgd.c (for the boot splash -- see fb_draw.c's
+# own doc comment) are pulled in directly (both already dependency-free) rather
+# than reusing TARGET_OBJS's build rule, so this never accidentally drags in
+# the rest of the player/LVGL.
 # Same r1-stays-bare reasoning as HOST_BIN/TARGET_BIN (below the BOARD
 # selector block near the top of this file) -- without this, `make
 # bootloader BOARD=r3proii` would silently overwrite the R1 bootloader
@@ -868,18 +867,16 @@ BOOTLOADER_BIN = compas_bootloader
 else
 BOOTLOADER_BIN = compas_bootloader_$(BOARD)
 endif
-BOOTLOADER_SRCS = src/bootloader/main.c src/bootloader/fb_draw.c src/bootloader/input.c \
+BOOTLOADER_SRCS = src/bootloader/main.c src/bootloader/fb_draw.c \
                   src/bootloader/scanner.c src/bootloader/installer.c src/bootloader/sd_ready.c \
                   src/bootloader/sd_ready_real.c \
-                  src/hardware/input_device_utils.c src/core/subprocess.c \
+                  src/core/subprocess.c \
                   lvgl/src/libs/tjpgd/tjpgd.c
 # -ffunction-sections/-fdata-sections + -Wl,--gc-sections: standard, safe
 # combination that lets the linker drop unused functions/data at the
-# granularity of individual symbols instead of whole .o files -- the only
-# thing this bootloader intentionally over-links (subprocess.c, for the
-# mount helper calls; input_device_utils.c) is small, but neither is used
-# in full, so this actually earns its keep here rather than being cargo-cult.
-BOOTLOADER_CFLAGS = -O2 -Wall -I. -Isrc/bootloader -Isrc/hardware -Isrc/core $(BOARD_DEFINE) -ffunction-sections -fdata-sections
+# granularity of individual symbols instead of whole .o files, which keeps
+# the statically linked mount helpers and JPEG decoder small.
+BOOTLOADER_CFLAGS = -O2 -Wall -I. -Isrc/bootloader -Isrc/core $(BOARD_DEFINE) -ffunction-sections -fdata-sections
 
 .PHONY: bootloader-player-selftest
 bootloader-player-selftest:

@@ -4,7 +4,6 @@
 #include "sd_ready.h"
 
 #include <ctype.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,10 +14,6 @@
 
 /* mount_sd_card_if_needed() is implemented in sd_ready_real.c, backed by
  * the wait_for_sd_ready() state machine. */
-
-#define DEFAULT_TIMEOUT_SECONDS 3
-#define MIN_TIMEOUT_SECONDS 1
-#define MAX_TIMEOUT_SECONDS 30
 
 bool scanner_path_is_executable(const char * path) {
     struct stat st;
@@ -96,70 +91,14 @@ bool scanner_read_build_stamp(const char * path, char * out, size_t out_size) {
     return found && read_ok;
 }
 
-void scanner_drop_sd_update_cache(void) {
-    const char * paths[] = { SD_UPDATE_PLAYER_PATH, LEGACY_SD_UPDATE_PLAYER_PATH };
-    int fd = -1;
-    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
-        fd = open(paths[i], O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) break;
-    }
-    if (fd < 0) return;
-
-    /* installer_run() reads this executable in full (for its checksum, and
-     * again when actually copying it). That is useful cache when it is
-     * about to boot, but pure memory pressure when Stock was selected
-     * instead. On this 56 MiB device it can split the HGL DMA reservation as
-     * Stock reacquires it during exec. Drop only this extra SD cache and
-     * only on that handoff; all normal Open Player paths retain their
-     * useful warm executable pages. Best-effort for filesystems which do not
-     * implement POSIX_FADV_DONTNEED. */
-    int rc = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-    if (rc != 0) {
-        fprintf(stderr, "scanner: failed to drop SD update page cache: %s\n", strerror(rc));
-    }
-    close(fd);
-}
-
-static void load_preferences(int * out_timeout_seconds) {
-    *out_timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
-
-    FILE * f = fopen(BOOT_PREF_PATH, "r");
-    if (!f) f = fopen(LEGACY_BOOT_PREF_PATH, "r");
-    if (!f) return; /* first boot, or SD/partition not present yet -- defaults above stand */
-
-    char line[128];
-    while (fgets(line, sizeof(line), f)) {
-        int value;
-        if (sscanf(line, "timeout_seconds=%d", &value) == 1) {
-            if (value >= MIN_TIMEOUT_SECONDS && value <= MAX_TIMEOUT_SECONDS) *out_timeout_seconds = value;
-        }
-    }
-    fclose(f);
-}
-
 void scanner_scan(scan_result_t * out) {
     memset(out, 0, sizeof(*out));
 
     mount_sd_card_if_needed();
 
-    out->sd_stock_path = scanner_path_is_executable(SD_STOCK_PLAYER_PATH) ? SD_STOCK_PLAYER_PATH :
-                         (scanner_path_is_executable(LEGACY_SD_STOCK_PLAYER_PATH) ?
-                              LEGACY_SD_STOCK_PLAYER_PATH : NULL);
-    out->sd_stock_present = out->sd_stock_path != NULL;
     out->sd_update_path = scanner_path_is_executable(SD_UPDATE_PLAYER_PATH) ? SD_UPDATE_PLAYER_PATH :
                           (scanner_path_is_executable(LEGACY_SD_UPDATE_PLAYER_PATH) ?
                                LEGACY_SD_UPDATE_PLAYER_PATH : NULL);
     out->sd_update_present = out->sd_update_path != NULL;
 
-    scanner_read_build_stamp(INTERNAL_PLAYER_PATH, out->internal_build_stamp,
-                             sizeof(out->internal_build_stamp));
-
-    load_preferences(&out->timeout_seconds);
-    /* Stock is never the automatic selection -- see scan_result_t's own doc
-     * comment on default_entry. There is no longer a competing "newer SD
-     * build" auto-selection either: an SD update binary is never a boot
-     * destination in its own right (installer.c), so the only two possible
-     * destinations here are Internal and Stock, and Internal always wins
-     * the unattended default. */
-    out->default_entry = BOOT_ENTRY_INTERNAL;
 }

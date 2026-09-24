@@ -32,15 +32,6 @@ fb_color_t fb_rgb(uint8_t r, uint8_t g, uint8_t b);
 void fb_fill(fb_color_t color);
 void fb_fill_rect(int x, int y, int w, int h, fb_color_t color);
 
-/* Alpha-blends color over whatever is already drawn there (e.g. the
- * background image) instead of overwriting it outright -- 0 leaves the
- * existing pixel untouched, 255 behaves exactly like fb_fill_rect(). For a
- * card whose background should read as "semi-transparent over the
- * artwork", not opaque. */
-void fb_fill_rect_alpha(int x, int y, int w, int h, fb_color_t color, uint8_t alpha);
-
-void fb_draw_rect_border(int x, int y, int w, int h, int thickness, fb_color_t color);
-
 /* Uppercase letters, digits, space, ':', '-', and '_' only -- see fb_draw.c's own
  * font table doc comment for exactly why the character set is this
  * narrow. Any other byte is drawn as a blank cell rather than skipped, so
@@ -60,8 +51,8 @@ void fb_flush(void);
  * player's own cover-art decode, lvgl/src/libs/tjpgd/ -- fully
  * standalone, no other LVGL dependency). Deliberately does NOT scale or
  * crop: this only exists to
- * draw /etc/logo1.jpeg, confirmed on-device to be exactly FB_WIDTH x
- * FB_HEIGHT already (this device's own stock boot splash asset) -- a
+ * draw the boot splash asset, expected to be exactly FB_WIDTH x FB_HEIGHT
+ * already -- a
  * general-purpose image-fit pipeline is exactly the kind of scope this
  * bootloader's own design deliberately avoids pulling in. Returns false
  * (caller should fall back to a plain fb_fill()) if the file can't be
@@ -69,16 +60,12 @@ void fb_flush(void);
  * screen exactly -- never scales/crops to fit as a fallback.
  *
  * On success, also caches the decoded frame (a plain heap copy, no
- * padding) so fb_restore_background() below can redraw it cheaply --
- * call this once, not on every menu redraw tick, or every tick pays a
- * full JPEG decode for no reason. */
+ * padding) so fb_restore_background() below can redraw it without
+ * decoding the JPEG again. */
 bool fb_draw_background_jpeg(const char * path);
 
-/* Fast per-frame redraw: blits the background fb_draw_background_jpeg()
- * cached, or fills with fallback_color if that was never called or
- * failed. This is what every subsequent draw_menu()-style redraw should
- * call instead of fb_fill() directly, so a countdown ticking every
- * ~100ms doesn't re-decode a JPEG that many times a second. */
+/* Restores the cached boot splash, or fills with fallback_color if decoding
+ * the splash failed. The installer uses this before drawing update status. */
 void fb_restore_background(fb_color_t fallback_color);
 
 #endif /* BOOTLOADER_FB_DRAW_H */

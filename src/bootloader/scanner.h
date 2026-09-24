@@ -59,7 +59,8 @@
  * writable partition, never the read-only squashfs rootfs. Plain
  * "key=value" lines, not real INI (no sections) -- one small integer per
  * line does not need a real parser. */
-#define BOOT_PREF_PATH "/usr/data/open_hiby_bootloader_preference.txt"
+#define BOOT_PREF_PATH "/usr/data/compas_bootloader_preference.txt"
+#define LEGACY_BOOT_PREF_PATH "/usr/data/open_hiby_bootloader_preference.txt"
 
 #define BOOT_ENTRY_INTERNAL 0
 #define BOOT_ENTRY_SD_STOCK 1

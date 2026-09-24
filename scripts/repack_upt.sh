@@ -10,6 +10,22 @@ usage() {
     exit 2
 }
 
+patch_bootloader_wrapper() {
+    local wrapper=$1
+    if grep -Eq '^[[:space:]]*(exec[[:space:]]+)?/usr/bin/(open_hiby_bootloader|compas_bootloader)[[:space:]]*$' \
+        "$wrapper"; then
+        sed -i -E 's#^([[:space:]]*)(exec[[:space:]]+)?/usr/bin/open_hiby_bootloader([[:space:]]*)$#\1\2/usr/bin/compas_bootloader\3#' \
+            "$wrapper"
+    else
+        grep -Eq '^[[:space:]]*(exec[[:space:]]+)?/usr/bin/hiby_player[[:space:]]*$' \
+            "$wrapper" || return 1
+        sed -i -E 's#^([[:space:]]*)(exec[[:space:]]+)?/usr/bin/hiby_player([[:space:]]*)$#\1\2/usr/bin/compas_bootloader\3#' \
+            "$wrapper"
+    fi
+    grep -Eq '^[[:space:]]*(exec[[:space:]]+)?/usr/bin/compas_bootloader[[:space:]]*$' "$wrapper" &&
+        ! grep -Eq '^[[:space:]]*(exec[[:space:]]+)?/usr/bin/open_hiby_bootloader[[:space:]]*$' "$wrapper"
+}
+
 board=${BOARD:-r1}
 if [[ ${1:-} == --board ]]; then
     [[ $# -ge 2 ]] || usage
@@ -75,25 +91,14 @@ if [[ $board == r1 ]]; then
     # An approved R1 Staging Image must already contain the bootloader handoff.
     # Refuse an older public beta instead of quietly producing a firmware that
     # bypasses the boot menu after the new bootloader binary is copied in.
-    grep -q '/usr/bin/open_hiby_bootloader' "$wrapper" || {
+    grep -Eq '^[[:space:]]*(exec[[:space:]]+)?/usr/bin/(open_hiby_bootloader|compas_bootloader)[[:space:]]*$' "$wrapper" || {
         echo "Base OTA is not an approved R1 Staging Image (bootloader wrapper missing)" >&2
         exit 1
     }
-else
-    # R3 Pro II stock firmware starts the stock player directly. Replace only
-    # the standalone command, preserving /usr/bin/hiby_player as the stock
-    # player that the bootloader can launch when selected from the SD card.
-    if ! grep -q '/usr/bin/open_hiby_bootloader' "$wrapper"; then
-        grep -Eq '^[[:space:]]*/usr/bin/hiby_player[[:space:]]*$' "$wrapper" || {
-            echo "R3 OTA has no standalone /usr/bin/hiby_player launcher to patch" >&2
-            exit 1
-        }
-        sed -i 's|^[[:space:]]*/usr/bin/hiby_player[[:space:]]*$|/usr/bin/open_hiby_bootloader|' "$wrapper"
-    fi
-    grep -q '/usr/bin/open_hiby_bootloader' "$wrapper" || {
-        echo "Failed to patch R3 /usr/bin/hiby_player.sh" >&2
-        exit 1
-    }
+fi
+if ! patch_bootloader_wrapper "$wrapper"; then
+    echo "Base OTA has no supported standalone launcher in /usr/bin/hiby_player.sh" >&2
+    exit 1
 fi
 
 # A previous Compás image may have left the old standalone name behind.
@@ -101,7 +106,6 @@ fi
 # unambiguous standalone binary and does not waste space in the rootfs.
 rm -f "$work/root/usr/bin/open_hiby_player"
 install -m 0755 "$player" "$work/root/usr/bin/compas_player"
-install -m 0755 "$bootloader" "$work/root/usr/bin/open_hiby_bootloader"
 
 # The R1 stock boot scripts start the A2DP source daemon without the encoder
 # arguments the player's default "auto" codec preference expects. Keep this
@@ -212,6 +216,17 @@ if [[ $board == r3proii && -n ${R3_RUNTIME_OVERLAY:-} ]]; then
     runtime_overlay=$(realpath "$R3_RUNTIME_OVERLAY")
     cp -a "$runtime_overlay"/. "$work/root/"
 fi
+
+# Apply the handoff after overlays so they cannot restore an old launcher.
+wrapper="$work/root/usr/bin/hiby_player.sh"
+if ! patch_bootloader_wrapper "$wrapper"; then
+    echo "Final OTA has no supported standalone launcher in /usr/bin/hiby_player.sh" >&2
+    exit 1
+fi
+
+# Remove a stale base or overlay copy so the wrapper has one bootloader path.
+rm -f "$work/root/usr/bin/open_hiby_bootloader"
+install -m 0755 "$bootloader" "$work/root/usr/bin/compas_bootloader"
 
 # The player promises the Speex rate converter, which is built from the
 # pinned, redistributable SpeexDSP/alsa-plugins sources by the base-image

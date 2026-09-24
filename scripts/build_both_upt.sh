@@ -50,9 +50,9 @@ make -C "$repo" target bootloader BOARD=r3proii
 
 for binary in \
     "$repo/compas_player_target" \
-    "$repo/open_hiby_bootloader" \
+    "$repo/compas_bootloader" \
     "$repo/compas_player_target_r3proii" \
-    "$repo/open_hiby_bootloader_r3proii"; do
+    "$repo/compas_bootloader_r3proii"; do
     [[ -s "$binary" ]] || { echo "Build did not produce: $binary" >&2; exit 1; }
 done
 
@@ -61,11 +61,11 @@ trap 'rm -rf "$temp_dir"' EXIT
 
 echo "Repacking R1 image..."
 "$repo/scripts/repack_upt.sh" --board r1 "$r1_base" \
-    "$repo/compas_player_target" "$repo/open_hiby_bootloader" \
+    "$repo/compas_player_target" "$repo/compas_bootloader" \
     "$temp_dir/r1.upt"
 echo "Repacking R3 Pro II image..."
 "$repo/scripts/repack_upt.sh" --board r3proii "$r3_base" \
-    "$repo/compas_player_target_r3proii" "$repo/open_hiby_bootloader_r3proii" \
+    "$repo/compas_player_target_r3proii" "$repo/compas_bootloader_r3proii" \
     "$temp_dir/r3proii.upt"
 
 mv -f "$temp_dir/r1.upt" "$r1_output"

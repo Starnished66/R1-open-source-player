@@ -124,6 +124,7 @@ static void load_preferences(int * out_timeout_seconds) {
     *out_timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
 
     FILE * f = fopen(BOOT_PREF_PATH, "r");
+    if (!f) f = fopen(LEGACY_BOOT_PREF_PATH, "r");
     if (!f) return; /* first boot, or SD/partition not present yet -- defaults above stand */
 
     char line[128];

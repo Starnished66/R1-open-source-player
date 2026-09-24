@@ -18,8 +18,8 @@ file with the layout expected by the R1 recovery updater. It:
 
 1. extracts the base image;
 2. joins and unpacks its `rootfs.squashfs` and `xImage` chunks;
-3. verifies that the base image's `usr/bin/hiby_player.sh` invokes
-   `/usr/bin/open_hiby_bootloader`;
+3. verifies that the base image's `usr/bin/hiby_player.sh` invokes the
+   bootloader, then rewrites the handoff to `/usr/bin/compas_bootloader`;
 4. installs the supplied player and bootloader binaries;
 5. copies the repository's git-tracked assets and fonts to their device paths,
    then every file under `firmware/overlay/` into the root filesystem;
@@ -93,15 +93,18 @@ The commands must produce these two non-empty files in the repository root:
 
 ```text
 compas_player_target
-open_hiby_bootloader
+compas_bootloader
 ```
 
 The repack script installs them as:
 
 ```text
 /usr/bin/compas_player
-/usr/bin/open_hiby_bootloader
+/usr/bin/compas_bootloader
 ```
+
+Older installs may still have `/usr/bin/open_hiby_bootloader`. Repacking an
+image removes that old binary and installs `/usr/bin/compas_bootloader`.
 
 Both files must be R1 MIPS binaries. Do not substitute the R3 Pro II build
 outputs or a host executable.
@@ -140,9 +143,9 @@ An asset that is present locally but untracked will silently not ship. That is
 a real failure mode, not a hypothetical: it is how the Subsonic download icon
 went missing from a release while appearing to be present in the source tree.
 
-The copies happen after the binaries are installed, so do not place
-`usr/bin/compas_player` or `usr/bin/open_hiby_bootloader` under
-`firmware/overlay/` unless overriding the command-line binaries is deliberate.
+The assets and overlay are copied after the player is installed. Do not place
+`usr/bin/compas_bootloader` under `firmware/overlay/`; the supplied bootloader
+is installed after the overlays are applied.
 
 ## 4. Create the `.upt` file
 
@@ -152,7 +155,7 @@ Invoke the script with exactly four arguments, in this order:
 scripts/repack_upt.sh \
   /path/to/base_staging.upt \
   compas_player_target \
-  open_hiby_bootloader \
+  compas_bootloader \
   output/r1-custom.upt
 ```
 

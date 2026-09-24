@@ -180,6 +180,8 @@
 /open_hiby_player_host_*
 /open_hiby_player_target
 /open_hiby_player_target_*
+/compas_bootloader
+/compas_bootloader_*
 /open_hiby_bootloader
 /open_hiby_bootloader_*
 /compile_commands.json

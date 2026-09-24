@@ -58,15 +58,15 @@ jobs:
           make sd_ready_test
           make -j2 target BOARD=r3proii RELEASE_LABEL="$RELEASE_LABEL"
           make bootloader BOARD=r3proii
-          file compas_player_target open_hiby_bootloader \
-            compas_player_target_r3proii open_hiby_bootloader_r3proii
+          file compas_player_target compas_bootloader \
+            compas_player_target_r3proii compas_bootloader_r3proii
           mipsel-linux-musl-readelf -h compas_player_target \
             | grep 'Machine:.*MIPS' >/dev/null
-          mipsel-linux-musl-readelf -h open_hiby_bootloader \
+          mipsel-linux-musl-readelf -h compas_bootloader \
             | grep 'Machine:.*MIPS' >/dev/null
           mipsel-linux-musl-readelf -h compas_player_target_r3proii \
             | grep 'Machine:.*MIPS' >/dev/null
-          mipsel-linux-musl-readelf -h open_hiby_bootloader_r3proii \
+          mipsel-linux-musl-readelf -h compas_bootloader_r3proii \
             | grep 'Machine:.*MIPS' >/dev/null
           for player in compas_player_target compas_player_target_r3proii; do
             if strings "$player" | grep -Eq \
@@ -102,10 +102,10 @@ jobs:
           set -euo pipefail
           mkdir -p release
           scripts/repack_upt.sh base/r1.upt compas_player_target \
-            open_hiby_bootloader release/r1.upt
+            compas_bootloader release/r1.upt
           cp compas_player_target release/compas_player
           BOARD=r3proii scripts/repack_upt.sh base/r3proii.upt \
-            compas_player_target_r3proii open_hiby_bootloader_r3proii \
+            compas_player_target_r3proii compas_bootloader_r3proii \
             release/r3proii.upt
           cp compas_player_target_r3proii release/compas_player_r3proii
           (

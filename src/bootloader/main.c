@@ -34,14 +34,14 @@ static int hgl_dma_reservation_fd = -1;
 static void reserve_stock_hgl_dma(void) {
     hgl_dma_reservation_fd = open(HGL_DMA_DEVICE, O_RDWR | O_CLOEXEC);
     if (hgl_dma_reservation_fd < 0) {
-        perror("open_hiby_bootloader: failed to reserve Stock HGL DMA memory");
+        perror("compas_bootloader: failed to reserve Stock HGL DMA memory");
     }
 }
 
 static void release_stock_hgl_dma(void) {
     if (hgl_dma_reservation_fd < 0) return;
     if (close(hgl_dma_reservation_fd) != 0) {
-        perror("open_hiby_bootloader: failed to release Stock HGL DMA reservation");
+        perror("compas_bootloader: failed to release Stock HGL DMA reservation");
     }
     hgl_dma_reservation_fd = -1;
 }
@@ -266,7 +266,7 @@ static void poweroff_device(void) {
     sync();
     reboot(RB_POWER_OFF);
     /* If poweroff syscall fails, pause indefinitely rather than rebooting. */
-    perror("open_hiby_bootloader: poweroff syscall failed");
+    perror("compas_bootloader: poweroff syscall failed");
     for (;;) pause();
 }
 
@@ -274,9 +274,9 @@ static void run_player_supervised(const char * player_path) {
     pid_t pid = fork();
     if (pid < 0) {
         /* If fork fails, attempt direct execve before rebooting. */
-        perror("open_hiby_bootloader: fork failed, execve'ing directly (no reboot-on-crash this launch)");
+        perror("compas_bootloader: fork failed, execve'ing directly (no reboot-on-crash this launch)");
         execve(player_path, (char * []) { (char *) player_path, NULL }, environ);
-        perror("open_hiby_bootloader: execve failed");
+        perror("compas_bootloader: execve failed");
         reboot_device();
     }
 
@@ -284,7 +284,7 @@ static void run_player_supervised(const char * player_path) {
         /* HGL reservation remains open in child until released via O_CLOEXEC on execve. */
         execve(player_path, (char * []) { (char *) player_path, NULL }, environ);
         /* Fall back to internal player if selected binary execve fails. */
-        perror("open_hiby_bootloader: execve failed, falling back to internal player");
+        perror("compas_bootloader: execve failed, falling back to internal player");
         if (strcmp(player_path, INTERNAL_PLAYER_PATH) != 0) {
             execve(INTERNAL_PLAYER_PATH, (char * []) { (char *) INTERNAL_PLAYER_PATH, NULL }, environ);
         }
@@ -303,12 +303,12 @@ static void run_player_supervised(const char * player_path) {
 
     if (reaped != pid) {
         /* Child wait failed unexpectedly; fall through to reboot. */
-        perror("open_hiby_bootloader: waitpid failed unexpectedly");
+        perror("compas_bootloader: waitpid failed unexpectedly");
     } else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-        fprintf(stderr, "open_hiby_bootloader: %s exited cleanly -- powering off\n", player_path);
+        fprintf(stderr, "compas_bootloader: %s exited cleanly -- powering off\n", player_path);
         poweroff_device();
     } else {
-        fprintf(stderr, "open_hiby_bootloader: %s exited abnormally (status=0x%x) -- rebooting\n",
+        fprintf(stderr, "compas_bootloader: %s exited abnormally (status=0x%x) -- rebooting\n",
                 player_path, (unsigned) status);
     }
     reboot_device();
@@ -353,7 +353,7 @@ int main(void) {
         int chosen_entry;
         if (!fb_ready) {
             /* Boot default entry without showing menu if framebuffer failed. */
-            fprintf(stderr, "open_hiby_bootloader: fb not available, booting default entry with no menu\n");
+            fprintf(stderr, "compas_bootloader: fb not available, booting default entry with no menu\n");
             chosen_entry = scan.default_entry;
         } else {
             chosen_entry = run_menu(&scan);

@@ -200,7 +200,7 @@ done < <(find "$overlay/usr" -type f -print0)
 # invariant explicit so a future stage cannot accidentally replace them.
 [[ ! -e $overlay/usr/bin/compas_player &&
    ! -e $overlay/usr/bin/open_hiby_player &&
-   ! -e $overlay/usr/bin/open_hiby_bootloader ]] ||
+   ! -e $overlay/usr/bin/compas_bootloader ]] ||
     die 'overlay must not contain board-specific player/bootloader binaries'
 
 (cd "$overlay" && find . \( -type f -o -type l \) -print | LC_ALL=C sort) > "$run/files.txt"

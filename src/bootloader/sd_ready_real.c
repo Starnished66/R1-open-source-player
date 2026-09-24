@@ -196,7 +196,7 @@ static void real_wait_ms(void * ctx_v, int ms) {
 
 /* Logs SD readiness result and diagnostics to stderr. */
 static void log_sd_ready_outcome(const sd_ready_result_t * r) {
-    const char * prefix = "open_hiby_bootloader: SD readiness";
+    const char * prefix = "compas_bootloader: SD readiness";
 
     if (r->elapsed_ms < 0) {
         fprintf(stderr, "%s: monotonic clock unavailable -- proceeded with a single best-effort check "

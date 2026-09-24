@@ -734,7 +734,7 @@ void settings_factory_reset(void) {
     remove(SETTINGS_TMP_FILE_PATH); /* stray leftover from an interrupted settings_save(), if any -- harmless to attempt even when it doesn't exist */
 
 #ifndef HOST_BUILD
-    /* Not execl("/sbin/reboot", ...): open_hiby_bootloader's
+    /* Not execl("/sbin/reboot", ...): compas_bootloader's
      * run_player_supervised() (src/bootloader/main.c) treats ANY clean
      * (status 0) exit of this exact supervised PID as "player exited
      * cleanly -- power off", regardless of which command replaced this

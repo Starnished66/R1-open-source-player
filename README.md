@@ -28,19 +28,19 @@ Makefile `BOARD` values: `r1` (default), `r3proii`, `r3ii_2025`. R1 binaries kee
 
 ```bash
 make target                 # -> compas_player_target
-make bootloader             # -> open_hiby_bootloader
+make bootloader             # -> compas_bootloader
 ```
 
 ## HiBy R3 Pro II
 
 ```bash
 make target BOARD=r3proii   # -> compas_player_target_r3proii
-make bootloader BOARD=r3proii # -> open_hiby_bootloader_r3proii
+make bootloader BOARD=r3proii # -> compas_bootloader_r3proii
 ```
 
 The tree has a 480×720 layout, 4.4 mm balanced-output routing, extra charger-IC handling, and UI scaling. Do not treat an R3 build as an R1 binary. The scheduled GitHub **Daily build** workflow publishes these two R3 binaries as a downloadable workflow artifact. A complete R3 `.upt` release requires a separately approved R3 staging image and checksum secret; the stock image is not used automatically.
 
-For a local R3 firmware candidate, supply your own R3 Pro II `.upt` and run `BOARD=r3proii scripts/repack_upt.sh BASE_R3_UPT compas_player_target_r3proii open_hiby_bootloader_r3proii OUTPUT_R3_UPT`. The repacker checks the stock player for the R3 board marker, adds the bootloader handoff, and installs the 480×720 boot assets. Keep the original base image for recovery; the candidate has not been validated on R3 hardware.
+For a local R3 firmware candidate, supply your own R3 Pro II `.upt` and run `BOARD=r3proii scripts/repack_upt.sh BASE_R3_UPT compas_player_target_r3proii compas_bootloader_r3proii OUTPUT_R3_UPT`. The repacker checks the stock player for the R3 board marker, adds the bootloader handoff, and installs the 480×720 boot assets. Keep the original base image for recovery; the candidate has not been validated on R3 hardware.
 
 When the repository secret `R3PROII_STAGING_IMAGE_SHA256` is configured, the same workflow can verify the R3 base image and publish a second, staging-only workflow artifact containing the repacked `.upt`. The manual workflow's `r3_base_asset` input selects the `.upt` asset from the private `staging-image-base` release. No public GitHub release is created by this path.
 
@@ -130,6 +130,9 @@ On the card that is `SD/.compas/compas_player`. Use the matching board binary, t
 Devices still running the older bootloader look for
 `SD/.open_hiby_player/open_hiby_player`; flash the current full `.upt` once to
 enable the Compás Player path above.
+
+Older installs may have `/usr/bin/open_hiby_bootloader`. The current full
+`.upt` installs `/usr/bin/compas_bootloader` and updates the wrapper.
 
 For the next release, each mount processes up to 256 top-level non-database,
 non-bootloader entries from `SD/.open_hiby_player` into `SD/.compas`; remaining

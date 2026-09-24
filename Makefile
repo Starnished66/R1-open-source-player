@@ -864,9 +864,9 @@ $(TARGET_BIN): $(TARGET_OBJS)
 # sitting in the working directory, since (unlike the player binary and its
 # object directory) this target's own output name was never suffixed.
 ifeq ($(BOARD),r1)
-BOOTLOADER_BIN = open_hiby_bootloader
+BOOTLOADER_BIN = compas_bootloader
 else
-BOOTLOADER_BIN = open_hiby_bootloader_$(BOARD)
+BOOTLOADER_BIN = compas_bootloader_$(BOARD)
 endif
 BOOTLOADER_SRCS = src/bootloader/main.c src/bootloader/fb_draw.c src/bootloader/input.c \
                   src/bootloader/scanner.c src/bootloader/installer.c src/bootloader/sd_ready.c \

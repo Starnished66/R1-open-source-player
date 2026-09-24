@@ -26,7 +26,7 @@ void idle_shutdown_reboot_now(void) {
     extern void gui_player_queue_flush(void);
     gui_player_queue_flush();
     /* Unlike idle_shutdown_now() above, this must NOT execl() an external
-     * /sbin/reboot: open_hiby_bootloader's run_player_supervised()
+     * /sbin/reboot: compas_bootloader's run_player_supervised()
      * (src/bootloader/main.c) treats ANY clean (status 0) exit of this
      * exact supervised PID as "player exited cleanly -- power off",
      * regardless of which command replaced this process's image.

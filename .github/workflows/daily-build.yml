@@ -53,14 +53,14 @@ jobs:
       - name: Validate production outputs and plugins
         run: |
           set -euo pipefail
-          file compas_player_target open_hiby_bootloader
+          file compas_player_target compas_bootloader
           test -s compas_player_target
-          test -s open_hiby_bootloader
+          test -s compas_bootloader
           # Do not use grep -q here: under pipefail its early exit can make
           # readelf receive SIGPIPE and falsely fail an otherwise valid job.
           mipsel-linux-musl-readelf -h compas_player_target \
             | grep 'Machine:.*MIPS' >/dev/null
-          mipsel-linux-musl-readelf -h open_hiby_bootloader \
+          mipsel-linux-musl-readelf -h compas_bootloader \
             | grep 'Machine:.*MIPS' >/dev/null
           if strings compas_player_target | grep -Eq \
               'TEST BUILD|TEST_BUILD_TAG|UI_PERF_TRACE|UI_GESTURE_TRACE|UI_HITBOX_DEBUG'; then
@@ -74,7 +74,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p daily-build
-          cp compas_player_target open_hiby_bootloader daily-build/
+          cp compas_player_target compas_bootloader daily-build/
           cp -a plugins_examples daily-build/
           (
             cd plugins_examples
@@ -84,7 +84,7 @@ jobs:
             echo "commit=${GITHUB_SHA}"
             echo "built_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             echo "workflow_run=${GITHUB_RUN_ID}"
-            sha256sum compas_player_target open_hiby_bootloader
+            sha256sum compas_player_target compas_bootloader
           } > daily-build/BUILD-INFO.txt
 
       - name: Upload daily build
@@ -175,7 +175,7 @@ jobs:
           mkdir -p r1-release
           scripts/repack_upt.sh base/r1.upt \
             r1-build/compas_player_target \
-            r1-build/open_hiby_bootloader \
+            r1-build/compas_bootloader \
             r1-release/r1.upt
           cp r1-build/compas_player_target r1-release/compas_player
           (
@@ -238,21 +238,21 @@ jobs:
       - name: Validate build output
         run: |
           set -euo pipefail
-          file compas_player_target_r3proii open_hiby_bootloader_r3proii
+          file compas_player_target_r3proii compas_bootloader_r3proii
           test -s compas_player_target_r3proii
-          test -s open_hiby_bootloader_r3proii
+          test -s compas_bootloader_r3proii
           # Do not use grep -q here: under pipefail its early exit can make
           # readelf receive SIGPIPE and falsely fail an otherwise valid job.
           mipsel-linux-musl-readelf -h compas_player_target_r3proii \
             | grep 'Machine:.*MIPS' >/dev/null
-          mipsel-linux-musl-readelf -h open_hiby_bootloader_r3proii \
+          mipsel-linux-musl-readelf -h compas_bootloader_r3proii \
             | grep 'Machine:.*MIPS' >/dev/null
 
       - name: Assemble R3 Pro II compile artifact
         run: |
           set -euo pipefail
           mkdir -p r3proii-build
-          cp compas_player_target_r3proii open_hiby_bootloader_r3proii \
+          cp compas_player_target_r3proii compas_bootloader_r3proii \
             r3proii-build/
           {
             echo "board=r3proii"
@@ -260,7 +260,7 @@ jobs:
             echo "built_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             echo "workflow_run=${GITHUB_RUN_ID}"
             sha256sum compas_player_target_r3proii \
-              open_hiby_bootloader_r3proii
+              compas_bootloader_r3proii
           } > r3proii-build/BUILD-INFO.txt
 
       - name: Upload R3 Pro II compile artifact
@@ -359,7 +359,7 @@ jobs:
           BOARD=r3proii scripts/repack_upt.sh \
             "base/$R3_BASE_ASSET" \
             r3proii-build/compas_player_target_r3proii \
-            r3proii-build/open_hiby_bootloader_r3proii \
+            r3proii-build/compas_bootloader_r3proii \
             r3-release/r3proii.upt
           cp r3proii-build/compas_player_target_r3proii \
             r3-release/compas_player_r3proii

@@ -2,8 +2,11 @@ Main submenu assets (2026-09-13)
 Runtime path: /usr/resource/litegui/theme2/submenu/
 Icons 44x44 RGBA, from Phosphor Icons @2.1.1 (MIT).
 Sources: folder-open, user, vinyl-record, user-square, music-notes-simple,
-playlist, cloud-arrow-down, usb, bluetooth, book-open, bookmark-simple.
+playlist, cloud-arrow-down, usb, bluetooth, book-open, bookmark-simple,
+arrows-clockwise.
 SVG gradients follow the Settings/Wireless gold/cyan/mint/silver/purple/coral
 palette. Rendered via ffmpeg librsvg and Lanczos size export.
+update_database.png uses the regular arrows-clockwise glyph from
+@phosphor-icons/core 2.1.1 (assets/regular/arrows-clockwise.svg), MIT.
 Saved backgrounds reuse the generated Settings and Wireless gradients.
 Rows retain decoded images for their lifetime. No runtime gradient generation.

@@ -1,5 +1,6 @@
 #include "gui.h"
 #include "gui_settings.h"
+#include "hw_buttons.h"
 #include "gui_shell.h"
 #include "gui_text_input.h"
 #include "app_clock.h"
@@ -58,6 +59,7 @@ static lv_obj_t * settings_display_screen;
 static lv_obj_t * settings_power_screen;
 static lv_obj_t * settings_system_screen;
 static lv_obj_t * about_screen;
+static lv_obj_t * buy_me_a_coffee_screen;
 static lv_obj_t * dev_options_screen;
 static lv_obj_t * accent_color_screen;
 static lv_obj_t * custom_font_screen;
@@ -445,15 +447,56 @@ static void dev_options_row_cb(lv_event_t * e) {
     nav_push(dev_options_screen);
 }
 
+static const char PAYPAL_DONATION_URL[] =
+    "https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=josegarita%40protonmail.com&currency_code=USD";
+
+static void buy_me_a_coffee_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(buy_me_a_coffee_screen);
+}
+
+static lv_obj_t * build_buy_me_a_coffee_screen(void) {
+    lv_obj_t * title_label;
+    lv_obj_t * list;
+    lv_obj_t * scr = build_subsonic_list_screen("Buy Me a Coffee", &title_label, &list);
+
+    lv_obj_t * qrcode = lv_qrcode_create(list);
+    lv_qrcode_set_size(qrcode, BOARD_SCALE_PX(320));
+    lv_qrcode_set_dark_color(qrcode, lv_color_black());
+    lv_qrcode_set_light_color(qrcode, lv_color_white());
+    lv_qrcode_set_quiet_zone(qrcode, true);
+    lv_obj_set_style_border_width(qrcode, 4, 0);
+    lv_obj_set_style_border_color(qrcode, lv_color_white(), 0);
+    lv_qrcode_update(qrcode, PAYPAL_DONATION_URL, strlen(PAYPAL_DONATION_URL));
+
+    lv_obj_t * caption = lv_label_create(list);
+    lv_label_set_text(caption, "Scan with your phone to support Compás Player on PayPal");
+    lv_obj_set_width(caption, lv_pct(90));
+    lv_label_set_long_mode(caption, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(caption, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_style(caption, &style_theme_text_muted, 0);
+    lv_obj_set_style_text_font(caption, gui_theme_font(GUI_FONT_ROLE_BODY), 0);
+    lv_obj_set_style_pad_top(caption, BOARD_SCALE_PX(12), 0);
+    lv_obj_set_style_pad_bottom(caption, BOARD_SCALE_PX(20), 0);
+
+    /* The QR and its caption fit within both 800px and 720px panels. Center
+     * the pair as a group so the shorter R3 Pro II screen keeps equal space
+     * above and below it without requiring a scroll. */
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    return scr;
+}
+
 static lv_obj_t * build_about_screen(void) {
-    static pill_list_item_t items[4];
+    static pill_list_item_t items[5];
     items[0] = (pill_list_item_t){ "Compás Player", PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
     items[1] = (pill_list_item_t){ app_version_label(), PILL_ACCESSORY_NONE, false, NULL, NULL, NULL };
-    items[2] =
-        (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };
+    items[2] = (pill_list_item_t){ "Buy Me a Coffee", PILL_ACCESSORY_CHEVRON, false,
+                                    buy_me_a_coffee_row_cb, NULL, NULL };
     items[3] =
+        (pill_list_item_t){ "Firmware Update", PILL_ACCESSORY_CHEVRON, false, firmware_update_row_cb, NULL, NULL };
+    items[4] =
         (pill_list_item_t){ "Developer Options", PILL_ACCESSORY_CHEVRON, false, dev_options_row_cb, NULL, NULL };
-    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 4, gui_theme_accent_style(), GUI_ROW_GAP, 100);
+    lv_obj_t * scr = build_pill_list_screen("About", generic_back_cb, items, 5, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -469,8 +512,15 @@ static void db_logging_switch_event_cb(lv_event_t * e) {
 /* Writes a detailed timestamped log of library database scans and album art
  * cache jobs to .logs/database_artwork.log, and USB DAC bridge diagnostics to
  * .logs/usb_dac_bridge.log on the SD card -- see db_log.h and usb_dac_bridge.h. */
+static void screenshot_combo_switch_event_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+    current_settings.screenshot_combo_enabled = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save(&current_settings);
+    hw_buttons_set_screenshot_combo_enabled(current_settings.screenshot_combo_enabled);
+}
+
 static lv_obj_t * build_dev_options_screen(void) {
-    static pill_list_item_t items[2];
+    static pill_list_item_t items[3];
     /* ADB lives here rather than on the USB Mode screen: it overrides
      * Storage/DAC while on and persists across a reboot, so it sits behind
      * Developer Options as the explicit opt-in that makes re-applying it on
@@ -480,7 +530,10 @@ static lv_obj_t * build_dev_options_screen(void) {
                                     NULL, adb_switch_event_cb, NULL, &adb_switch };
     items[1] = (pill_list_item_t){ "Enable debug logging", PILL_ACCESSORY_TOGGLE,
                                     current_settings.db_logging_enabled, NULL, db_logging_switch_event_cb, NULL };
-    lv_obj_t * scr = build_pill_list_screen("Developer Options", generic_back_cb, items, 2, gui_theme_accent_style(), GUI_ROW_GAP, 100);
+    items[2] = (pill_list_item_t){ "Screenshots (Power + Vol Down)", PILL_ACCESSORY_TOGGLE,
+                                    current_settings.screenshot_combo_enabled, NULL,
+                                    screenshot_combo_switch_event_cb, NULL };
+    lv_obj_t * scr = build_pill_list_screen("Developer Options", generic_back_cb, items, 3, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1578,15 +1631,13 @@ static lv_obj_t * build_music_timers_screen(void) {
 }
 
 static lv_obj_t * build_music_library_screen(void) {
-    static pill_list_item_t items[1 + PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS];
-    items[0] = (pill_list_item_t){ "Update Music Database", PILL_ACCESSORY_NONE, false, update_music_database_row_cb, NULL, NULL };
-
-    int count = 1;
-    count = append_plugin_list_rows(items, count, PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS,
-                                    plugin_manager_get_music_library_list_item_count,
-                                    plugin_manager_get_music_library_list_item_label,
-                                    plugin_manager_get_music_library_list_item_options,
-                                    plugin_music_library_list_item_click_cb);
+    static pill_list_item_t items[PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS];
+    int count = append_plugin_list_rows(items, 0, PLUGIN_MAX_MUSIC_LIBRARY_LIST_ITEMS,
+                                        plugin_manager_get_music_library_list_item_count,
+                                        plugin_manager_get_music_library_list_item_label,
+                                        plugin_manager_get_music_library_list_item_options,
+                                        plugin_music_library_list_item_click_cb);
+    if (count <= 0) return NULL;
 
     lv_obj_t * scr = build_pill_list_screen("Library", generic_back_cb, items, count, gui_theme_accent_style(), GUI_ROW_GAP, 100);
     finalize_screen_navigation(scr);
@@ -1610,19 +1661,33 @@ static void music_category_timers_cb(lv_event_t * e) {
     nav_push(music_timers_screen);
 }
 static void music_category_library_cb(lv_event_t * e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED || !music_library_screen) return;
     nav_push(music_library_screen);
 }
 
 static lv_obj_t * build_music_settings_screen(void) {
-    static pill_list_item_t items[5];
-    items[0] = (pill_list_item_t){ "Playback", PILL_ACCESSORY_CHEVRON, false, music_category_playback_cb, NULL, NULL };
-    items[1] = (pill_list_item_t){ "Audio", PILL_ACCESSORY_CHEVRON, false, music_category_audio_cb, NULL, NULL };
-    items[2] = (pill_list_item_t){ "Controls & Interface", PILL_ACCESSORY_CHEVRON, false, music_category_controls_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "Timers", PILL_ACCESSORY_CHEVRON, false, music_category_timers_cb, NULL, NULL };
-    items[4] = (pill_list_item_t){ "Library", PILL_ACCESSORY_CHEVRON, false, music_category_library_cb, NULL, NULL };
+    static pill_list_item_t items[6];
+    lv_obj_t * native_rows[6] = { NULL };
+    items[0] = (pill_list_item_t){
+        .label = "Update Music Database",
+        .accessory = PILL_ACCESSORY_NONE,
+        .on_click = update_music_database_row_cb,
+        .out_row = &native_rows[0],
+    };
+    items[1] = (pill_list_item_t){ "Playback", PILL_ACCESSORY_CHEVRON, false, music_category_playback_cb, NULL, NULL };
+    items[2] = (pill_list_item_t){ "Audio", PILL_ACCESSORY_CHEVRON, false, music_category_audio_cb, NULL, NULL };
+    items[3] = (pill_list_item_t){ "Controls & Interface", PILL_ACCESSORY_CHEVRON, false, music_category_controls_cb, NULL, NULL };
+    items[4] = (pill_list_item_t){ "Timers", PILL_ACCESSORY_CHEVRON, false, music_category_timers_cb, NULL, NULL };
 
-    lv_obj_t * scr = build_pill_list_screen("Music Settings", generic_back_cb, items, 5, gui_theme_accent_style(), GUI_ROW_GAP, 100);
+    int count = 5;
+    if (plugin_manager_get_music_library_list_item_count() > 0) {
+        items[count++] = (pill_list_item_t){ "Library", PILL_ACCESSORY_CHEVRON, false,
+                                             music_category_library_cb, NULL, NULL };
+    }
+
+    lv_obj_t * scr = build_pill_list_screen("Music Settings", generic_back_cb, items, count,
+                                            gui_theme_accent_style(), GUI_ROW_GAP, 100);
+    decorate_category_row(native_rows[0], "submenu/update_database.png", NULL);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -1866,7 +1931,7 @@ static lv_obj_t * build_settings_system_screen(void) {
                                     clock_settings_row_cb, NULL, NULL };
     items[1] = (pill_list_item_t){ "USB Mode", PILL_ACCESSORY_CHEVRON, false, usb_mode_settings_row_cb, NULL, NULL };
     items[2] = (pill_list_item_t){ "Hostname", PILL_ACCESSORY_CHEVRON, false, hostname_row_cb, NULL, NULL };
-    items[3] = (pill_list_item_t){ "Plugins", PILL_ACCESSORY_CHEVRON, false, gui_plugin_manage_row_cb, NULL, NULL };
+    items[3] = (pill_list_item_t){ "Plugin Manager", PILL_ACCESSORY_CHEVRON, false, gui_plugin_manage_row_cb, NULL, NULL };
     items[4] = (pill_list_item_t){ "Factory Reset", PILL_ACCESSORY_NONE, false, factory_reset_btn_cb, NULL, NULL };
 
     int count = 5;
@@ -3051,6 +3116,7 @@ static lv_obj_t * build_eq_screen(void) {
 }
 
 void gui_settings_init(void) {
+    buy_me_a_coffee_screen = build_buy_me_a_coffee_screen();
     about_screen = build_about_screen();
     dev_options_screen = build_dev_options_screen();
     accent_color_screen = build_accent_color_screen();
@@ -3067,7 +3133,8 @@ void gui_settings_init(void) {
     music_audio_screen = build_music_audio_screen();
     music_controls_screen = build_music_controls_screen();
     music_timers_screen = build_music_timers_screen();
-    music_library_screen = build_music_library_screen();
+    music_library_screen = plugin_manager_get_music_library_list_item_count() > 0
+                               ? build_music_library_screen() : NULL;
     settings_music_screen = build_music_settings_screen();
     settings_display_screen = build_settings_display_screen();
     settings_power_screen = build_settings_power_screen();
@@ -3100,6 +3167,7 @@ void gui_settings_teardown(void) {
     gui_popup_teardown(&hostname_reboot_popup);
 
     if (about_screen) { lv_obj_delete(about_screen); about_screen = NULL; }
+    if (buy_me_a_coffee_screen) { lv_obj_delete(buy_me_a_coffee_screen); buy_me_a_coffee_screen = NULL; }
     if (dev_options_screen) { lv_obj_delete(dev_options_screen); dev_options_screen = NULL; }
     adb_switch = NULL; /* owned by the screen just deleted; sync runs off the USB poll, not this screen's lifetime */
     if (accent_color_screen) { lv_obj_delete(accent_color_screen); accent_color_screen = NULL; }

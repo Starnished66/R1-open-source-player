@@ -3,13 +3,21 @@
 #include "remote_control_webapp.h"
 #include "metadata.h"
 #include "metadata_db.h"
+#include "tagcache.h"
+#include "albumart.h"
+#include "artwork_coordinator.h"
+#include "catalog_source_cache.h"
 #include "playlist_files.h"
 #include "settings.h"
 #include "audio.h"
+#ifndef HOST_BUILD
+#include "audio_output.h" /* target-only, like audio.c's own audio_output_* calls */
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -21,6 +29,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -72,9 +81,10 @@ static const char * remote_codec_name(audio_codec_t codec) {
     return "";
 }
 
-/* Playback requests -- edge-triggered flags consumed by update_timer_cb.
+/* Control requests -- edge-triggered flags consumed by update_timer_cb.
  * Guarded by status_mutex. */
 static bool request_play_pause = false;
+static bool request_screenshot = false;
 static bool request_next = false;
 static bool request_prev = false;
 static bool request_mode_cycle = false;
@@ -86,8 +96,10 @@ static bool request_has_volume = false;
 static int request_volume_percent = 0;
 static bool request_has_play_index = false;
 static int64_t request_play_index = 0;
+static char request_play_catalog_revision[METADATA_DB_CATALOG_REVISION_SIZE] = "";
 static bool request_has_queue_index = false;
 static int64_t request_queue_index = 0;
+static char request_queue_catalog_revision[METADATA_DB_CATALOG_REVISION_SIZE] = "";
 static bool request_has_queue_remove = false;
 static int request_queue_remove_offset = 0;
 static uint64_t request_queue_remove_revision = 0;
@@ -310,6 +322,14 @@ bool remote_control_consume_play_pause(void) {
     return result;
 }
 
+bool remote_control_consume_screenshot(void) {
+    pthread_mutex_lock(&status_mutex);
+    bool result = request_screenshot;
+    request_screenshot = false;
+    pthread_mutex_unlock(&status_mutex);
+    return result;
+}
+
 bool remote_control_consume_next(void) {
     pthread_mutex_lock(&status_mutex);
     bool result = request_next;
@@ -367,12 +387,15 @@ bool remote_control_consume_volume(int * out_percent) {
     return result;
 }
 
-bool remote_control_consume_queue_index(int64_t * out_index) {
+bool remote_control_consume_queue_index(int64_t * out_index, char * out_catalog_revision,
+                                         size_t revision_size) {
     pthread_mutex_lock(&status_mutex);
     bool result = request_has_queue_index;
     if (result) {
         request_has_queue_index = false;
         *out_index = request_queue_index;
+        if (out_catalog_revision && revision_size)
+            snprintf(out_catalog_revision, revision_size, "%s", request_queue_catalog_revision);
     }
     pthread_mutex_unlock(&status_mutex);
     return result;
@@ -430,7 +453,8 @@ void remote_control_sync_queue(const char * const * paths, int count, uint64_t r
 
 bool remote_control_consume_play_index(int64_t * out_index, char * out_playlist, size_t playlist_size,
                                         char * out_artist, size_t artist_size, char * out_album_artist,
-                                        size_t album_artist_size, char * out_album, size_t album_size) {
+                                        size_t album_artist_size, char * out_album, size_t album_size,
+                                        char * out_catalog_revision, size_t revision_size) {
     pthread_mutex_lock(&status_mutex);
     bool result = request_has_play_index;
     if (result) {
@@ -440,6 +464,8 @@ bool remote_control_consume_play_index(int64_t * out_index, char * out_playlist,
         snprintf(out_artist, artist_size, "%s", request_play_artist_filter);
         snprintf(out_album_artist, album_artist_size, "%s", request_play_album_artist_filter);
         snprintf(out_album, album_size, "%s", request_play_album_filter);
+        if (out_catalog_revision && revision_size)
+            snprintf(out_catalog_revision, revision_size, "%s", request_play_catalog_revision);
     }
     pthread_mutex_unlock(&status_mutex);
     return result;
@@ -691,6 +717,13 @@ static void build_albums_json(const char * artist_filter, const char * album_art
 
 static void build_status_json(char * out, size_t out_size) {
     char title_esc[512] = {0}, artist_esc[512] = {0}, album_esc[512] = {0};
+    /* Query the route before taking status_mutex. Route selection has its own
+     * lock and must not be nested with the playback-status snapshot lock. */
+#ifndef HOST_BUILD
+    bool bluetooth_audio_output = audio_output_is_bluetooth_requested();
+#else
+    bool bluetooth_audio_output = false; /* host builds have no Bluetooth route */
+#endif
     pthread_mutex_lock(&status_mutex);
     json_escape_append(title_esc, sizeof(title_esc), status_title);
     json_escape_append(artist_esc, sizeof(artist_esc), status_artist);
@@ -698,10 +731,12 @@ static void build_status_json(char * out, size_t out_size) {
     snprintf(out, out_size,
              "{\"playing\":%s,\"paused\":%s,\"title\":\"%s\",\"artist\":\"%s\",\"album\":\"%s\","
              "\"position_seconds\":%d,\"duration_seconds\":%d,\"volume\":%.2f,\"play_mode\":%d,"
-             "\"codec\":\"%s\",\"source_bit_depth\":%u,\"source_sample_rate\":%u}",
+             "\"codec\":\"%s\",\"source_bit_depth\":%u,\"source_sample_rate\":%u,"
+             "\"bluetooth_audio_output\":%s}",
              status_playing ? "true" : "false", status_paused ? "true" : "false", title_esc, artist_esc, album_esc,
              status_position_seconds, status_duration_seconds, (double) status_volume, status_play_mode,
-             status_codec, status_source_bit_depth, status_source_sample_rate);
+             status_codec, status_source_bit_depth, status_source_sample_rate,
+             bluetooth_audio_output ? "true" : "false");
     pthread_mutex_unlock(&status_mutex);
 }
 
@@ -939,16 +974,535 @@ static void send_response_binary(int fd, const char * status_line, const char * 
     send_all(fd, (const char *) data, len);
 }
 
-/* Sniffs just enough of the embedded picture's own magic bytes to pick a
- * Content-Type -- metadata_read() hands back raw still-encoded bytes with
- * no separate format tag, and the two containers this app's own tag
- * readers ever extract art from (FLAC METADATA_BLOCK_PICTURE, MP3 ID3v2
- * APIC) are always JPEG or PNG in practice. Falls back to JPEG (the
- * overwhelmingly common case) rather than rejecting an unrecognized-but-
- * real image outright. */
+/* Sniffs enough image magic to label either an original sidecar or embedded
+ * art. The player can return BMP sidecars as well as embedded JPEG/PNG; an
+ * unrecognized-but-real image keeps the common JPEG fallback. */
 static const char * sniff_image_content_type(const uint8_t * data, uint32_t size) {
     if (size >= 8 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47) return "image/png";
+    if (size >= 2 && data[0] == 'B' && data[1] == 'M') return "image/bmp";
     return "image/jpeg";
+}
+
+/* Tag text is capped at 127 bytes; JSON escaping can expand each byte to six.
+ * The artist membership array duplicates at most that source text, then adds
+ * up to three quote/comma bytes per split artist. Remaining row syntax,
+ * numeric fields, and the key fit within 256 bytes. The page envelope is
+ * bounded by its UUID/revision strings and signed numeric fields. */
+#define CATALOG_TAG_ESCAPED_MAX ((TAGCACHE_TAG_MAX - 1u) * 6u)
+#define CATALOG_SONG_ROW_WORST_CASE (6u * CATALOG_TAG_ESCAPED_MAX + \
+                                     3u * TAGCACHE_ARTIST_SPLIT_MAX + 256u)
+#define CATALOG_COVER_ROW_WORST_CASE 256u
+#define CATALOG_JSON_ENVELOPE_MAX 512u
+/* Worst status JSON is 1,873 bytes: three 511-byte escaped strings, a
+ * 43-byte formatted float, bounded integer/codec fields, and fixed syntax.
+ * The extra byte count for NUL still fits comfortably in this 2 KiB buffer. */
+#define STATUS_JSON_CAPACITY 2048u
+#define CATALOG_ART_MAX_BYTES (8u * 1024u * 1024u)
+#define CATALOG_ART_STREAM_CHUNK (16u * 1024u)
+
+static void catalog_send_error(int cfd, const char * status, const char * code) {
+    char body[160];
+    snprintf(body, sizeof(body), "{\"error\":\"catalog_error\",\"code\":\"%s\"}", code);
+    send_response(cfd, status, "application/json", body);
+}
+
+static bool catalog_query_number(const char * path, const char * key, uint64_t default_value,
+                                 uint64_t max_value, uint64_t * out_value) {
+    if (!query_param_present(path, key)) {
+        *out_value = default_value;
+        return true;
+    }
+    char raw[32] = {0};
+    if (!query_param_str(path, key, raw, sizeof(raw)) || raw[0] == '\0') return false;
+    for (const char * p = raw; *p; p++) if (*p < '0' || *p > '9') return false;
+    errno = 0;
+    char * end = NULL;
+    unsigned long long value = strtoull(raw, &end, 10);
+    if (errno == ERANGE || !end || *end != '\0' || value > max_value) return false;
+    *out_value = (uint64_t) value;
+    return true;
+}
+
+static bool catalog_query_revision_named(const char * path, const char * key, bool required,
+                                         char out[METADATA_DB_CATALOG_REVISION_SIZE]) {
+    out[0] = '\0';
+    if (!query_param_present(path, key)) return !required;
+    char raw[METADATA_DB_CATALOG_REVISION_SIZE * 3] = {0};
+    if (!query_param_str(path, key, raw, sizeof(raw)) ||
+        !url_decode_checked(raw, out, METADATA_DB_CATALOG_REVISION_SIZE) || out[0] == '\0') return false;
+    return true;
+}
+
+static bool catalog_query_revision(const char * path, bool required,
+                                   char out[METADATA_DB_CATALOG_REVISION_SIZE]) {
+    return catalog_query_revision_named(path, "revision", required, out);
+}
+
+static void catalog_albumart_info(const song_row_t * row, albumart_info_t * out) {
+    memset(out, 0, sizeof(*out));
+    snprintf(out->path, sizeof(out->path), "%s", row->path);
+    snprintf(out->artist, sizeof(out->artist), "%s", row->tags.artist);
+    snprintf(out->album, sizeof(out->album), "%s", row->tags.album);
+    snprintf(out->albumartist, sizeof(out->albumartist), "%s",
+             row->tags.album_artist[0] ? row->tags.album_artist : row->tags.artist);
+}
+
+static uint64_t catalog_album_key_hash(const song_row_t * row) {
+    albumart_info_t info;
+    catalog_albumart_info(row, &info);
+    return albumart_thumbnail_key(&info);
+}
+
+static bool catalog_build_songs_json(const metadata_db_catalog_page_t * page,
+                                     const metadata_db_catalog_song_t * rows,
+                                     int requested_offset, char * json, size_t capacity) {
+    json_builder_t builder;
+    json_builder_init(&builder, json, capacity);
+    if (!json_builder_appendf(&builder,
+        "{\"library_id\":\"%s\",\"revision\":\"%s\",\"total\":%lld,\"offset\":%d,\"songs\":[",
+        page->library_id, page->revision, (long long) page->total, requested_offset)) return false;
+    int emitted = 0;
+    for (int i = 0; i < page->count; i++) {
+        const song_row_t * row = &rows[i].song;
+        char row_json[8192] = {0};
+        json_builder_t row_builder;
+        json_builder_init(&row_builder, row_json, sizeof(row_json));
+        char title[128] = {0};
+        char title_json[800] = {0}, artist_json[800] = {0}, album_json[800] = {0};
+        char album_artist_json[800] = {0}, genre_json[800] = {0};
+        char split_artists[TAGCACHE_ARTIST_SPLIT_MAX][TAGCACHE_TAG_MAX] = {{0}};
+        metadata_db_song_display_title(row, title, sizeof(title));
+        json_escape_append(title_json, sizeof(title_json), title);
+        json_escape_append(artist_json, sizeof(artist_json), row->tags.artist);
+        json_escape_append(album_json, sizeof(album_json), row->tags.album);
+        json_escape_append(album_artist_json, sizeof(album_artist_json),
+                           row->tags.album_artist[0] ? row->tags.album_artist : row->tags.artist);
+        json_escape_append(genre_json, sizeof(genre_json), row->tags.genre);
+        int artist_count = tagcache_artist_names(row->tags.artist, split_artists, TAGCACHE_ARTIST_SPLIT_MAX);
+        bool appended = json_builder_appendf(&row_builder,
+            "%s{\"id\":%lld,\"title\":\"%s\",\"artist\":\"%s\",\"artists\":[",
+            emitted ? "," : "", (long long) row->id, title_json, artist_json);
+        if (!appended) return false;
+        for (int artist_i = 0; artist_i < artist_count; artist_i++) {
+            char artist_name_json[800] = {0};
+            json_escape_append(artist_name_json, sizeof(artist_name_json), split_artists[artist_i]);
+            appended = json_builder_appendf(&row_builder, "%s\"%s\"", artist_i ? "," : "", artist_name_json);
+            if (!appended) return false;
+        }
+        appended = json_builder_appendf(&row_builder,
+            "],\"album\":\"%s\",\"album_artist\":\"%s\",\"genre\":\"%s\",\"track_number\":",
+            album_json, album_artist_json, genre_json);
+        if (!appended) return false;
+        if (row->tags.track_number > 0)
+            appended = json_builder_appendf(&row_builder, "%d,\"disc_number\":", row->tags.track_number);
+        else
+            appended = json_builder_appendf(&row_builder, "null,\"disc_number\":");
+        if (!appended) return false;
+        if (row->tags.disc_number > 0)
+            appended = json_builder_appendf(&row_builder, "%d,\"album_key\":", row->tags.disc_number);
+        else
+            appended = json_builder_appendf(&row_builder, "null,\"album_key\":");
+        if (!appended) return false;
+        if (rows[i].album_representative_id > 0)
+            appended = json_builder_appendf(&row_builder, "\"a2-%016llx\"}",
+                (unsigned long long) catalog_album_key_hash(row));
+        else
+            appended = json_builder_appendf(&row_builder, "null}");
+        if (!appended || row_builder.truncated ||
+            !json_builder_appendf(&builder, "%s", row_json)) return false;
+        emitted++;
+    }
+    return json_builder_appendf(&builder, "],\"next_offset\":%d}", requested_offset + emitted);
+}
+
+static uint64_t catalog_hash_text(uint64_t hash, const char * text) {
+    for (const unsigned char * p = (const unsigned char *) text; *p; p++) {
+        hash ^= *p;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t catalog_source_fingerprint(const char * path, int64_t mtime, int64_t size) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    hash = catalog_hash_text(hash, path);
+    hash ^= 0;
+    hash *= UINT64_C(1099511628211);
+    uint64_t values[2] = { (uint64_t) mtime, (uint64_t) size };
+    for (size_t value = 0; value < 2; value++) {
+        for (unsigned int byte = 0; byte < 8; byte++) {
+            hash ^= (uint8_t) (values[value] >> (byte * 8));
+            hash *= UINT64_C(1099511628211);
+        }
+    }
+    return hash;
+}
+
+/* Source keys are independent of library generation and song id. A stable
+ * album_key lets the client retain a cover if a new scan changes the chosen
+ * representative but the original sidecar source remains the same. */
+typedef struct {
+    const metadata_db_catalog_cover_t * row;
+} catalog_source_load_context_t;
+
+static bool catalog_source_resolution_load(void * context,
+                                           catalog_source_resolution_t * out_resolution) {
+    catalog_source_load_context_t * load = context;
+    const metadata_db_catalog_cover_t * row = load ? load->row : NULL;
+    if (!row || !out_resolution) return false;
+
+    albumart_info_t info;
+    catalog_albumart_info(&row->representative, &info);
+    char sidecar[CATALOG_SOURCE_CACHE_PATH_SIZE] = {0};
+    struct stat st;
+    if (albumart_search_source_files(&info, "", sidecar, sizeof(sidecar)) &&
+        stat(sidecar, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0) {
+        uint64_t fingerprint = catalog_source_fingerprint(sidecar, (int64_t) st.st_mtime,
+                                                          (int64_t) st.st_size);
+        int n = snprintf(out_resolution->cover_key, sizeof(out_resolution->cover_key),
+                         "s-%016llx", (unsigned long long) fingerprint);
+        if (n <= 0 || (size_t) n >= sizeof(out_resolution->cover_key)) return false;
+        n = snprintf(out_resolution->sidecar_path, sizeof(out_resolution->sidecar_path),
+                     "%s", sidecar);
+        if (n <= 0 || (size_t) n >= sizeof(out_resolution->sidecar_path)) return false;
+        out_resolution->has_sidecar = true;
+        out_resolution->stat_mtime = (int64_t) st.st_mtime;
+        out_resolution->stat_size = (int64_t) st.st_size;
+        return true;
+    }
+
+    int64_t mtime = row->scanned_mtime;
+    int64_t size = row->scanned_size;
+    if (stat(row->representative.path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0) {
+        mtime = (int64_t) st.st_mtime;
+        size = (int64_t) st.st_size;
+    }
+    uint64_t fingerprint = catalog_source_fingerprint(row->representative.path, mtime, size);
+    int n = snprintf(out_resolution->cover_key, sizeof(out_resolution->cover_key),
+                     "e-%016llx", (unsigned long long) fingerprint);
+    if (n <= 0 || (size_t) n >= sizeof(out_resolution->cover_key)) return false;
+    out_resolution->stat_mtime = mtime;
+    out_resolution->stat_size = size;
+    return true;
+}
+
+static bool catalog_cover_resolution_for_row(const char * revision,
+                                             const metadata_db_catalog_cover_t * row,
+                                             catalog_source_resolution_t * out_resolution) {
+    if (!row || !out_resolution) return false;
+    catalog_source_load_context_t context = { .row = row };
+    return catalog_source_cache_resolve(revision, row->representative_id,
+        catalog_source_resolution_load, &context, out_resolution);
+}
+
+static bool catalog_build_covers_json(const metadata_db_catalog_page_t * page,
+                                      const metadata_db_catalog_cover_t * rows,
+                                      int requested_offset, char * json, size_t capacity) {
+    json_builder_t builder;
+    json_builder_init(&builder, json, capacity);
+    if (!json_builder_appendf(&builder,
+        "{\"library_id\":\"%s\",\"revision\":\"%s\",\"total\":%lld,\"offset\":%d,\"covers\":[",
+        page->library_id, page->revision, (long long) page->total, requested_offset)) return false;
+    int emitted = 0;
+    for (int i = 0; i < page->count; i++) {
+        catalog_source_resolution_t resolution;
+        if (!catalog_cover_resolution_for_row(page->revision, &rows[i], &resolution)) return false;
+        uint64_t album_hash = catalog_album_key_hash(&rows[i].representative);
+        bool appended = json_builder_appendf(&builder,
+            "%s{\"album_key\":\"a2-%016llx\",\"representative_id\":%lld,\"cover_key\":\"%s\",\"available\":%s}",
+            emitted ? "," : "", (unsigned long long) album_hash,
+            (long long) rows[i].representative_id, resolution.cover_key,
+            resolution.has_sidecar ? "true" : "null");
+        if (!appended) return false;
+        emitted++;
+    }
+    return json_builder_appendf(&builder, "],\"next_offset\":%d}", requested_offset + emitted);
+}
+
+static void handle_catalog_page_request(int cfd, const char * path, bool covers) {
+    uint64_t offset_u = 0, limit_u = 50;
+    if (!catalog_query_number(path, "offset", 0, INT_MAX, &offset_u) ||
+        !catalog_query_number(path, "limit", 50, METADATA_DB_CATALOG_PAGE_MAX, &limit_u) ||
+        limit_u == 0) {
+        catalog_send_error(cfd, "400 Bad Request", "invalid_paging");
+        return;
+    }
+    char revision[METADATA_DB_CATALOG_REVISION_SIZE] = {0};
+    if (!catalog_query_revision(path, covers, revision)) {
+        catalog_send_error(cfd, "400 Bad Request", "invalid_revision");
+        return;
+    }
+    int offset = (int) offset_u;
+    int limit = (int) limit_u;
+    size_t row_worst_case = covers ? CATALOG_COVER_ROW_WORST_CASE : CATALOG_SONG_ROW_WORST_CASE;
+    size_t json_capacity = (size_t) limit * row_worst_case + CATALOG_JSON_ENVELOPE_MAX;
+    char * json = malloc(json_capacity);
+    if (!json) {
+        catalog_send_error(cfd, "503 Service Unavailable", "temporary_unavailable");
+        return;
+    }
+    metadata_db_catalog_page_t page;
+    metadata_db_catalog_result_t result;
+    if (covers) {
+        metadata_db_catalog_cover_t * rows = calloc((size_t) limit, sizeof(*rows));
+        if (!rows) {
+            free(json);
+            catalog_send_error(cfd, "503 Service Unavailable", "temporary_unavailable");
+            return;
+        }
+        result = metadata_db_catalog_covers_page(revision[0] ? revision : NULL, offset, limit, &page, rows);
+        if (result == METADATA_DB_CATALOG_OK) {
+            if (page.count == 0 && offset < page.total) {
+                result = METADATA_DB_CATALOG_UNAVAILABLE;
+            } else if (catalog_build_covers_json(&page, rows, offset, json, json_capacity)) {
+                send_response(cfd, "200 OK", "application/json", json);
+            } else {
+                result = METADATA_DB_CATALOG_UNAVAILABLE;
+            }
+        }
+        free(rows);
+    } else {
+        metadata_db_catalog_song_t * rows = calloc((size_t) limit, sizeof(*rows));
+        if (!rows) {
+            free(json);
+            catalog_send_error(cfd, "503 Service Unavailable", "temporary_unavailable");
+            return;
+        }
+        result = metadata_db_catalog_songs_page(revision[0] ? revision : NULL, offset, limit, &page, rows);
+        if (result == METADATA_DB_CATALOG_OK) {
+            if (page.count == 0 && offset < page.total) {
+                result = METADATA_DB_CATALOG_UNAVAILABLE;
+            } else if (catalog_build_songs_json(&page, rows, offset, json, json_capacity)) {
+                send_response(cfd, "200 OK", "application/json", json);
+            } else {
+                result = METADATA_DB_CATALOG_UNAVAILABLE;
+            }
+        }
+        free(rows);
+    }
+    free(json);
+    if (result == METADATA_DB_CATALOG_STALE)
+        catalog_send_error(cfd, "409 Conflict", "revision_mismatch");
+    else if (result == METADATA_DB_CATALOG_UNAVAILABLE)
+        catalog_send_error(cfd, "503 Service Unavailable", "temporary_unavailable");
+}
+
+static bool catalog_parse_cover_key(const char * key, char * out_kind, uint64_t * out_fingerprint) {
+    if (!key || (key[0] != 's' && key[0] != 'e') || key[1] != '-' || strlen(key + 2) != 16) return false;
+    uint64_t value = 0;
+    for (int i = 0; i < 16; i++) {
+        char c = key[i + 2];
+        unsigned int digit;
+        if (c >= '0' && c <= '9') digit = (unsigned int) (c - '0');
+        else if (c >= 'a' && c <= 'f') digit = (unsigned int) (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') digit = (unsigned int) (c - 'A' + 10);
+        else return false;
+        value = (value << 4) | digit;
+    }
+    *out_kind = key[0];
+    *out_fingerprint = value;
+    return true;
+}
+
+static void catalog_stream_header(int cfd, const char * content_type, size_t length) {
+    char header[320];
+    int n = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+        "Cache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\n"
+        "Connection: close\r\n\r\n", content_type, length);
+    if (n > 0 && (size_t) n < sizeof(header)) send_all(cfd, header, (size_t) n);
+}
+
+static void catalog_stream_sidecar(int cfd, int fd, size_t length, const char * content_type) {
+    catalog_stream_header(cfd, content_type, length);
+    char buffer[CATALOG_ART_STREAM_CHUNK];
+    size_t remaining = length;
+    while (remaining > 0) {
+        size_t wanted = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+        ssize_t count = read(fd, buffer, wanted);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        send_all(cfd, buffer, (size_t) count);
+        remaining -= (size_t) count;
+    }
+}
+
+static void handle_catalog_art_request(int cfd, const char * path) {
+    char revision[METADATA_DB_CATALOG_REVISION_SIZE] = {0};
+    char raw_key[96] = {0}, cover_key[96] = {0};
+    uint64_t representative_id_u = 0;
+    if (!catalog_query_revision(path, true, revision) ||
+        !catalog_query_number(path, "representative_id", 0, INT32_MAX, &representative_id_u) ||
+        representative_id_u == 0 ||
+        !query_param_str(path, "cover_key", raw_key, sizeof(raw_key)) ||
+        !url_decode_checked(raw_key, cover_key, sizeof(cover_key))) {
+        catalog_send_error(cfd, "400 Bad Request", "invalid_art_key");
+        return;
+    }
+    char kind = 0;
+    uint64_t requested_fingerprint = 0;
+    if (!catalog_parse_cover_key(cover_key, &kind, &requested_fingerprint)) {
+        catalog_send_error(cfd, "400 Bad Request", "invalid_art_key");
+        return;
+    }
+
+    int64_t representative_id = (int64_t) representative_id_u;
+    metadata_db_catalog_page_t page;
+    metadata_db_catalog_cover_t source;
+    metadata_db_catalog_result_t lookup = metadata_db_catalog_cover_source(
+        revision, representative_id, &page, &source);
+    if (lookup == METADATA_DB_CATALOG_STALE) {
+        catalog_send_error(cfd, "409 Conflict", "revision_or_cover_stale");
+        return;
+    }
+    if (lookup != METADATA_DB_CATALOG_OK) {
+        catalog_send_error(cfd, "503 Service Unavailable", "temporary_unavailable");
+        return;
+    }
+
+    catalog_source_resolution_t resolution;
+    if (!catalog_cover_resolution_for_row(page.revision, &source, &resolution)) {
+        catalog_send_error(cfd, "503 Service Unavailable", "source_unavailable");
+        return;
+    }
+    if (strcmp(resolution.cover_key, cover_key) != 0 || (kind == 's') != resolution.has_sidecar) {
+        catalog_send_error(cfd, "409 Conflict", "revision_or_cover_stale");
+        return;
+    }
+
+    if (kind == 's') {
+        int fd = open(resolution.sidecar_path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            catalog_send_error(cfd, "503 Service Unavailable", "source_unavailable");
+            return;
+        }
+        struct stat st;
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+            close(fd);
+            catalog_send_error(cfd, "503 Service Unavailable", "source_unavailable");
+            return;
+        }
+        uint64_t actual_fingerprint = catalog_source_fingerprint(resolution.sidecar_path, (int64_t) st.st_mtime,
+                                                                 (int64_t) st.st_size);
+        if (actual_fingerprint != requested_fingerprint) {
+            close(fd);
+            catalog_send_error(cfd, "409 Conflict", "revision_or_cover_stale");
+            return;
+        }
+        if ((uint64_t) st.st_size > CATALOG_ART_MAX_BYTES) {
+            close(fd);
+            catalog_send_error(cfd, "413 Content Too Large", "artwork_too_large");
+            return;
+        }
+        if (st.st_size == 0) {
+            close(fd);
+            catalog_send_error(cfd, "404 Not Found", "artwork_missing");
+            return;
+        }
+        metadata_db_catalog_page_t current_page;
+        metadata_db_catalog_cover_t current_source;
+        lookup = metadata_db_catalog_cover_source(revision, representative_id, &current_page, &current_source);
+        if (lookup != METADATA_DB_CATALOG_OK ||
+            strcmp(current_source.representative.path, source.representative.path) != 0) {
+            close(fd);
+            catalog_send_error(cfd, lookup == METADATA_DB_CATALOG_UNAVAILABLE ?
+                               "503 Service Unavailable" : "409 Conflict",
+                               lookup == METADATA_DB_CATALOG_UNAVAILABLE ?
+                               "temporary_unavailable" : "revision_or_cover_stale");
+            return;
+        }
+        uint8_t magic[16] = {0};
+        ssize_t magic_size = pread(fd, magic, sizeof(magic), 0);
+        if (magic_size < 0) magic_size = 0;
+        const char * content_type = sniff_image_content_type(magic, (uint32_t) magic_size);
+        if (lseek(fd, 0, SEEK_SET) < 0) {
+            close(fd);
+            catalog_send_error(cfd, "503 Service Unavailable", "source_unavailable");
+            return;
+        }
+        catalog_stream_sidecar(cfd, fd, (size_t) st.st_size, content_type);
+        close(fd);
+        return;
+    }
+
+    struct stat before;
+    if (stat(source.representative.path, &before) != 0 || !S_ISREG(before.st_mode)) {
+        catalog_send_error(cfd, "503 Service Unavailable", "source_unavailable");
+        return;
+    }
+    uint64_t actual_fingerprint = catalog_source_fingerprint(source.representative.path,
+        (int64_t) before.st_mtime, (int64_t) before.st_size);
+    if (actual_fingerprint != requested_fingerprint) {
+        catalog_send_error(cfd, "409 Conflict", "revision_or_cover_stale");
+        return;
+    }
+
+    artwork_acquire_result_t acquired = artwork_coordinator_acquire(ARTWORK_PRIO_WARMER,
+        1024u * 1024u, 500, NULL, NULL);
+    if (acquired != ARTWORK_ACQUIRE_OK) {
+        catalog_send_error(cfd, "503 Service Unavailable", "artwork_busy");
+        return;
+    }
+    track_metadata_t meta;
+    memset(&meta, 0, sizeof(meta));
+    metadata_artwork_result_t artwork = metadata_read_artwork_isolated(source.representative.path,
+        &meta, 5000, ARTWORK_PRIO_WARMER);
+    artwork_coordinator_release(ARTWORK_PRIO_WARMER);
+    if (artwork == METADATA_ARTWORK_TEMPORARY_FAILURE) {
+        free(meta.picture_data);
+        free(meta.lyrics);
+        catalog_send_error(cfd, "503 Service Unavailable", "artwork_unavailable");
+        return;
+    }
+    if (artwork == METADATA_ARTWORK_TOO_LARGE) {
+        free(meta.picture_data);
+        free(meta.lyrics);
+        catalog_send_error(cfd, "413 Content Too Large", "embedded_artwork_too_large");
+        return;
+    }
+    if (artwork == METADATA_ARTWORK_INVALID) {
+        free(meta.picture_data);
+        free(meta.lyrics);
+        catalog_send_error(cfd, "503 Service Unavailable", "embedded_artwork_invalid");
+        return;
+    }
+    if (artwork != METADATA_ARTWORK_FOUND || !meta.picture_data || meta.picture_size == 0) {
+        free(meta.picture_data);
+        free(meta.lyrics);
+        catalog_send_error(cfd, "404 Not Found", "artwork_missing");
+        return;
+    }
+    if (meta.picture_size > CATALOG_ART_MAX_BYTES) {
+        free(meta.picture_data);
+        free(meta.lyrics);
+        catalog_send_error(cfd, "413 Content Too Large", "artwork_too_large");
+        return;
+    }
+    struct stat after;
+    if (stat(source.representative.path, &after) != 0 || !S_ISREG(after.st_mode) ||
+        after.st_mtime != before.st_mtime || after.st_size != before.st_size) {
+        free(meta.picture_data);
+        free(meta.lyrics);
+        catalog_send_error(cfd, "409 Conflict", "revision_or_cover_stale");
+        return;
+    }
+    metadata_db_catalog_page_t current_page;
+    metadata_db_catalog_cover_t current_source;
+    lookup = metadata_db_catalog_cover_source(revision, representative_id, &current_page, &current_source);
+    if (lookup != METADATA_DB_CATALOG_OK ||
+        strcmp(current_source.representative.path, source.representative.path) != 0) {
+        free(meta.picture_data);
+        free(meta.lyrics);
+        catalog_send_error(cfd, lookup == METADATA_DB_CATALOG_UNAVAILABLE ?
+                           "503 Service Unavailable" : "409 Conflict",
+                           lookup == METADATA_DB_CATALOG_UNAVAILABLE ?
+                           "temporary_unavailable" : "revision_or_cover_stale");
+        return;
+    }
+    send_response_binary(cfd, "200 OK", sniff_image_content_type(meta.picture_data, meta.picture_size),
+                         meta.picture_data, meta.picture_size);
+    free(meta.picture_data);
+    free(meta.lyrics);
 }
 
 static void handle_art_request(int cfd, const char * path) {
@@ -1250,7 +1804,7 @@ static void handle_connection(int cfd) {
                 "{\"version\":1,\"authRequired\":true,\"authHeader\":\"X-Compas-PIN\","
                 "\"transports\":[\"wifi\",\"bluetooth_classic_rfcomm\"],\"features\":["
                 "\"status\",\"playback_controls\",\"queue\",\"library_browse\","
-                "\"playlists\",\"album_art\"]}";
+                "\"playlists\",\"album_art\",\"screenshots\",\"catalog_sync_v1\"]}";
             send_response(cfd, "200 OK", "application/json", capabilities);
             return;
         }
@@ -1260,8 +1814,9 @@ static void handle_connection(int cfd) {
     }
 
     /* Only the shell and capabilities handshake are public. All library,
-     * status, artwork, playback, playlist, queue, and asset requests require
-     * the same PIN header over both Wi-Fi and Bluetooth RFCOMM. */
+     * status, artwork, playback, screenshot, playlist, queue, and asset
+     * requests require the same PIN header over both Wi-Fi and Bluetooth
+     * RFCOMM. */
     bool public_request = strcmp(method, "GET") == 0 &&
                           (strcmp(path_only, "/") == 0 ||
                            strcmp(path, "/api/v1/capabilities") == 0 ||
@@ -1282,9 +1837,15 @@ static void handle_connection(int cfd) {
 
     if (strcmp(method, "GET") == 0) {
         if (strcmp(path_only, "/api/status") == 0) {
-            char json[1600];
+            char json[STATUS_JSON_CAPACITY];
             build_status_json(json, sizeof(json));
             send_response(cfd, "200 OK", "application/json", json);
+        } else if (strcmp(path_only, "/api/catalog") == 0) {
+            handle_catalog_page_request(cfd, path, false);
+        } else if (strcmp(path_only, "/api/catalog/covers") == 0) {
+            handle_catalog_page_request(cfd, path, true);
+        } else if (strcmp(path_only, "/api/catalog/art") == 0) {
+            handle_catalog_art_request(cfd, path);
         } else if (strcmp(path_only, "/api/library") == 0) {
             int offset = 0, limit = 50;
             char query_raw[128] = {0}, query[128] = {0};
@@ -1481,11 +2042,36 @@ static void handle_connection(int cfd) {
                 }
             }
         } else {
+            bool is_catalog_id_action = strcmp(path_only, "/api/playback/play") == 0 ||
+                                        strcmp(path_only, "/api/playback/queue") == 0;
+            bool catalog_revision_present = false;
+            char catalog_revision[METADATA_DB_CATALOG_REVISION_SIZE] = {0};
+            if (is_catalog_id_action && query_param_present(path, "catalog_revision")) {
+                catalog_revision_present = true;
+                uint64_t index = 0;
+                if (!catalog_query_revision_named(path, "catalog_revision", true, catalog_revision) ||
+                    !catalog_query_number(path, "index", 0, INT32_MAX, &index) || index == 0) {
+                    catalog_send_error(cfd, "400 Bad Request", "invalid_catalog_action");
+                    return;
+                }
+                metadata_db_catalog_result_t validation = metadata_db_catalog_validate_song_revision(
+                    catalog_revision, (int64_t) index);
+                if (validation == METADATA_DB_CATALOG_STALE) {
+                    catalog_send_error(cfd, "409 Conflict", "revision_mismatch");
+                    return;
+                }
+                if (validation != METADATA_DB_CATALOG_OK) {
+                    catalog_send_error(cfd, "503 Service Unavailable", "temporary_unavailable");
+                    return;
+                }
+            }
             bool ok = true;
             bool conflict = false;
             pthread_mutex_lock(&status_mutex);
             if (strcmp(path_only, "/api/playback/toggle") == 0) {
                 request_play_pause = true;
+            } else if (strcmp(path_only, "/api/screenshot") == 0) {
+                request_screenshot = true;
             } else if (strcmp(path_only, "/api/playback/next") == 0) {
                 request_next = true;
             } else if (strcmp(path_only, "/api/playback/prev") == 0) {
@@ -1527,6 +2113,8 @@ static void handle_connection(int cfd) {
                 if (query_param_int64(path, "index", &index) && index >= 0) {
                     request_has_play_index = true;
                     request_play_index = index;
+                    snprintf(request_play_catalog_revision, sizeof(request_play_catalog_revision), "%s",
+                             catalog_revision_present ? catalog_revision : "");
 
                     char raw[128];
                     request_play_playlist_name[0] = '\0';
@@ -1553,6 +2141,8 @@ static void handle_connection(int cfd) {
                 if (query_param_int64(path, "index", &index) && index >= 0) {
                     request_has_queue_index = true;
                     request_queue_index = index;
+                    snprintf(request_queue_catalog_revision, sizeof(request_queue_catalog_revision), "%s",
+                             catalog_revision_present ? catalog_revision : "");
                 } else {
                     ok = false;
                 }

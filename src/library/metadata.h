@@ -49,6 +49,9 @@ typedef struct {
      * an in-memory "file", it doesn't copy it up front like the PNG one does). */
     uint8_t * picture_data;
     uint32_t picture_size;
+    /* Set when a recognized embedded image exceeds the parser's safe 4 MiB
+     * extraction cap. Lets catalog sync distinguish it from absent artwork. */
+    bool picture_too_large;
 
     /* Embedded lyrics text (MP3/AAC/AIFF/WAV/DSF/DFF ID3v2 USLT, FLAC/Opus
      * VORBIS_COMMENT LYRICS/UNSYNCEDLYRICS, M4A "\xA9lyr" atom) -- raw text
@@ -126,6 +129,7 @@ typedef enum {
     METADATA_ARTWORK_NOT_FOUND,
     METADATA_ARTWORK_TEMPORARY_FAILURE,
     METADATA_ARTWORK_INVALID,
+    METADATA_ARTWORK_TOO_LARGE,
 } metadata_artwork_result_t;
 
 /* Artwork-only metadata read with embedded cover bytes, contained in a child
@@ -138,7 +142,8 @@ typedef enum {
  * PRIO_PLAYER extraction should not be held to the background warmer's own
  * stricter 8MiB reserve just because this happens to share code with it.
  * The result distinguishes a completed read with no picture from transient
- * process, timeout, I/O, and allocation failures. Caller owns
+ * process, timeout, I/O, and allocation failures; oversized recognized art is
+ * reported separately so sync clients do not cache it as absent. Caller owns
  * out->picture_data. */
 metadata_artwork_result_t metadata_read_artwork_isolated(const char * path,
                                                          track_metadata_t * out,

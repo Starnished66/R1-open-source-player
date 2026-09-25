@@ -38,6 +38,12 @@ typedef struct {
 
 bool albumart_search_files(const albumart_info_t * info, const char * size_string, char * buf, size_t buflen);
 
+/* Same source-sidecar search order as albumart_search_files(), but skips the
+ * player-generated RGB565-derived BMP caches. Remote catalog sync uses this
+ * to serve the original compressed sidecar bytes instead of a resized cache. */
+bool albumart_search_source_files(const albumart_info_t * info, const char * size_string,
+                                  char * buf, size_t buflen);
+
 /* Writes <musicroot>/.compas/albumart/<artist>-<album>.WxH.bmp from RGB565.
  * Source cover/audio mtime is stored in the BMP reserved field so a later
  * load can detect a replaced cover. */
@@ -54,9 +60,12 @@ bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int hei
 bool albumart_generated_cache_fresh(const albumart_info_t * info, int width, int height,
                                     char * found, size_t found_size);
 
-/* Exposes the internal v2-<hash> filename key for diagnostics only (e.g.
- * logging the exact key a lookup computed, to compare against what's
- * actually on disk). Not for constructing paths outside this file. */
+/* Shared case-insensitive (album, effective album artist) identity used by
+ * tagcache album grouping, catalog album keys, and artwork thumbnail keys. */
+uint64_t albumart_thumbnail_key(const albumart_info_t * info);
+
+/* Exposes the shared thumbnail key for diagnostics only. Not for constructing
+ * paths outside this file. */
 uint64_t albumart_debug_thumbnail_key(const albumart_info_t * info);
 
 typedef enum {

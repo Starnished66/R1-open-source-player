@@ -4,7 +4,7 @@ plugin.define({ id = "example.api_info", name = "Plugin API Info", version = "2.
 -- Demonstrates all available namespaces, functions, capabilities, and runtime info.
 
 local CAPABILITIES = {
-    "ui.list", "ui.settings", "ui.row_width", "ui.text_input", "ui.toast", "ui.theme",
+    "ui.list", "ui.settings", "ui.row_width", "ui.text_input", "ui.toast", "ui.screenshot", "ui.theme",
     "filesystem.sd", "playback.control", "playback.state", "playback.events",
     "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
@@ -130,6 +130,7 @@ local CATEGORIES = {
                 "plugin.show_settings_list(title, items)",
                 "plugin.show_text_input(title, initial, password, cb)",
                 "plugin.show_toast(msg)",
+                "plugin.screenshot() -> bool, reason",
                 "plugin.register_list_item(list_id, label, on_open, [opts])",
                 "plugin.register_stream_media_tile(label, on_open, [icon])",
                 "plugin.register_home_tile(id, label, on_open, icon)",
@@ -213,6 +214,7 @@ local CATEGORIES = {
                 "plugin.get_app_info() -> table",
                 "plugin.on(event, handler)",
                 "volume_changed / battery_changed events",
+                "screenshot_saved(path) / screenshot_failed(reason) events",
                 "suspending / system_resumed events",
                 "plugin.set_interval(sec, handler) -> handle",
                 "plugin.clear_interval(handle)",

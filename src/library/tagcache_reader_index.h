@@ -330,6 +330,19 @@ bool tagcache_artist_matches(const char *raw, const char *name) {
     return false;
 }
 
+int tagcache_artist_names(const char *raw, char out[][TAGCACHE_TAG_MAX], int max_names) {
+    if (!out || max_names <= 0 || !raw || !raw[0]) return 0;
+    char names[TAGCACHE_ARTIST_SPLIT_MAX][TAGCACHE_PATH_MAX];
+    int count = split_artist(raw, names);
+    if (count > max_names) count = max_names;
+    for (int i = 0; i < count; i++) {
+        size_t len = strnlen(names[i], TAGCACHE_TAG_MAX - 1);
+        memcpy(out[i], names[i], len);
+        out[i][len] = '\0';
+    }
+    return count;
+}
+
 void tagcache_artist_primary(const char *raw, char *out, size_t size) {
     if (!out || !size) return;
     char names[TAGCACHE_ARTIST_SPLIT_MAX][TAGCACHE_PATH_MAX];

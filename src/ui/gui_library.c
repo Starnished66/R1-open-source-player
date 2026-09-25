@@ -1687,7 +1687,8 @@ bool gui_library_generate_player_cover(const char * track_path, const char * art
          * already means embedded extraction had its chance regardless of
          * whether a sidecar file existed or how it failed. */
         if (out_no_art_confirmed && (artwork_result == METADATA_ARTWORK_NOT_FOUND ||
-                                     artwork_result == METADATA_ARTWORK_INVALID))
+                                     artwork_result == METADATA_ARTWORK_INVALID ||
+                                     artwork_result == METADATA_ARTWORK_TOO_LARGE))
             *out_no_art_confirmed = true;
         return false;
     }

@@ -211,6 +211,10 @@ typedef struct {
      * on the SD card (see db_log.h), and also gates the USB DAC bridge's own
      * diagnostic log to .logs/usb_dac_bridge.log (see usb_dac_bridge.h). */
     bool db_logging_enabled;
+    /* Power + Volume Down takes a screenshot. Off by default: the combination
+     * is easy to hit by accident in a pocket, and nobody who does not know it
+     * exists should find the card filling with images. */
+    bool screenshot_combo_enabled;
 
     /* Caps the PMIC's charge-termination voltage to 4.2V to extend battery
      * longevity, rather than a literal state-of-charge cutoff -- see

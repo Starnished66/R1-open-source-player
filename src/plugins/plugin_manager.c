@@ -13,6 +13,7 @@
 #include "plugin_storage.h"
 #include "plugin_internal.h"
 #include "plugin_disabled_list.h"
+#include "../core/screenshot.h"
 #include "db_log.h"
 #include "app_version.h"
 #include "fallback_font.h"
@@ -389,6 +390,11 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *     Shows the same transient toast used elsewhere in the app; duration
  *     defaults to 5000ms and is clamped by validation to 100..30000ms.
  *
+ *   plugin.screenshot() -> true | false, reason
+ *     Starts an asynchronous screenshot of the visible display. A successful
+ *     capture is saved under SD/Screenshots, flashes the display, and fires
+ *     screenshot_saved(path) or screenshot_failed(reason) on the UI thread.
+ *
  *   plugin.led_available() -> bool
  *     True when both charge-status LED brightness sysfs nodes exist on this
  *     board.
@@ -574,6 +580,9 @@ static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE
  *         tick and fired only when the applied volume percent changes.
  *       "battery_changed" -- callback(info), when level/charging/full/
  *         external_power changes.
+ *       "screenshot_saved" -- callback(path), after a PNG is saved.
+ *       "screenshot_failed" -- callback(reason), if the asynchronous
+ *         capture or save fails.
  *       "suspending" / "system_resumed" -- callback(), around suspend-to-RAM.
  *         system_resumed is separate from playback's existing "resumed".
  *       "stopped" -- callback(), no arguments, fires when playback stops
@@ -1434,6 +1443,17 @@ static int l_plugin_show_toast(lua_State * L) {
         return luaL_error(L, "plugin.show_toast: duration_ms must be between 100 and 30000");
     gui_plugin_show_toast(msg, (uint32_t) duration_ms);
     return 0;
+}
+
+static int l_plugin_screenshot(lua_State * L) {
+    screenshot_result_t result = screenshot_start();
+    if (result == SCREENSHOT_RESULT_STARTED) {
+        lua_pushboolean(L, true);
+        return 1;
+    }
+    lua_pushboolean(L, false);
+    lua_pushstring(L, screenshot_result_reason(result));
+    return 2;
 }
 
 #ifndef HOST_BUILD
@@ -3326,6 +3346,8 @@ typedef enum {
     PLUGIN_EVENT_BATTERY_CHANGED,
     PLUGIN_EVENT_SUSPENDING,
     PLUGIN_EVENT_SYSTEM_RESUMED,
+    PLUGIN_EVENT_SCREENSHOT_SAVED,
+    PLUGIN_EVENT_SCREENSHOT_FAILED,
     PLUGIN_EVENT_COUNT,
 } plugin_event_t;
 
@@ -3355,6 +3377,8 @@ static int l_plugin_on(lua_State * L) {
     else if (strcmp(event, "battery_changed") == 0) idx = PLUGIN_EVENT_BATTERY_CHANGED;
     else if (strcmp(event, "suspending") == 0) idx = PLUGIN_EVENT_SUSPENDING;
     else if (strcmp(event, "system_resumed") == 0) idx = PLUGIN_EVENT_SYSTEM_RESUMED;
+    else if (strcmp(event, "screenshot_saved") == 0) idx = PLUGIN_EVENT_SCREENSHOT_SAVED;
+    else if (strcmp(event, "screenshot_failed") == 0) idx = PLUGIN_EVENT_SCREENSHOT_FAILED;
     else return luaL_error(L, "plugin.on: unknown event '%s'", event);
 
     if (plugin_event_subscriber_count[idx] >= PLUGIN_MAX_EVENT_SUBSCRIBERS) {
@@ -3676,7 +3700,7 @@ static int l_plugin_led_release(lua_State * L) {
 }
 
 static const char * const plugin_capabilities[] = {
-    "ui.list", "ui.settings", "ui.row_width", "ui.text_input", "ui.toast", "ui.theme",
+    "ui.list", "ui.settings", "ui.row_width", "ui.text_input", "ui.toast", "ui.screenshot", "ui.theme",
     "filesystem.sd", "playback.control", "playback.state", "playback.events",
     "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
@@ -3888,6 +3912,7 @@ static const luaL_Reg plugin_funcs[] = {
     { "play_remote",               l_plugin_play_remote },
     { "queue_remote_list",         l_plugin_queue_remote_list },
     { "show_toast",                l_plugin_show_toast },
+    { "screenshot",                l_plugin_screenshot },
     { "set_icon",                  l_plugin_set_icon },
     { "set_background_color",      l_plugin_set_background_color },
     { "set_text_color",            l_plugin_set_text_color },
@@ -5098,6 +5123,27 @@ void plugin_manager_notify_suspending(void) {
 
 void plugin_manager_notify_system_resumed(void) {
     notify_event_no_args(PLUGIN_EVENT_SYSTEM_RESUMED, "system_resumed");
+}
+
+static void notify_event_string(plugin_event_t idx, const char * kind, const char * value) {
+    for (int i = 0; i < plugin_event_subscriber_count[idx]; i++) {
+        plugin_event_subscriber_t * sub = &plugin_event_subscribers[idx][i];
+        lua_rawgeti(sub->L, LUA_REGISTRYINDEX, sub->ref);
+        lua_pushstring(sub->L, value ? value : "");
+        if (plugin_call(sub->L, 1, 0, 0) != LUA_OK) {
+            const char * err = lua_tostring(sub->L, -1);
+            fprintf(stderr, "[plugins] %s handler error: %s\n", kind, err ? err : "unknown error");
+            lua_pop(sub->L, 1);
+        }
+    }
+}
+
+void plugin_manager_notify_screenshot_saved(const char * path) {
+    notify_event_string(PLUGIN_EVENT_SCREENSHOT_SAVED, "screenshot_saved", path);
+}
+
+void plugin_manager_notify_screenshot_failed(const char * reason) {
+    notify_event_string(PLUGIN_EVENT_SCREENSHOT_FAILED, "screenshot_failed", reason);
 }
 
 void plugin_manager_interval_fired(int slot) {

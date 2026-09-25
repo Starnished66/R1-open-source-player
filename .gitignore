@@ -238,6 +238,7 @@
 !/src/network/remote_control_mdns_test.c
 !/src/library/tagcache_storage_test.c
 !/src/library/tagcache_write_volume_test.c
+!/src/library/metadata_catalog_test.c
 !/src/library/tagcache_incremental_test.c
 !/src/library/tagcache_refs_test.c
 !/src/library/tagcache_commit_failure_test.c

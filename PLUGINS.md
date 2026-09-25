@@ -189,13 +189,15 @@ on one of these screens:
 | `"music_audio"` | Settings → Music Settings → Audio | EQ, DSP, gain/volume-curve tools | 8 |
 | `"music_controls"` | Settings → Music Settings → Controls & Interface | Playback-button and interface behavior | 8 |
 | `"music_timers"` | Settings → Music Settings → Timers | Sleep/idle timer tools | 8 |
-| `"music_library"` | Settings → Music Settings → Library | Scanning, tagging, scrobbling tools | 8 |
+| `"music_library"` | Settings → Music Settings → Library (shown when a plugin adds a row) | Scanning, tagging, scrobbling tools | 8 |
 | `"power"` | Settings → Power | Battery and power tools | 8 |
 | `"system"` | Settings → System | Device and maintenance tools | 8 |
 
 Passing anything else raises a Lua error at load time rather than silently
-registering into nothing. If no plugin registers a row for a given
-`list_id`, that screen just shows its native rows, no placeholder.
+registering into nothing. If no plugin registers a row for a destination, no
+plugin row is appended. The Library sub-screen appears only while at least one
+plugin-registered Library row exists. The native **Update Music Database**
+action is at the root of Music Settings.
 `build_pill_list_screen()` rows scroll, so every registered row remains
 reachable even when several plugins target the same screen.
 
@@ -221,7 +223,7 @@ from the moment your script starts running (injected before
 |---|---|
 | Identity | `define`, `api_version`, `has_capability`, `get_app_info`, `media_capabilities` |
 | Hardware | `led_available`, `led_set`, `led_blink`, `led_breathe`, `led_get`, `led_status`, `led_release` |
-| UI | `register_list_item`, `register_stream_media_tile`, `register_home_tile`, `register_quick_toggle`, `set_quick_toggle`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast` |
+| UI | `register_list_item`, `register_stream_media_tile`, `register_home_tile`, `register_quick_toggle`, `set_quick_toggle`, `show_list`, `show_settings_list`, `show_text_input`, `show_toast`, `screenshot` |
 | Theme | `set_icon`, `set_background_color`, `set_text_color`, `set_home_layout`, `refresh_theme`, `reload_ui` |
 | Playback | `play_file`, `play_list`, `play_remote`, `queue_remote_list`, transport controls, playback state |
 | Files & Playlists | `sd_root`, `list_dir`, `mkdir`, `playlist_list`, `playlist_read`, `playlist_create`, `playlist_add`, `playlist_remove`, `playlist_delete` |
@@ -1154,6 +1156,19 @@ queue"). Useful for "nothing found" / error feedback -- see
 files in it. The optional duration defaults to 5000ms and accepts
 100..30000ms.
 
+### `plugin.screenshot()` -> `true` | `false, reason`
+
+Starts an asynchronous screenshot of the currently visible display. It returns
+`true` when capture starts, or `false` with one of `screen_off`, `no_card`,
+`usb_storage`, `busy`, `framebuffer_unavailable`, `worker_start_failed`, or
+`unavailable`. A started capture flashes the display and shows a completion
+toast. PNG files are written under `<SD card>/Screenshots/`.
+
+Register `plugin.on("screenshot_saved", function(path) ... end)` to receive the
+full saved path, or `plugin.on("screenshot_failed", function(reason) ... end)`
+for an asynchronous encode or file-write failure. Both callbacks run on the UI
+thread.
+
 ### 🎚️ EQ and Sound Profiles
 
 This app has its own 10-band parametric EQ (`src/audio/peq.c`) -- these
@@ -1767,7 +1782,7 @@ tell them apart; empty from `library_get_artists`).
 
 ### `plugin.refresh_library()`
 
-Triggers the same background rescan as Settings -> Update Music Database --
+Triggers the same background rescan as Settings -> Music Settings -> Update Music Database --
 useful after a plugin writes new files under `plugin.sd_root()`, since none
 of the `library_*()` functions above notice new files on their own;
 there's no filesystem watcher, only a rescan triggered by this, that same
@@ -1844,6 +1859,9 @@ first or the most recent. The recognized events are:
 - `"battery_changed"` -- `callback(info)`, with the same fields as
   `plugin.get_battery()`. Fires only when one or more fields changes, polled on
   the existing UI tick.
+- `"screenshot_saved"` -- `callback(path)`, after a screenshot PNG is saved.
+- `"screenshot_failed"` -- `callback(reason)`, if the asynchronous screenshot
+  encode or file write fails.
 - `"suspending"` -- `callback()`, just before idle suspend-to-RAM. It is a
   notification only; it cannot cancel suspend and uses the normal plugin call
   time budget.
@@ -2000,7 +2018,7 @@ It also demonstrates the success/busy return contract of `show_text_input()`.
 1. Write the plugin in any text editor—there is no separate plugin build.
 2. Optionally run `luac -p MyPlugin.lua` to catch syntax errors locally.
 3. Copy it to `<SD card>/.plugins/`.
-4. Either restart the player, or open Settings -> System -> Plugins and tap
+4. Either restart the player, or open Settings -> System -> Plugin Manager and tap
    "Refresh Plugins" to pick up the new/edited file without restarting (same
    full reload `plugin.reload_ui()` itself triggers -- every other loaded
    plugin's top-level code re-runs too, and navigation lands back on Home).

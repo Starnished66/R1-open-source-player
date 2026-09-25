@@ -587,6 +587,13 @@ bool audio_output_is_local_requested(void) {
     return local;
 }
 
+bool audio_output_is_bluetooth_requested(void) {
+    pthread_mutex_lock(&config_mutex);
+    bool bluetooth = requested_target == OUTPUT_TARGET_BT;
+    pthread_mutex_unlock(&config_mutex);
+    return bluetooth;
+}
+
 bool audio_output_supports_wide_path(void) {
     pthread_mutex_lock(&config_mutex);
     bool supports = (requested_target == OUTPUT_TARGET_LOCAL || requested_target == OUTPUT_TARGET_USB);

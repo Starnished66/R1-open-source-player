@@ -71,8 +71,29 @@ static void fix_path_part(char * path, int offset, int count) {
 
 static const char * const extensions[] = { "jpeg", "jpg", "png", "bmp" };
 
-/* Hash raw, separated identity fields before filename sanitization. */
-static uint64_t thumbnail_key(const albumart_info_t * info) {
+/* Tagcache album groups compare ASCII bytes without case and use the
+ * effective album artist as their second identity field. Keep the hash
+ * ordering and separator aligned with that exact grouping identity. */
+uint64_t albumart_thumbnail_key(const albumart_info_t * info) {
+    if (!info) return UINT64_C(14695981039346656037);
+    const char * album_artist = info->albumartist[0] ? info->albumartist : info->artist;
+    const char * fields[] = { info->album, album_artist };
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (int field = 0; field < 2; field++) {
+        for (const unsigned char * p = (const unsigned char *) fields[field]; *p; p++) {
+            unsigned char c = *p;
+            if (c >= 'A' && c <= 'Z') c = (unsigned char) (c + ('a' - 'A'));
+            hash = (hash ^ c) * UINT64_C(1099511628211);
+        }
+        if (field == 0) hash = (hash ^ 0) * UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+/* Existing v2 artwork files used raw, case-sensitive album-artist then album
+ * bytes. Keep looking for those names so an identity-key change does not
+ * discard already generated thumbnail files. New shared-key files use v3. */
+static uint64_t thumbnail_key_legacy(const albumart_info_t * info) {
     const char * fields[] = { info->albumartist[0] ? info->albumartist : info->artist, info->album };
     uint64_t hash = UINT64_C(14695981039346656037);
     for (int i = 0; i < 2; i++) {
@@ -95,13 +116,20 @@ static bool try_exts(char * path, int len);
 
 static bool try_albumart_cache(const char * dir, const albumart_info_t * id3, const char * size_string, char * path) {
     const char * artist = id3->albumartist[0] ? id3->albumartist : id3->artist;
-    int pathlen;
     if (!artist[0] || !id3->album[0]) return false;
-    if (size_string[0])
-        pathlen = snprintf(path, PATH_MAX, "%s/v2-%016llx%s.", dir,
-                           (unsigned long long) thumbnail_key(id3), size_string);
-    else
-        pathlen = snprintf(path, PATH_MAX, "%s/%s-%s%s.", dir, artist, id3->album, size_string);
+    if (size_string[0]) {
+        uint64_t keys[2] = { albumart_thumbnail_key(id3), thumbnail_key_legacy(id3) };
+        for (size_t i = 0; i < 2; i++) {
+            const char * version = i == 0 ? "v3" : "v2";
+            int pathlen = snprintf(path, PATH_MAX, "%s/%s-%016llx%s.", dir, version,
+                                   (unsigned long long) keys[i], size_string);
+            if (pathlen < 0 || pathlen >= PATH_MAX) continue;
+            fix_path_part(path, (int) strlen(dir) + 1, PATH_MAX);
+            if (try_exts(path, pathlen)) return true;
+        }
+        return false;
+    }
+    int pathlen = snprintf(path, PATH_MAX, "%s/%s-%s%s.", dir, artist, id3->album, size_string);
     if (pathlen < 0 || pathlen >= PATH_MAX) return false;
     fix_path_part(path, (int) strlen(dir) + 1, PATH_MAX);
     return try_exts(path, pathlen);
@@ -271,7 +299,8 @@ static bool find_sibling_disc_art(const char * parent_dir, const char * current_
     return false;
 }
 
-bool albumart_search_files(const albumart_info_t * id3, const char * size_string, char * buf, size_t buflen) {
+static bool albumart_search_files_internal(const albumart_info_t * id3, const char * size_string,
+                                            char * buf, size_t buflen, bool include_generated_cache) {
     char path[PATH_MAX];
     char dir[PATH_MAX];
     char disc_name[SIBLING_DISC_NAME_MAX];
@@ -307,10 +336,12 @@ bool albumart_search_files(const albumart_info_t * id3, const char * size_string
 
         if (!found) found = try_art_in_dir(dir, dirlen, id3, size_string, albumlen, path);
 
-        if (!found) found = try_albumart_cache(ALBUMART_DIR, id3, size_string, path);
-        /* A destination directory created before the legacy cache is moved
-         * must not hide covers that are still stored under the old name. */
-        if (!found) found = try_albumart_cache(ALBUMART_LEGACY_DIR, id3, size_string, path);
+        if (include_generated_cache) {
+            if (!found) found = try_albumart_cache(ALBUMART_DIR, id3, size_string, path);
+            /* A destination directory created before the legacy cache is moved
+             * must not hide covers that are still stored under the old name. */
+            if (!found) found = try_albumart_cache(ALBUMART_LEGACY_DIR, id3, size_string, path);
+        }
 
         if (!found && dirlen > 1) {
             basename_of_dir(dir, disc_name, sizeof(disc_name));
@@ -333,6 +364,15 @@ bool albumart_search_files(const albumart_info_t * id3, const char * size_string
     if (!found) return false;
     strmemccpy_local(buf, path, buflen);
     return true;
+}
+
+bool albumart_search_files(const albumart_info_t * id3, const char * size_string, char * buf, size_t buflen) {
+    return albumart_search_files_internal(id3, size_string, buf, buflen, true);
+}
+
+bool albumart_search_source_files(const albumart_info_t * id3, const char * size_string,
+                                  char * buf, size_t buflen) {
+    return albumart_search_files_internal(id3, size_string, buf, buflen, false);
 }
 
 static void rgb565_to_bgr(uint16_t p, uint8_t * b, uint8_t * g, uint8_t * r) {
@@ -392,7 +432,7 @@ static bool bmp_source_mtime(const char * path, int expected_width, int expected
 }
 
 uint64_t albumart_debug_thumbnail_key(const albumart_info_t * info) {
-    return thumbnail_key(info);
+    return albumart_thumbnail_key(info);
 }
 
 bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int height, char * found, size_t found_size) {
@@ -414,9 +454,14 @@ bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int hei
 
 static bool generated_cache_file(const char * dir, const albumart_info_t * info, int width, int height,
                                  char * path, size_t path_size) {
-    int pathlen = snprintf(path, path_size, "%s/v2-%016llx.%dx%d.bmp", dir,
-                           (unsigned long long) thumbnail_key(info), width, height);
-    return pathlen > 0 && (size_t) pathlen < path_size && file_exists(path);
+    uint64_t keys[2] = { albumart_thumbnail_key(info), thumbnail_key_legacy(info) };
+    const char * versions[2] = { "v3", "v2" };
+    for (size_t i = 0; i < 2; i++) {
+        int pathlen = snprintf(path, path_size, "%s/%s-%016llx.%dx%d.bmp", dir, versions[i],
+                               (unsigned long long) keys[i], width, height);
+        if (pathlen > 0 && (size_t) pathlen < path_size && file_exists(path)) return true;
+    }
+    return false;
 }
 
 bool albumart_generated_cache_fresh(const albumart_info_t * info, int width, int height,
@@ -447,8 +492,8 @@ bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, 
     mkdir(ALBUMART_DIR, 0755);
 
     char path[PATH_MAX], tmp[PATH_MAX + 16];
-    int pathlen = snprintf(path, sizeof(path), "%s/v2-%016llx.%dx%d.bmp", ALBUMART_DIR,
-                           (unsigned long long) thumbnail_key(info), width, height);
+    int pathlen = snprintf(path, sizeof(path), "%s/v3-%016llx.%dx%d.bmp", ALBUMART_DIR,
+                           (unsigned long long) albumart_thumbnail_key(info), width, height);
     if (pathlen < 0 || (size_t) pathlen >= sizeof(path)) return false;
     fix_path_part(path, (int) strlen(ALBUMART_DIR) + 1, PATH_MAX);
     if (snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path) >= (int) sizeof(tmp)) return false;

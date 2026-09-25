@@ -7,6 +7,9 @@
 
 /* Must match tagcache's maximum metadata text field, including the NUL. */
 #define METADATA_DB_TEXT_MAX 600
+#define METADATA_DB_CATALOG_PAGE_MAX 100
+#define METADATA_DB_CATALOG_LIBRARY_ID_SIZE 37
+#define METADATA_DB_CATALOG_REVISION_SIZE 64
 
 /* On-disk cache of every scanned song's title/artist/album/album_artist/
  * genre tags, keyed by path + the file's mtime/size at the time it was
@@ -115,6 +118,31 @@ typedef struct {
     char path[600];
     cached_tags_t tags;
 } song_row_t;
+
+typedef enum {
+    METADATA_DB_CATALOG_OK,
+    METADATA_DB_CATALOG_STALE,
+    METADATA_DB_CATALOG_UNAVAILABLE
+} metadata_db_catalog_result_t;
+
+typedef struct {
+    char library_id[METADATA_DB_CATALOG_LIBRARY_ID_SIZE];
+    char revision[METADATA_DB_CATALOG_REVISION_SIZE];
+    int64_t total;
+    int count;
+} metadata_db_catalog_page_t;
+
+typedef struct {
+    song_row_t song;
+    int64_t album_representative_id; /* 0 means the song has no album group */
+} metadata_db_catalog_song_t;
+
+typedef struct {
+    song_row_t representative;
+    int64_t representative_id;
+    int64_t scanned_mtime;
+    int64_t scanned_size;
+} metadata_db_catalog_cover_t;
 
 typedef struct {
     char name[128];
@@ -242,6 +270,28 @@ int metadata_db_search_names(metadata_db_az_kind_t kind, const char * needle, in
  * so every song_row_t consumer (remote_control.c, plugin.library_*) shows
  * the same thing for an untagged file instead of a blank title. */
 void metadata_db_song_display_title(const song_row_t * row, char * out, size_t out_size);
+
+/* Revision-consistent, bounded snapshots for remote library sync. Each page
+ * captures library ID, tagcache generation, total, and rows under one database
+ * guard. `expected_revision == NULL` is accepted only for the initial songs
+ * page; covers and source resolution require a revision. */
+metadata_db_catalog_result_t metadata_db_catalog_songs_page(
+    const char * expected_revision, int offset, int limit,
+    metadata_db_catalog_page_t * out_page, metadata_db_catalog_song_t * out_rows);
+metadata_db_catalog_result_t metadata_db_catalog_covers_page(
+    const char * expected_revision, int offset, int limit,
+    metadata_db_catalog_page_t * out_page, metadata_db_catalog_cover_t * out_rows);
+metadata_db_catalog_result_t metadata_db_catalog_cover_source(
+    const char * expected_revision, int64_t representative_id,
+    metadata_db_catalog_page_t * out_page, metadata_db_catalog_cover_t * out_source);
+/* Validates a catalog-origin numeric song id against a supplied revision
+ * inside one metadata DB guard. */
+metadata_db_catalog_result_t metadata_db_catalog_validate_song_revision(
+    const char * expected_revision, int64_t song_id);
+/* Revalidates a catalog-origin ID and copies its concrete row in the same DB
+ * guard, closing the gap between HTTP acceptance and UI-thread consumption. */
+metadata_db_catalog_result_t metadata_db_catalog_get_song_revision(
+    const char * expected_revision, int64_t song_id, song_row_t * out_song);
 
 /* Title/artist substring search (case-insensitive), ordered by title then
  * stable id -- capped at max_rows, always replace-not-append the caller's

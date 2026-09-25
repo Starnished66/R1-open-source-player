@@ -11,8 +11,8 @@
  * /api/v1/capabilities describes the API version and currently available
  * features and supported transports (Wi-Fi HTTP and Bluetooth Classic RFCOMM).
  * Transport support is advertised independently of whether its radio is
- * currently enabled. Playback remains local to the player.
- * Playback requests set flags that are polled and consumed by update_timer_cb. */
+ * currently enabled. Playback remains local to the player. Playback and
+ * screenshot requests set flags consumed by update_timer_cb. */
 
 /* Starts the HTTP listener thread on REMOTE_CONTROL_PORT. Idempotent. */
 void remote_control_start(void);
@@ -42,6 +42,8 @@ void remote_control_notify_status(bool playing, bool paused, const char * title,
 
 /* Poll from update_timer_cb only. Edge-triggered (cleared once consumed). */
 bool remote_control_consume_play_pause(void);
+/* POST /api/screenshot; returns once when the UI thread should start capture. */
+bool remote_control_consume_screenshot(void);
 bool remote_control_consume_next(void);
 bool remote_control_consume_prev(void);
 
@@ -57,7 +59,8 @@ bool remote_control_consume_seek(int * out_seconds);
 bool remote_control_consume_volume(int * out_percent);
 
 /* POST /api/playback/queue?index=N -- enqueue one library song by metadata_db id. */
-bool remote_control_consume_queue_index(int64_t * out_index);
+bool remote_control_consume_queue_index(int64_t * out_index, char * out_catalog_revision,
+                                         size_t revision_size);
 bool remote_control_consume_queue_remove(int * out_offset, uint64_t * out_revision);
 bool remote_control_consume_queue_clear(uint64_t * out_revision);
 
@@ -68,7 +71,8 @@ void remote_control_sync_queue(const char * const * paths, int count, uint64_t r
  * album_artist, album) narrow the context for building the playback queue. */
 bool remote_control_consume_play_index(int64_t * out_index, char * out_playlist, size_t playlist_size,
                                          char * out_artist, size_t artist_size, char * out_album_artist,
-                                         size_t album_artist_size, char * out_album, size_t album_size);
+                                         size_t album_artist_size, char * out_album, size_t album_size,
+                                         char * out_catalog_revision, size_t revision_size);
 
 /* Playlist mutation (create playlist / add song) runs synchronously on the HTTP
  * thread.

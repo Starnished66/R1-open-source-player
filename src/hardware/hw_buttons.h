@@ -60,6 +60,14 @@ bool hw_buttons_consume_power(void);
  * that press's eventual release does not also set the short-tap flag. */
 bool hw_buttons_consume_power_long_press(void);
 
+/* True once for a Power + Volume Down screenshot chord, then reset. One
+ * screenshot is accepted per Power hold; further Volume Down presses during
+ * that hold are ignored. */
+bool hw_buttons_consume_screenshot(void);
+/* Arms the Power + Volume Down screenshot chord. While disarmed (the default)
+ * both keys keep their ordinary meaning and nothing is suppressed. */
+void hw_buttons_set_screenshot_combo_enabled(bool enabled);
+
 /* Net accumulated volume step (in percent) since the last call, then reset
  * to 0. Positive for volume up, negative for volume down. */
 int hw_buttons_consume_volume_delta(void);

@@ -37,6 +37,10 @@ static bool next_requested = false;
 static bool prev_requested = false;
 static bool power_requested = false;
 static bool power_long_press_requested = false;
+static bool screenshot_requested = false;
+/* Developer Options arms the chord; written from the UI thread, read here
+ * under state_mutex like the rest of the key state. */
+static bool screenshot_combo_enabled = false;
 static int volume_delta = 0;
 
 /* Held-state + next-repeat-due tracking for volume up/down specifically --
@@ -47,6 +51,12 @@ static bool volume_up_held = false;
 static bool volume_down_held = false;
 static uint32_t volume_up_next_repeat_ms = 0;
 static uint32_t volume_down_next_repeat_ms = 0;
+/* A Volume Down press can become the first half of the reverse-order
+ * screenshot chord. Its step is undoable only until the UI drains the shared
+ * volume accumulator; its press time remains available while the key is held. */
+static bool volume_down_initial_step_pending = false;
+static uint32_t volume_down_pressed_ms = 0;
+static bool volume_down_screenshot_chorded = false;
 
 /* Power held-state + long-press-due tracking, same shape as the volume
  * repeat state above -- power_long_press_fired guards against firing the
@@ -55,6 +65,7 @@ static uint32_t volume_down_next_repeat_ms = 0;
  * flag once the same press has already turned into a long-press. */
 static bool power_held = false;
 static bool power_long_press_fired = false;
+static bool power_screenshot_chorded = false;
 static uint32_t power_long_press_due_ms = 0;
 
 /* Next-button hold-to-seek state, same shape as the power long-press state
@@ -85,10 +96,24 @@ static void handle_key_event(unsigned short code, int value) {
         switch (code) {
             case KEY_POWER: {
                 uint32_t now = monotonic_ms();
+                bool reverse_chord = screenshot_combo_enabled && volume_down_held &&
+                    (uint32_t) (now - volume_down_pressed_ms) <= 250;
                 power_held = true;
                 power_long_press_fired = false;
-                power_long_press_due_ms = now + POWER_LONG_PRESS_MS;
-                DBG_LOG("hw_buttons: KEY_POWER down at t=%u\n", now);
+                power_screenshot_chorded = reverse_chord;
+                power_long_press_due_ms = reverse_chord ? 0 : now + POWER_LONG_PRESS_MS;
+                if (reverse_chord) {
+                    screenshot_requested = true;
+                    volume_down_screenshot_chorded = true;
+                    volume_down_held = false;
+                    if (volume_down_initial_step_pending) {
+                        volume_delta += VOLUME_STEP_PERCENT;
+                        volume_down_initial_step_pending = false;
+                    }
+                    DBG_LOG("hw_buttons: screenshot chord VolDown -> Power at t=%u\n", now);
+                } else {
+                    DBG_LOG("hw_buttons: KEY_POWER down at t=%u\n", now);
+                }
                 break;
             }
             /* Accessory remotes do not all speak the same code for the same
@@ -113,11 +138,27 @@ static void handle_key_event(unsigned short code, int value) {
                 volume_up_held = true;
                 volume_up_next_repeat_ms = monotonic_ms() + VOLUME_REPEAT_INITIAL_DELAY_MS;
                 break;
-            case KEY_VOLUMEDOWN:
-                volume_delta -= VOLUME_STEP_PERCENT;
-                volume_down_held = true;
-                volume_down_next_repeat_ms = monotonic_ms() + VOLUME_REPEAT_INITIAL_DELAY_MS;
+            case KEY_VOLUMEDOWN: {
+                uint32_t now = monotonic_ms();
+                if (screenshot_combo_enabled && power_held && !power_long_press_fired) {
+                    if (!power_screenshot_chorded) {
+                        screenshot_requested = true;
+                        power_screenshot_chorded = true;
+                        DBG_LOG("hw_buttons: screenshot chord Power -> VolDown at t=%u\n", now);
+                    }
+                    volume_down_screenshot_chorded = true;
+                    volume_down_initial_step_pending = false;
+                    volume_down_held = false;
+                } else {
+                    volume_delta -= VOLUME_STEP_PERCENT;
+                    volume_down_held = true;
+                    volume_down_pressed_ms = now;
+                    volume_down_initial_step_pending = true;
+                    volume_down_screenshot_chorded = false;
+                    volume_down_next_repeat_ms = now + VOLUME_REPEAT_INITIAL_DELAY_MS;
+                }
                 break;
+            }
             default: break;
         }
     } else if (value == 0) {
@@ -130,11 +171,16 @@ static void handle_key_event(unsigned short code, int value) {
                  * gui.c to show the power-off countdown for this same
                  * press, and the release shouldn't also toggle the screen
                  * out from under it. */
-                if (power_held && !power_long_press_fired) power_requested = true;
+                if (power_held && !power_long_press_fired && !power_screenshot_chorded) power_requested = true;
                 power_held = false;
+                power_screenshot_chorded = false;
                 break;
             case KEY_VOLUMEUP:   volume_up_held = false; break;
-            case KEY_VOLUMEDOWN: volume_down_held = false; break;
+            case KEY_VOLUMEDOWN:
+                volume_down_held = false;
+                volume_down_initial_step_pending = false;
+                volume_down_screenshot_chorded = false;
+                break;
             case KEY_FASTFORWARD:
             case KEY_NEXTSONG:
                 /* Same suppression as KEY_POWER above: only a release that
@@ -160,7 +206,8 @@ static void apply_due_volume_repeats(void) {
         volume_delta += VOLUME_STEP_PERCENT;
         volume_up_next_repeat_ms = now + VOLUME_REPEAT_INTERVAL_MS;
     }
-    if (volume_down_held && (int32_t) (now - volume_down_next_repeat_ms) >= 0) {
+    if (volume_down_held && !volume_down_screenshot_chorded &&
+        (int32_t) (now - volume_down_next_repeat_ms) >= 0) {
         volume_delta -= VOLUME_STEP_PERCENT;
         volume_down_next_repeat_ms = now + VOLUME_REPEAT_INTERVAL_MS;
     }
@@ -174,7 +221,8 @@ static void apply_due_volume_repeats(void) {
 static void apply_due_power_long_press(void) {
     uint32_t now = monotonic_ms();
     pthread_mutex_lock(&state_mutex);
-    if (power_held && !power_long_press_fired && (int32_t) (now - power_long_press_due_ms) >= 0) {
+    if (power_held && !power_long_press_fired && !power_screenshot_chorded &&
+        (int32_t) (now - power_long_press_due_ms) >= 0) {
         power_long_press_fired = true;
         power_long_press_requested = true;
     }
@@ -302,7 +350,7 @@ static void * hw_buttons_thread_func(void * arg) {
     while (1) {
         pthread_mutex_lock(&state_mutex);
         bool volume_held = volume_up_held || volume_down_held;
-        bool power_pending_long_press = power_held && !power_long_press_fired;
+        bool power_pending_long_press = power_held && !power_long_press_fired && !power_screenshot_chorded;
         bool next_pending_seek = next_held;
         pthread_mutex_unlock(&state_mutex);
 
@@ -411,10 +459,25 @@ int hw_buttons_consume_next_seek_steps(bool * out_is_first) {
     return result;
 }
 
+void hw_buttons_set_screenshot_combo_enabled(bool enabled) {
+    pthread_mutex_lock(&state_mutex);
+    screenshot_combo_enabled = enabled;
+    pthread_mutex_unlock(&state_mutex);
+}
+
+bool hw_buttons_consume_screenshot(void) {
+    pthread_mutex_lock(&state_mutex);
+    bool result = screenshot_requested;
+    screenshot_requested = false;
+    pthread_mutex_unlock(&state_mutex);
+    return result;
+}
+
 int hw_buttons_consume_volume_delta(void) {
     pthread_mutex_lock(&state_mutex);
     int result = volume_delta;
     volume_delta = 0;
+    volume_down_initial_step_pending = false;
     pthread_mutex_unlock(&state_mutex);
     return result;
 }

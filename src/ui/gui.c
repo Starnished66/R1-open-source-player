@@ -69,6 +69,7 @@
 #include "timezone_data.h"
 #include "timezone_apply.h"
 #include "hostname_apply.h"
+#include "../core/screenshot.h"
 
 /* --- Theme API (gui_theme.h) --- */
 
@@ -284,7 +285,8 @@ static bool shutdown_background_work_active(void) {
     return gui_library_has_background_work() || gui_subsonic_has_background_work() ||
            gui_network_has_background_work() || gui_lyrics_has_background_work() ||
            gui_player_has_background_work() || gui_shell_has_background_work() ||
-           plugin_manager_has_background_work() || playlist_files_has_active_write() || gui_player_queue_write_busy();
+           plugin_manager_has_background_work() || playlist_files_has_active_write() ||
+           gui_player_queue_write_busy() || screenshot_is_busy();
 }
 
 /* Grace window after resuming from suspend. hw_buttons sets its short-tap flag
@@ -502,6 +504,7 @@ static void update_timer_cb(lv_timer_t * timer) {
     if (next_seek_steps > 0) {
         gui_player_hw_next_seek_steps(next_seek_steps, next_seek_is_first);
     }
+    bool screenshot_request_pending = hw_buttons_consume_screenshot();
 
 #ifndef HOST_BUILD
     /* Bluetooth accessory controls dispatch to UI/player state on this thread. */
@@ -560,6 +563,22 @@ static void update_timer_cb(lv_timer_t * timer) {
      * audio state" pattern as hw_buttons/bt_media_player just above --
      * reuses the exact same shuffle-aware stepping and volume-persistence
      * shape as those, rather than a separate implementation. */
+    screenshot_request_pending = remote_control_consume_screenshot() || screenshot_request_pending;
+    if (screenshot_request_pending) (void) screenshot_start();
+    screenshot_completion_t screenshot_result;
+    if (screenshot_poll_completion(&screenshot_result)) {
+        if (screenshot_result.saved) {
+            show_info_toast("Screenshot saved");
+            plugin_manager_notify_screenshot_saved(screenshot_result.path);
+        } else {
+            char failed_msg[64];
+            snprintf(failed_msg, sizeof(failed_msg), "Screenshot failed (%s)",
+                     screenshot_result.reason[0] ? screenshot_result.reason : "unknown");
+            show_error_toast(failed_msg);
+            plugin_manager_notify_screenshot_failed(screenshot_result.reason);
+        }
+    }
+
     if (remote_control_consume_play_pause()) {
         toggle_play_pause();
     }
@@ -591,9 +610,15 @@ static void update_timer_cb(lv_timer_t * timer) {
         refresh_volume_topbar(remote_volume_percent);
     }
     int64_t remote_queue_id;
-    if (remote_control_consume_queue_index(&remote_queue_id)) {
+    char remote_queue_catalog_revision[METADATA_DB_CATALOG_REVISION_SIZE] = {0};
+    if (remote_control_consume_queue_index(&remote_queue_id, remote_queue_catalog_revision,
+                                            sizeof(remote_queue_catalog_revision))) {
         song_row_t remote_queue_row;
-        if (metadata_db_get_song_by_id(remote_queue_id, &remote_queue_row)) queue_add_song(remote_queue_row.path);
+        bool found = remote_queue_catalog_revision[0]
+            ? metadata_db_catalog_get_song_revision(remote_queue_catalog_revision, remote_queue_id,
+                                                    &remote_queue_row) == METADATA_DB_CATALOG_OK
+            : metadata_db_get_song_by_id(remote_queue_id, &remote_queue_row);
+        if (found) queue_add_song(remote_queue_row.path);
     }
     int remote_queue_remove_offset;
     uint64_t remote_queue_revision;
@@ -603,10 +628,12 @@ static void update_timer_cb(lv_timer_t * timer) {
         gui_player_remote_queue_clear(remote_queue_revision);
     int64_t remote_play_id;
     char remote_play_playlist[128], remote_play_artist[128], remote_play_album_artist[128], remote_play_album[128];
+    char remote_play_catalog_revision[METADATA_DB_CATALOG_REVISION_SIZE] = {0};
     if (remote_control_consume_play_index(&remote_play_id, remote_play_playlist, sizeof(remote_play_playlist),
                                            remote_play_artist, sizeof(remote_play_artist), remote_play_album_artist,
                                            sizeof(remote_play_album_artist), remote_play_album,
-                                           sizeof(remote_play_album))) {
+                                           sizeof(remote_play_album), remote_play_catalog_revision,
+                                           sizeof(remote_play_catalog_revision))) {
         /* remote_play_id is a song id (metadata_db.c's rowid-based
          * song_row_t.id) -- resolve it to a path, then hand that straight to
          * play_remote_control_song() (defined with the rest of the
@@ -614,9 +641,13 @@ static void update_timer_cb(lv_timer_t * timer) {
          * resolves the path plus the playlist/artist/album context into the
          * right playlist and position via its own DB queries, falling back
          * to the whole library (All Songs, by title offset) when no scope
-         * applies. */
+        * applies. */
         song_row_t remote_play_row;
-        if (metadata_db_get_song_by_id(remote_play_id, &remote_play_row)) {
+        bool found = remote_play_catalog_revision[0]
+            ? metadata_db_catalog_get_song_revision(remote_play_catalog_revision, remote_play_id,
+                                                    &remote_play_row) == METADATA_DB_CATALOG_OK
+            : metadata_db_get_song_by_id(remote_play_id, &remote_play_row);
+        if (found) {
             play_remote_control_song(remote_play_row.path, remote_play_playlist, remote_play_artist,
                                       remote_play_album_artist, remote_play_album);
         }
@@ -1406,6 +1437,7 @@ void gui_init(uint32_t screen_width, uint32_t screen_height) {
     bt_control_set_speexrate_enabled(current_settings.bt_speexrate_enabled);
     bt_control_set_sample_rate(current_settings.bt_sample_rate);
     db_log_set_enabled(current_settings.db_logging_enabled);
+    hw_buttons_set_screenshot_combo_enabled(current_settings.screenshot_combo_enabled);
     usb_dac_bridge_set_debug_log_enabled(current_settings.db_logging_enabled);
     headphone_status_refresh_earpods_adc();
     app_clock_init(current_settings.clock_automatic, current_settings.clock_manual_epoch,

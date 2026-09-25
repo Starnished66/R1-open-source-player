@@ -192,6 +192,8 @@ int tagcache_cmp_ascii(const char * a, const char * b);
 bool tagcache_artist_matches(const char * raw_artist, const char * name);
 /* First artist name a raw ARTIST tag is filed under. */
 void tagcache_artist_primary(const char * raw_artist, char * out, size_t out_size);
+/* Exact bounded artist membership names for a song's raw ARTIST tag. */
+int tagcache_artist_names(const char * raw_artist, char out[][TAGCACHE_TAG_MAX], int max_names);
 const char * tagcache_ascii_casestr(const char * hay, const char * needle);
 
 #endif /* TAGCACHE_H */

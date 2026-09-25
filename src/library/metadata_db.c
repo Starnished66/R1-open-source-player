@@ -9,6 +9,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
 #include <pthread.h>
@@ -29,6 +30,8 @@
 #define METADATA_DB_OLD_DIR METADATA_DB_ROOT "/.open_hiby_player"
 #define MIGRATION_PENDING METADATA_DB_DIR "/migration.pending"
 #define MIGRATION_COMPLETE METADATA_DB_DIR "/migration.complete"
+#define CATALOG_INCARNATION_NAME "catalog.incarnation"
+#define CATALOG_INCARNATION_TEMP_NAME "catalog.incarnation.tmp"
 
 static bool db_ready;
 static int migration_db_fd = -1;
@@ -41,6 +44,13 @@ static bool migration_replayed;
 static bool migration_applied;
 static size_t migration_unmatched;
 static tagcache_stats_snapshot_t * migration_stats;
+static char catalog_library_id[METADATA_DB_CATALOG_LIBRARY_ID_SIZE];
+static bool catalog_library_id_ready;
+static bool catalog_library_id_force_rotation;
+/* A database rebuilt after corruption is a provisional, empty tagcache until
+ * its replacement generation commits. Never let a catalog client publish
+ * that transient state under the old library identity. */
+static bool catalog_rebuild_pending;
 static pthread_once_t metadata_db_mutex_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t metadata_db_mutex;
 static pthread_mutex_t metadata_update_mutex;
@@ -351,6 +361,122 @@ static int az_kind_to_group(metadata_db_az_kind_t kind) {
 
 static metadata_db_load_outcome_t last_outcome = METADATA_DB_LOAD_UNMOUNTED;
 
+typedef enum {
+    CATALOG_ID_READ_ERROR = -1,
+    CATALOG_ID_MISSING = 0,
+    CATALOG_ID_INVALID = 1,
+    CATALOG_ID_VALID = 2
+} catalog_id_read_result_t;
+
+static bool catalog_id_format_valid(char id[METADATA_DB_CATALOG_LIBRARY_ID_SIZE]) {
+    if (strlen(id) != METADATA_DB_CATALOG_LIBRARY_ID_SIZE - 1) return false;
+    for (size_t i = 0; i < METADATA_DB_CATALOG_LIBRARY_ID_SIZE - 1; i++) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (id[i] != '-') return false;
+            continue;
+        }
+        unsigned char c = (unsigned char) id[i];
+        if (c >= 'A' && c <= 'F') id[i] = (char) (c + ('a' - 'A'));
+        else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+
+static catalog_id_read_result_t catalog_read_id(char out[METADATA_DB_CATALOG_LIBRARY_ID_SIZE]) {
+    if (migration_db_fd < 0) return CATALOG_ID_READ_ERROR;
+    int fd = openat(migration_db_fd, CATALOG_INCARNATION_NAME,
+                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return errno == ENOENT ? CATALOG_ID_MISSING : CATALOG_ID_READ_ERROR;
+
+    struct stat st;
+    bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) &&
+              (st.st_size == 36 || st.st_size == 37);
+    char id[METADATA_DB_CATALOG_LIBRARY_ID_SIZE] = {0};
+    size_t needed = ok ? (size_t) st.st_size : 0;
+    size_t received = 0;
+    while (ok && received < needed) {
+        ssize_t n = read(fd, id + received, needed - received);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { ok = false; break; }
+        received += (size_t) n;
+    }
+    if (close(fd) != 0) ok = false;
+    if (!ok) return CATALOG_ID_READ_ERROR;
+    if (needed == 37) {
+        if (id[36] != '\n') return CATALOG_ID_INVALID;
+        id[36] = '\0';
+    }
+    if (!catalog_id_format_valid(id)) return CATALOG_ID_INVALID;
+    memcpy(out, id, sizeof(id));
+    return CATALOG_ID_VALID;
+}
+
+static bool catalog_write_id(const char * id) {
+    if (migration_db_fd < 0) return false;
+    int fd = openat(migration_db_fd, CATALOG_INCARNATION_TEMP_NAME,
+                    O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return false;
+    size_t length = strlen(id);
+    size_t written = 0;
+    bool ok = true;
+    while (written < length) {
+        ssize_t n = write(fd, id + written, length - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { ok = false; break; }
+        written += (size_t) n;
+    }
+    if (ok && fsync(fd) != 0) ok = false;
+    if (close(fd) != 0) ok = false;
+    if (ok && renameat(migration_db_fd, CATALOG_INCARNATION_TEMP_NAME,
+                       migration_db_fd, CATALOG_INCARNATION_NAME) != 0) ok = false;
+    if (ok && fsync(migration_db_fd) != 0) ok = false;
+    if (!ok) unlinkat(migration_db_fd, CATALOG_INCARNATION_TEMP_NAME, 0);
+    return ok;
+}
+
+static bool catalog_generate_id(char out[METADATA_DB_CATALOG_LIBRARY_ID_SIZE]) {
+    uint8_t bytes[16];
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    size_t received = 0;
+    while (received < sizeof(bytes)) {
+        ssize_t n = read(fd, bytes + received, sizeof(bytes) - received);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { close(fd); return false; }
+        received += (size_t) n;
+    }
+    if (close(fd) != 0) return false;
+    bytes[6] = (uint8_t) ((bytes[6] & 0x0f) | 0x40); /* UUID v4 */
+    bytes[8] = (uint8_t) ((bytes[8] & 0x3f) | 0x80); /* RFC 4122 variant */
+    int n = snprintf(out, METADATA_DB_CATALOG_LIBRARY_ID_SIZE,
+                     "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                     bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+    return n == METADATA_DB_CATALOG_LIBRARY_ID_SIZE - 1;
+}
+
+/* Called only with metadata_db_mutex held. Missing/invalid identity files are
+ * replaced; I/O errors fail closed so a catalog revision is never served with
+ * a possibly reused identity. */
+static bool catalog_identity_prepare(void) {
+    if (catalog_library_id_ready && !catalog_library_id_force_rotation) return true;
+    char id[METADATA_DB_CATALOG_LIBRARY_ID_SIZE] = {0};
+    if (!catalog_library_id_force_rotation) {
+        catalog_id_read_result_t read_result = catalog_read_id(id);
+        if (read_result == CATALOG_ID_READ_ERROR) return false;
+        if (read_result == CATALOG_ID_VALID) {
+            memcpy(catalog_library_id, id, sizeof(id));
+            catalog_library_id_ready = true;
+            return true;
+        }
+    }
+    if (!catalog_generate_id(id) || !catalog_write_id(id)) return false;
+    memcpy(catalog_library_id, id, sizeof(id));
+    catalog_library_id_ready = true;
+    catalog_library_id_force_rotation = false;
+    return true;
+}
+
 static metadata_db_load_outcome_t capture_tagcache_outcome(bool update_ready) {
     switch (tagcache_get_load_outcome()) {
         case TAGCACHE_LOAD_SUCCESS_NORMAL: last_outcome = METADATA_DB_LOAD_SUCCESS_NORMAL; break;
@@ -388,7 +514,16 @@ metadata_db_load_outcome_t metadata_db_open(void) {
         last_outcome = METADATA_DB_LOAD_FAILED;
         return last_outcome;
     }
-    return capture_tagcache_outcome(true);
+    metadata_db_load_outcome_t outcome = capture_tagcache_outcome(true);
+    if (outcome == METADATA_DB_LOAD_SUCCESS_FRESH ||
+        outcome == METADATA_DB_LOAD_SUCCESS_RECOVERED) {
+        catalog_library_id_ready = false;
+        catalog_library_id_force_rotation = true;
+    }
+    /* A fresh or recovered tagcache starts a new catalog incarnation. Older
+     * installs without the marker get one stable ID on their first open. */
+    catalog_identity_prepare();
+    return outcome;
 }
 
 bool metadata_db_storage_current(void) {
@@ -473,6 +608,13 @@ bool metadata_db_prepare_rebuild(void) {
     }
     capture_tagcache_outcome(false);
     db_ready = prepared;
+    if (prepared && outcome == METADATA_DB_LOAD_FAILED) {
+        /* Keep catalog reads unavailable until the explicit replacement
+         * generation commits and receives a fresh persistent identity. */
+        catalog_library_id_ready = false;
+        catalog_library_id_force_rotation = true;
+        catalog_rebuild_pending = true;
+    }
     return db_ready;
 }
 
@@ -519,6 +661,10 @@ void metadata_db_close(void) {
     migration_unpin_dirs();
     db_ready = false;
     last_outcome = METADATA_DB_LOAD_UNMOUNTED;
+    catalog_library_id[0] = '\0';
+    catalog_library_id_ready = false;
+    catalog_library_id_force_rotation = false;
+    catalog_rebuild_pending = false;
     path_cache_drop();
     remote_state_drop();
 }
@@ -577,6 +723,8 @@ bool metadata_db_end_update(void) {
     }
     bool ok = tagcache_end_update_with_lock(metadata_query_unlock, metadata_query_lock);
     capture_tagcache_outcome(true);
+    if (ok && catalog_library_id_force_rotation && catalog_identity_prepare())
+        catalog_rebuild_pending = false;
     if (ok && migration_pending) migration_applied = true;
     if (!ok) { migration_replayed = false; migration_unmatched = 0; }
     return ok;
@@ -916,6 +1064,163 @@ void metadata_db_song_display_title(const song_row_t * row, char * out, size_t o
     }
     const char * slash = strrchr(row->path, '/');
     utf8_truncate_safe(out, slash ? slash + 1 : row->path, out_size);
+}
+
+/* All helpers below require metadata_db_mutex to stay held for the whole
+ * revision/count/page snapshot. Never call the public metadata_db page helpers
+ * from these paths: they acquire their own guard and would split this snapshot
+ * into separately locked reads. */
+static metadata_db_catalog_result_t catalog_page_begin_locked(
+    const char * expected_revision, metadata_db_catalog_page_t * out_page) {
+    if (!db_ready || catalog_rebuild_pending || !tagcache_storage_current() || !catalog_identity_prepare())
+        return METADATA_DB_CATALOG_UNAVAILABLE;
+    int32_t generation = tagcache_generation();
+    if (generation < 0) return METADATA_DB_CATALOG_UNAVAILABLE;
+    snprintf(out_page->library_id, sizeof(out_page->library_id), "%s", catalog_library_id);
+    snprintf(out_page->revision, sizeof(out_page->revision), "%s:%d", catalog_library_id, generation);
+    if (expected_revision && strcmp(expected_revision, out_page->revision) != 0)
+        return METADATA_DB_CATALOG_STALE;
+    return METADATA_DB_CATALOG_OK;
+}
+
+static bool catalog_album_representative_locked(const tagcache_song_t * song, int64_t * out_id) {
+    *out_id = 0;
+    if (!song || !song->album[0]) return true;
+    /* The library scanner normalizes absent ALBUMARTIST to ARTIST before
+     * upserting. Keep that same identity for older/incomplete cache rows. */
+    const char * album_artist = song->album_artist[0] ? song->album_artist : song->artist;
+    int index = tagcache_group_index(TAGCACHE_GROUP_ALBUM, song->album, album_artist);
+    if (index < 0 && !song->album_artist[0])
+        index = tagcache_group_index(TAGCACHE_GROUP_ALBUM, song->album, "");
+    tagcache_group_t group;
+    if (index < 0 || !tagcache_group_at(TAGCACHE_GROUP_ALBUM, index, &group)) return false;
+    *out_id = group.first_song_id;
+    return true;
+}
+
+metadata_db_catalog_result_t metadata_db_catalog_songs_page(
+    const char * expected_revision, int offset, int limit,
+    metadata_db_catalog_page_t * out_page, metadata_db_catalog_song_t * out_rows) {
+    if (!out_page || !out_rows || offset < 0 || limit < 1 || limit > METADATA_DB_CATALOG_PAGE_MAX)
+        return METADATA_DB_CATALOG_UNAVAILABLE;
+    memset(out_page, 0, sizeof(*out_page));
+    METADATA_DB_GUARD;
+    metadata_db_catalog_result_t result = catalog_page_begin_locked(expected_revision, out_page);
+    if (result != METADATA_DB_CATALOG_OK) return result;
+
+    out_page->total = tagcache_live_count();
+    tagcache_query_t query;
+    tagcache_query_begin(&query, TAGCACHE_QUERY_SONGS, NULL, NULL, NULL, NULL);
+    tagcache_query_skip(&query, (uint64_t) offset);
+    int32_t rank;
+    while (out_page->count < limit && tagcache_query_next(&query, &rank)) {
+        tagcache_song_t song;
+        if (!tagcache_song_at_title_rank(rank, &song)) return METADATA_DB_CATALOG_UNAVAILABLE;
+        metadata_db_catalog_song_t * dst = &out_rows[out_page->count];
+        copy_song(&song, &dst->song);
+        if (!catalog_album_representative_locked(&song, &dst->album_representative_id))
+            return METADATA_DB_CATALOG_UNAVAILABLE;
+        out_page->count++;
+    }
+    if (out_page->count < limit && (int64_t) offset + out_page->count < out_page->total)
+        return METADATA_DB_CATALOG_UNAVAILABLE;
+    return METADATA_DB_CATALOG_OK;
+}
+
+metadata_db_catalog_result_t metadata_db_catalog_covers_page(
+    const char * expected_revision, int offset, int limit,
+    metadata_db_catalog_page_t * out_page, metadata_db_catalog_cover_t * out_rows) {
+    if (!out_page || !out_rows || offset < 0 || limit < 1 || limit > METADATA_DB_CATALOG_PAGE_MAX)
+        return METADATA_DB_CATALOG_UNAVAILABLE;
+    memset(out_page, 0, sizeof(*out_page));
+    METADATA_DB_GUARD;
+    metadata_db_catalog_result_t result = catalog_page_begin_locked(expected_revision, out_page);
+    if (result != METADATA_DB_CATALOG_OK) return result;
+
+    int album_count = tagcache_group_count(TAGCACHE_GROUP_ALBUM);
+    out_page->total = album_count;
+    for (int rank = offset; rank < album_count && out_page->count < limit; rank++) {
+        tagcache_group_t group;
+        if (!tagcache_group_at(TAGCACHE_GROUP_ALBUM, rank, &group) || group.first_song_id <= 0)
+            return METADATA_DB_CATALOG_UNAVAILABLE;
+        tagcache_song_t representative;
+        if (!tagcache_song_by_id((int32_t) group.first_song_id, &representative))
+            return METADATA_DB_CATALOG_UNAVAILABLE;
+
+        metadata_db_catalog_cover_t * dst = &out_rows[out_page->count];
+        memset(dst, 0, sizeof(*dst));
+        copy_song(&representative, &dst->representative);
+        dst->representative_id = group.first_song_id;
+        dst->scanned_mtime = representative.mtime;
+        dst->scanned_size = representative.size;
+        out_page->count++;
+    }
+    if (out_page->count < limit && (int64_t) offset + out_page->count < out_page->total)
+        return METADATA_DB_CATALOG_UNAVAILABLE;
+    return METADATA_DB_CATALOG_OK;
+}
+
+metadata_db_catalog_result_t metadata_db_catalog_cover_source(
+    const char * expected_revision, int64_t representative_id,
+    metadata_db_catalog_page_t * out_page, metadata_db_catalog_cover_t * out_source) {
+    if (!out_page || !out_source || representative_id <= 0 || representative_id > INT32_MAX)
+        return METADATA_DB_CATALOG_STALE;
+    memset(out_page, 0, sizeof(*out_page));
+    memset(out_source, 0, sizeof(*out_source));
+    METADATA_DB_GUARD;
+    metadata_db_catalog_result_t result = catalog_page_begin_locked(expected_revision, out_page);
+    if (result != METADATA_DB_CATALOG_OK) return result;
+
+    tagcache_song_t song;
+    if (!tagcache_song_by_id((int32_t) representative_id, &song)) return METADATA_DB_CATALOG_STALE;
+    int group_index = song.album[0]
+        ? tagcache_group_index(TAGCACHE_GROUP_ALBUM, song.album,
+                              song.album_artist[0] ? song.album_artist : song.artist)
+        : -1;
+    if (group_index < 0 && song.album[0] && !song.album_artist[0])
+        group_index = tagcache_group_index(TAGCACHE_GROUP_ALBUM, song.album, "");
+    tagcache_group_t group;
+    if (group_index < 0 || !tagcache_group_at(TAGCACHE_GROUP_ALBUM, group_index, &group) ||
+        group.first_song_id != representative_id) return METADATA_DB_CATALOG_STALE;
+
+    copy_song(&song, &out_source->representative);
+    out_source->representative_id = representative_id;
+    out_source->scanned_mtime = song.mtime;
+    out_source->scanned_size = song.size;
+    out_page->total = tagcache_group_count(TAGCACHE_GROUP_ALBUM);
+    out_page->count = 1;
+    return METADATA_DB_CATALOG_OK;
+}
+
+metadata_db_catalog_result_t metadata_db_catalog_validate_song_revision(
+    const char * expected_revision, int64_t song_id) {
+    if (!expected_revision || !expected_revision[0] || song_id <= 0 || song_id > INT32_MAX)
+        return METADATA_DB_CATALOG_STALE;
+    metadata_db_catalog_page_t page;
+    memset(&page, 0, sizeof(page));
+    METADATA_DB_GUARD;
+    metadata_db_catalog_result_t result = catalog_page_begin_locked(expected_revision, &page);
+    if (result != METADATA_DB_CATALOG_OK) return result;
+    tagcache_song_t song;
+    return tagcache_song_by_id((int32_t) song_id, &song)
+        ? METADATA_DB_CATALOG_OK : METADATA_DB_CATALOG_STALE;
+}
+
+metadata_db_catalog_result_t metadata_db_catalog_get_song_revision(
+    const char * expected_revision, int64_t song_id, song_row_t * out_song) {
+    if (!expected_revision || !expected_revision[0] || !out_song ||
+        song_id <= 0 || song_id > INT32_MAX)
+        return METADATA_DB_CATALOG_STALE;
+    memset(out_song, 0, sizeof(*out_song));
+    metadata_db_catalog_page_t page;
+    memset(&page, 0, sizeof(page));
+    METADATA_DB_GUARD;
+    metadata_db_catalog_result_t result = catalog_page_begin_locked(expected_revision, &page);
+    if (result != METADATA_DB_CATALOG_OK) return result;
+    tagcache_song_t song;
+    if (!tagcache_song_by_id((int32_t) song_id, &song)) return METADATA_DB_CATALOG_STALE;
+    copy_song(&song, out_song);
+    return METADATA_DB_CATALOG_OK;
 }
 
 int metadata_db_search_songs(const char *query_text, song_row_t *out_rows, int max_rows) {

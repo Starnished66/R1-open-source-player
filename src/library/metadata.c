@@ -56,7 +56,11 @@ static bool artwork_only;
 static _Thread_local bool lyrics_only;
 
 static bool store_picture_bytes(track_metadata_t * out, const uint8_t * src, uint32_t n) {
-    if (!out || out->picture_data != NULL || !src || n == 0 || n > EMBEDDED_COVER_MAX_BYTES) return false;
+    if (!out || out->picture_data != NULL || !src || n == 0) return false;
+    if (n > EMBEDDED_COVER_MAX_BYTES) {
+        out->picture_too_large = true;
+        return false;
+    }
     uint8_t * copy = malloc(n);
     if (!copy) return false;
     memcpy(copy, src, n);
@@ -793,7 +797,14 @@ static bool read_id3v2_streaming(FILE * f, track_metadata_t * out, uint8_t major
             }
             free(data);
             if (!read_ok) break;
-        } else if (!id3_stream_skip(&stream, frame_size)) break;
+        } else {
+            /* A large APIC/PIC body is intentionally skipped instead of
+             * allocated. Preserve that fact for artwork clients so an
+             * oversized source is not reported as permanently missing. */
+            if (include_blobs && !lyrics_only && is_picture && frame_size > EMBEDDED_COVER_MAX_BYTES)
+                out->picture_too_large = true;
+            if (!id3_stream_skip(&stream, frame_size)) break;
+        }
     }
     fseek(f, tag_end, SEEK_SET);
     return found_any;
@@ -1193,7 +1204,10 @@ static void m4a_read_cover_art(FILE * f, m4a_box_t item, track_metadata_t * out)
     if (!m4a_find_data_payload(f, item, &payload_offset, &payload_size) || payload_size == 0) return;
     /* Audiobook/M4B covers are often multi-megabyte JPEGs. Unbounded
      * malloc here races the decoder's own RAM on the 56 MiB target. */
-    if (payload_size > EMBEDDED_COVER_MAX_BYTES) return;
+    if (payload_size > EMBEDDED_COVER_MAX_BYTES) {
+        out->picture_too_large = true;
+        return;
+    }
 
     uint8_t * data = malloc(payload_size);
     if (!data) return;
@@ -1333,6 +1347,9 @@ static void read_opus_metadata(const char * path, track_metadata_t * out, bool i
 
             size_t decoded_len = 0;
             int size_err = mbedtls_base64_decode(NULL, 0, &decoded_len, (const unsigned char *) b64, b64_len);
+            if ((size_err == 0 || size_err == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) &&
+                decoded_len > METADATA_BLOB_MAX_BYTES)
+                out->picture_too_large = true;
             if ((size_err == 0 || size_err == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) && decoded_len > 0 &&
                 decoded_len <= METADATA_BLOB_MAX_BYTES) {
                 uint8_t * decoded = malloc(decoded_len);
@@ -1393,6 +1410,9 @@ static void read_ogg_vorbis_metadata(const char * path, track_metadata_t * out, 
 
             size_t decoded_len = 0;
             int size_err = mbedtls_base64_decode(NULL, 0, &decoded_len, (const unsigned char *) b64, b64_len);
+            if ((size_err == 0 || size_err == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) &&
+                decoded_len > METADATA_BLOB_MAX_BYTES)
+                out->picture_too_large = true;
             if ((size_err == 0 || size_err == MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) && decoded_len > 0 &&
                 decoded_len <= METADATA_BLOB_MAX_BYTES) {
                 uint8_t * decoded = malloc(decoded_len);
@@ -2271,7 +2291,9 @@ static metadata_artwork_result_t metadata_read_artwork_isolated_impl(const char 
         outcome = METADATA_ARTWORK_INVALID;
         ok = false;
     }
-    if (ok && result.picture_size > 0) {
+    if (ok && result.picture_too_large && result.picture_size == 0) {
+        outcome = METADATA_ARTWORK_TOO_LARGE;
+    } else if (ok && result.picture_size > 0) {
         /* The helper still owns its copy. Charge only the additional copy
          * against current free memory, not a fixed worst-case tag size --
          * against the CALLER's real reserve (`prio`), not always the
@@ -2287,7 +2309,8 @@ static metadata_artwork_result_t metadata_read_artwork_isolated_impl(const char 
         result.picture_data = picture;
         result.lyrics = NULL;
         *out = result;
-        outcome = picture ? METADATA_ARTWORK_FOUND : METADATA_ARTWORK_NOT_FOUND;
+        if (result.picture_too_large && !picture) outcome = METADATA_ARTWORK_TOO_LARGE;
+        else outcome = picture ? METADATA_ARTWORK_FOUND : METADATA_ARTWORK_NOT_FOUND;
     } else {
         free(picture);
         kill(pid, SIGKILL);
@@ -2301,6 +2324,8 @@ static metadata_artwork_result_t metadata_read_artwork_isolated_impl(const char 
                 memset(out, 0, sizeof(*out));
                 return outcome == METADATA_ARTWORK_INVALID
                     ? METADATA_ARTWORK_INVALID
+                    : outcome == METADATA_ARTWORK_TOO_LARGE
+                    ? METADATA_ARTWORK_TOO_LARGE
                     : METADATA_ARTWORK_TEMPORARY_FAILURE;
             }
             return outcome;

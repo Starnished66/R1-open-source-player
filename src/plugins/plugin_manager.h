@@ -398,7 +398,8 @@ void plugin_manager_settings_list_slid(int slot, int row, int new_value);
 
 /* ---- Dispatchers for plugin.on() event subscribers. Playback and suspend
  * transitions are called from gui.c at their transition points; volume and
- * battery state are sampled on its existing control tick. Each loops every
+ * battery state are sampled on its existing control tick. Screenshot events
+ * are dispatched when the capture worker completes. Each loops every
  * subscriber and calls it through plugin_call() on the UI thread. ---- */
 /* provider/track_id are "" for a local/Subsonic track -- non-empty only for
  * a remote-provider one (plugin.play_remote(), see remote_track.h), purely
@@ -416,6 +417,8 @@ void plugin_manager_notify_volume_changed(int percent);
 void plugin_manager_poll_battery(void);
 void plugin_manager_notify_suspending(void);
 void plugin_manager_notify_system_resumed(void);
+void plugin_manager_notify_screenshot_saved(const char * path);
+void plugin_manager_notify_screenshot_failed(const char * reason);
 
 /* ---- plugin.register_quick_toggle() -- a toggle in the quick drawer's
  * expanded area (gui_shell.c's build_quick_drawer(), third toggle row),

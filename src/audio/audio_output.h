@@ -53,6 +53,11 @@ bool audio_output_write_s24(const int32_t * buf, uint64_t frames, unsigned int c
  * (neither Bluetooth nor USB DAC output is requested). */
 bool audio_output_is_local_requested(void);
 
+/* Returns true when Bluetooth is the currently requested output target.
+ * Reads the route request under the config mutex, so callers outside the
+ * audio/UI threads can query it without observing a torn route update. */
+bool audio_output_is_bluetooth_requested(void);
+
 /* Returns true if the currently requested target supports wide output (S24).
  * Local and USB DAC output support S24, Bluetooth does not. */
 bool audio_output_supports_wide_path(void);

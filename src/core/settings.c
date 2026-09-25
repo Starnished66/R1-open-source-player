@@ -117,6 +117,7 @@ static void set_defaults(player_settings_t * out) {
     out->hide_player_topbar = false;
     out->led_indicator_enabled = true;
     out->db_logging_enabled = false; /* opt-in developer diagnostic, off by default */
+    out->screenshot_combo_enabled = false;
     out->charge_limiter_enabled = false; /* opt-in -- caps max charge voltage to 4.2V, a real behavior change the user should choose, not a default surprise */
     out->safe_charging_enabled = false; /* off means leave the PMIC charge-current setting untouched */
     out->show_battery_percent = true; /* on by default -- matches every previous version's always-on behavior */
@@ -403,6 +404,8 @@ bool settings_load(player_settings_t * out) {
             out->led_indicator_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "db_logging_enabled") == 0) {
             out->db_logging_enabled = (strcmp(value, "1") == 0);
+        } else if (strcmp(key, "screenshot_combo_enabled") == 0) {
+            out->screenshot_combo_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "charge_limiter_enabled") == 0) {
             out->charge_limiter_enabled = (strcmp(value, "1") == 0);
         } else if (strcmp(key, "safe_charging_enabled") == 0) {
@@ -570,6 +573,7 @@ static void settings_write_file(const player_settings_t * settings) {
     fprintf(f, "hide_player_topbar=%d\n", settings->hide_player_topbar ? 1 : 0);
     fprintf(f, "led_indicator_enabled=%d\n", settings->led_indicator_enabled ? 1 : 0);
     fprintf(f, "db_logging_enabled=%d\n", settings->db_logging_enabled ? 1 : 0);
+    fprintf(f, "screenshot_combo_enabled=%d\n", settings->screenshot_combo_enabled ? 1 : 0);
     fprintf(f, "charge_limiter_enabled=%d\n", settings->charge_limiter_enabled ? 1 : 0);
     fprintf(f, "safe_charging_enabled=%d\n", settings->safe_charging_enabled ? 1 : 0);
     fprintf(f, "show_battery_percent=%d\n", settings->show_battery_percent ? 1 : 0);

@@ -91,6 +91,23 @@ static int last_selected_row = -1;
 static void rebuild_list(void);
 static void scan_current_dir(void);
 
+/* Where each ancestor's list was when a folder was opened from it, so going
+ * back up returns to the same page and scroll offset instead of the top.
+ * Deeper than the stack, back simply starts at the top. The listing loads
+ * asynchronously, so the offset is applied once the parent's index arrives
+ * (restore_generation ties it to that exact request). */
+#define FILE_BROWSER_POSITION_STACK 32
+typedef struct {
+    int page_start;
+    int32_t scroll_y;
+} browser_position_t;
+static browser_position_t position_stack[FILE_BROWSER_POSITION_STACK];
+static int position_depth;
+static int position_overflow;
+static bool restore_pending;
+static int32_t restore_scroll_y;
+static unsigned restore_generation;
+
 /* Kept in sync with audio.c's decoder dispatch. */
 static const char * const PLAYABLE_EXTENSIONS[] = {
     ".flac", ".mp3", ".wav", ".aiff", ".aif", ".dsf", ".dff", ".aac", ".m4a", ".m4b", ".ape", ".wma", ".opus", ".ogg",
@@ -583,6 +600,14 @@ static void index_poll_cb(lv_timer_t *timer) {
         entry_count = -1;
     }
     rebuild_list();
+    if (restore_pending && restore_generation == generation) {
+        restore_pending = false;
+        if (entry_count > 0) {
+            /* Clamped by LVGL if the folder shrank since. */
+            lv_obj_update_layout(list);
+            lv_obj_scroll_to_y(list, restore_scroll_y, LV_ANIM_OFF);
+        }
+    }
     (void)running;
 }
 
@@ -704,7 +729,21 @@ void file_browser_go_up(void) {
         if (strlen(current_dir) < strlen(root_dir)) {
             snprintf(current_dir, sizeof(current_dir), "%s", root_dir);
         }
+        bool restore = false;
+        if (position_overflow > 0) {
+            position_overflow--;
+            page_start = 0;
+        } else if (position_depth > 0) {
+            position_depth--;
+            page_start = position_stack[position_depth].page_start;
+            restore_scroll_y = position_stack[position_depth].scroll_y;
+            restore = true;
+        } else {
+            page_start = 0;
+        }
         scan_current_dir();
+        restore_pending = restore;
+        restore_generation = index_request_generation;
         rebuild_list();
     }
 }
@@ -738,6 +777,14 @@ static void entry_click_cb(lv_event_t * e) {
         char new_dir[PATH_MAX];
         snprintf(new_dir, sizeof(new_dir), "%s/%s", current_dir, clicked.name);
         snprintf(current_dir, sizeof(current_dir), "%s", new_dir);
+        if (position_depth < FILE_BROWSER_POSITION_STACK) {
+            position_stack[position_depth].page_start = page_start;
+            position_stack[position_depth].scroll_y = list ? lv_obj_get_scroll_y(list) : 0;
+            position_depth++;
+        } else {
+            position_overflow++;
+        }
+        restore_pending = false;
         page_start = 0;
         scan_current_dir();
         rebuild_list();
@@ -947,6 +994,8 @@ void file_browser_init(lv_obj_t * parent, const char * root, file_browser_select
     snprintf(root_dir, sizeof(root_dir), "%s", root);
     snprintf(current_dir, sizeof(current_dir), "%s", root);
     page_start = 0;
+    position_depth = position_overflow = 0;
+    restore_pending = false;
 
     path_label = lv_label_create(parent);
     lv_obj_set_style_text_color(path_label, lv_color_make(180, 180, 180), 0);
@@ -985,6 +1034,8 @@ void file_browser_reset_to_root(void) {
     if (!list) return; /* gui_library_get_files_screen() not built yet -- nothing to refresh */
     snprintf(current_dir, sizeof(current_dir), "%s", root_dir);
     page_start = 0;
+    position_depth = position_overflow = 0;
+    restore_pending = false;
     scan_current_dir();
     rebuild_list();
 }

@@ -3350,6 +3350,10 @@ static void refresh_group_song_thumbnails(void) {
                                 group_songs_entries[index].artwork_key,
                                 NULL,
                                 (void *) &album_thumbnail_context);
+        /* The shared decorator pads compact-list rows by 100px for the cover;
+         * these rows position their labels absolutely instead (see
+         * group_song_row_text_offset()), so padding would shift the text twice. */
+        lv_obj_set_style_pad_left(row, 0, 0);
         int32_t pad_left = lv_obj_get_style_pad_left(row, LV_PART_MAIN);
         int32_t pad_top = lv_obj_get_style_pad_top(row, LV_PART_MAIN);
         int32_t pad_bottom = lv_obj_get_style_pad_bottom(row, LV_PART_MAIN);

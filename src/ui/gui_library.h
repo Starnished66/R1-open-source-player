@@ -10,6 +10,8 @@ typedef struct group_song_entry_s {
     char * title;
     int32_t disc_number;
     bool show_disc_header;
+    int64_t song_id;
+    uint64_t artwork_key;
 } group_song_entry_t;
 
 void free_group_song_entries(group_song_entry_t * entries, int count);

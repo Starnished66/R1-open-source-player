@@ -436,6 +436,8 @@ typedef struct {
     const char * trailing_asset;   /* optional theme-relative badge asset */
     const char * subtitle;         /* optional; same borrowed lifetime as label */
     bool is_action;                /* explicit action affordance, not a song */
+    uint64_t artwork_key;           /* optional stable thumbnail key, separate from row identity */
+    const char * artwork_name;      /* optional artist name for artist-image resolution */
 } compact_list_item_t;
 
 /* Fixed size of a paged-mode row label buffer (compact_list_fetch_page_cb_t
@@ -449,6 +451,8 @@ typedef struct {
     char trailing_asset[64];
     char subtitle[256];
     bool is_action;
+    uint64_t artwork_key;
+    char artwork_name[128];
 } compact_list_page_row_t;
 
 /* Fired when a row is tapped, with the index into the `items` array passed
@@ -560,8 +564,12 @@ typedef int (*compact_list_fetch_page_cb_t)(void * ctx, int offset, int count,
  * exceeds the assignment. */
 typedef void (*compact_list_row_decorator_cb_t)(lv_obj_t * list, lv_obj_t * row,
                                                 lv_obj_t * leading_image, int logical_index,
-                                                int pool_slot, int64_t identity, void * ctx);
+                                                int pool_slot, int64_t identity, uint64_t artwork_key,
+                                                const char * artwork_name, void * ctx);
 void compact_list_set_row_decorator(lv_obj_t * list, compact_list_row_decorator_cb_t cb, void * ctx);
+/* Clears every leading image currently showing `src` (pointer compare only,
+ * no decorator run). For owners about to free a borrowed image descriptor. */
+void compact_list_detach_image_src(lv_obj_t * list, const void * src);
 /* Makes each visible trailing_asset a separate tappable accessory. The
  * callback receives the row's current logical index, including after the
  * virtual row has been recycled during scrolling. NULL disables it. */

@@ -1774,6 +1774,7 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
         int old_index = data->row_logical_index[slot];
         if (old_index < first || old_index >= window_end || old_index >= data->item_count) {
             lv_obj_add_flag(data->rows[slot], LV_OBJ_FLAG_HIDDEN);
+            lv_image_set_src(data->leading_images[slot], NULL);
             data->row_logical_index[slot] = -1;
             ((compact_list_row_ctx_t *) data->row_ctx[slot])->logical_index = -1;
         }
@@ -1791,6 +1792,8 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
         const char * trailing_asset = NULL;
         const char * subtitle = NULL;
         bool is_action = false;
+        uint64_t artwork_key = 0;
+        const char * artwork_name = NULL;
         if (data->fetch_page) {
             int cache_idx = index - data->cache_start;
             bool cached = cache_idx >= 0 && cache_idx < data->cache_count;
@@ -1798,6 +1801,7 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
             /* Hide the slot until page data arrives to avoid rendering an empty card. */
             if (!info) {
                 lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+                lv_image_set_src(data->leading_images[slot], NULL);
                 data->row_logical_index[slot] = -1;
                 ((compact_list_row_ctx_t *) data->row_ctx[slot])->logical_index = -1;
                 continue;
@@ -1807,12 +1811,16 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
             trailing_asset = info->trailing_asset[0] ? info->trailing_asset : NULL;
             subtitle = info->subtitle[0] ? info->subtitle : NULL;
             is_action = info->is_action;
+            artwork_key = info->artwork_key;
+            artwork_name = info->artwork_name[0] ? info->artwork_name : NULL;
         } else {
             label = data->items[index].label;
             identity = data->items[index].identity;
             trailing_asset = data->items[index].trailing_asset;
             subtitle = data->items[index].subtitle;
             is_action = data->items[index].is_action;
+            artwork_key = data->items[index].artwork_key;
+            artwork_name = data->items[index].artwork_name;
         }
         lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
         lv_obj_t * trailing = data->trailing_images[slot];
@@ -1831,7 +1839,7 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
          * later thumbnail refresh invalidated the label. */
         if (data->row_decorator)
             data->row_decorator(list, row, data->leading_images[slot], index, slot,
-                                identity, data->row_decorator_ctx);
+                                identity, artwork_key, artwork_name, data->row_decorator_ctx);
         lv_obj_remove_style(row, &style_theme_card_bg, 0);
         if (is_action) lv_obj_add_style(row, &style_theme_card_bg, 0);
         /* Identity details use two lines on music rows. Reset on every
@@ -2259,6 +2267,18 @@ void compact_list_set_row_decorator(lv_obj_t * list, compact_list_row_decorator_
     data->row_decorator = cb;
     data->row_decorator_ctx = ctx;
     compact_list_refresh_visible(list);
+}
+
+void compact_list_detach_image_src(lv_obj_t * list, const void * src) {
+    compact_list_virtual_data_t * data = list ? (compact_list_virtual_data_t *) lv_obj_get_user_data(list) : NULL;
+    if (!data || !src) return;
+    for (int slot = 0; slot < COMPACT_LIST_POOL_SIZE; slot++) {
+        lv_obj_t * image = data->leading_images[slot];
+        if (image && lv_image_get_src(image) == src) {
+            lv_image_set_src(image, NULL);
+            lv_obj_add_flag(image, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
 void compact_list_refresh_visible(lv_obj_t * list) {

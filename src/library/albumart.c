@@ -182,7 +182,7 @@ static bool try_art_in_dir(const char * dir, int dirlen, const albumart_info_t *
  * Deliberately narrow: bare numbers, Roman numerals and descriptive suffixes
  * ("2 Disc Set", "Disc") are excluded to avoid false positives on ordinary
  * (non-multi-disc) album folders. */
-static bool looks_like_disc_dir(const char * name) {
+bool albumart_is_disc_folder(const char * name) {
     static const char * const prefixes[] = { "cd", "disc", "disk" };
     if (!name || !name[0]) return false;
 
@@ -205,6 +205,35 @@ static bool looks_like_disc_dir(const char * name) {
         if (all_digits) return true;
     }
     return false;
+}
+
+bool albumart_find_artist_sidecar(const char * directory, char * found, size_t found_size) {
+    static const char * const names[] = {
+        "artist.jpg", "artist.png", "folder.jpg", "folder.png", "cover.jpg", "cover.png"
+    };
+    if (!directory || !directory[0] || !found || found_size == 0) return false;
+    DIR * dp = opendir(directory);
+    if (!dp) return false;
+    bool have = false;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && !have; i++) {
+        rewinddir(dp);
+        struct dirent * de;
+        while ((de = readdir(dp)) != NULL) {
+            if (strcasecmp(de->d_name, names[i]) != 0) continue;
+            char path[PATH_MAX];
+            int n = snprintf(path, sizeof(path), "%s%s%s", directory,
+                             directory[strlen(directory) - 1] == '/' ? "" : "/", de->d_name);
+            struct stat st;
+            if (n <= 0 || (size_t) n >= sizeof(path) || stat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
+                strlen(path) >= found_size)
+                continue;
+            strmemccpy_local(found, path, found_size);
+            have = true;
+            break;
+        }
+    }
+    closedir(dp);
+    return have;
 }
 
 /* Extracts the final path component (no trailing slash) from dir (which
@@ -245,7 +274,7 @@ static bool find_sibling_disc_art(const char * parent_dir, const char * current_
         if (name[0] == '.') continue;
         if (strcmp(name, current_disc_name) == 0) continue;
         if (strlen(name) >= SIBLING_DISC_NAME_MAX) continue;
-        if (!looks_like_disc_dir(name)) continue;
+        if (!albumart_is_disc_folder(name)) continue;
 
         char full[PATH_MAX];
         int n = snprintf(full, sizeof(full), "%s%s", parent_dir, name);
@@ -354,7 +383,7 @@ static bool albumart_search_files_internal(const albumart_info_t * id3, const ch
 
         if (dirlen > 0 && !found) found = try_art_in_dir(dir, dirlen, id3, size_string, albumlen, path);
 
-        if (!found && walked_to_parent && dirlen > 0 && size_string[0] == '\0' && looks_like_disc_dir(disc_name)) {
+        if (!found && walked_to_parent && dirlen > 0 && size_string[0] == '\0' && albumart_is_disc_folder(disc_name)) {
             found = find_sibling_disc_art(dir, disc_name, id3, albumlen, path);
         }
 
@@ -384,14 +413,25 @@ static void rgb565_to_bgr(uint16_t p, uint8_t * b, uint8_t * g, uint8_t * r) {
     *b = (uint8_t) ((b5 << 3) | (b5 >> 2));
 }
 
-static uint32_t source_mtime_of(const albumart_info_t * info) {
+uint32_t albumart_source_mtime_with_path(const albumart_info_t * info, char * sidecar_path,
+                                         size_t sidecar_path_size, bool * out_has_sidecar) {
+    if (sidecar_path && sidecar_path_size > 0) sidecar_path[0] = '\0';
+    if (out_has_sidecar) *out_has_sidecar = false;
     if (!info) return 0;
     char src[PATH_MAX];
     struct stat st;
-    if (albumart_search_files(info, "", src, sizeof(src)) && stat(src, &st) == 0 && S_ISREG(st.st_mode))
+    if (albumart_search_files(info, "", src, sizeof(src)) && stat(src, &st) == 0 && S_ISREG(st.st_mode)) {
+        if (sidecar_path && sidecar_path_size > 0 && strlen(src) < sidecar_path_size)
+            strmemccpy_local(sidecar_path, src, sidecar_path_size);
+        if (out_has_sidecar) *out_has_sidecar = true;
         return (uint32_t) st.st_mtime;
+    }
     if (info->path[0] && stat(info->path, &st) == 0 && S_ISREG(st.st_mode)) return (uint32_t) st.st_mtime;
     return 0;
+}
+
+uint32_t albumart_source_mtime(const albumart_info_t * info) {
+    return albumart_source_mtime_with_path(info, NULL, 0, NULL);
 }
 
 static bool bmp_source_mtime(const char * path, int expected_width, int expected_height,
@@ -435,7 +475,19 @@ uint64_t albumart_debug_thumbnail_key(const albumart_info_t * info) {
     return albumart_thumbnail_key(info);
 }
 
-bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int height, char * found, size_t found_size) {
+uint64_t albumart_artist_thumbnail_key(const char * artist) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    const unsigned char * p = (const unsigned char *) (artist ? artist : "");
+    do {
+        unsigned char c = *p;
+        if (c >= 'A' && c <= 'Z') c = (unsigned char) (c + ('a' - 'A'));
+        hash = (hash ^ c) * UINT64_C(1099511628211);
+    } while (*p++);
+    return hash;
+}
+
+bool albumart_sized_thumb_fresh_with_source_mtime(const albumart_info_t * info, int width, int height,
+                                                   uint32_t source_mtime, char * found, size_t found_size) {
     if (!info || !found || width <= 0 || height <= 0) return false;
     char size_string[24];
     snprintf(size_string, sizeof(size_string), ".%dx%d", width, height);
@@ -447,9 +499,13 @@ bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int hei
      * a valid replacement after this function opened the old inode, and an
      * unlink at this point would delete that fresh file. */
     if (!bmp_source_mtime(found, width, height, &stored)) return false;
-    uint32_t src = source_mtime_of(info);
-    if (stored != 0 && src != 0 && stored != src) return false;
+    if (stored != 0 && source_mtime != 0 && stored != source_mtime) return false;
     return true;
+}
+
+bool albumart_sized_thumb_fresh(const albumart_info_t * info, int width, int height, char * found, size_t found_size) {
+    return info && albumart_sized_thumb_fresh_with_source_mtime(info, width, height,
+                    albumart_source_mtime(info), found, found_size);
 }
 
 static bool generated_cache_file(const char * dir, const albumart_info_t * info, int width, int height,
@@ -477,25 +533,16 @@ bool albumart_generated_cache_fresh(const albumart_info_t * info, int width, int
 
     uint32_t stored = 0;
     if (!bmp_source_mtime(path, width, height, &stored)) return false;
-    uint32_t src = source_mtime_of(info);
+    uint32_t src = albumart_source_mtime(info);
     if (stored != 0 && src != 0 && stored != src) return false;
     strmemccpy_local(found, path, found_size);
     return found[0] != '\0';
 }
 
-bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, const uint16_t * pixels) {
-    if (!info || !pixels || width <= 0 || height <= 0) return false;
-    const char * artist = info->albumartist[0] ? info->albumartist : info->artist;
-    if (!artist[0] || !info->album[0]) return false;
-
-    mkdir(SD_COMPAS_ROOT, 0755);
-    mkdir(ALBUMART_DIR, 0755);
-
-    char path[PATH_MAX], tmp[PATH_MAX + 16];
-    int pathlen = snprintf(path, sizeof(path), "%s/v3-%016llx.%dx%d.bmp", ALBUMART_DIR,
-                           (unsigned long long) albumart_thumbnail_key(info), width, height);
-    if (pathlen < 0 || (size_t) pathlen >= sizeof(path)) return false;
-    fix_path_part(path, (int) strlen(ALBUMART_DIR) + 1, PATH_MAX);
+static bool store_rgb565_file(const char * path, const char * dir, uint32_t src_mtime,
+                              int width, int height, const uint16_t * pixels) {
+    if (!path || !dir || !pixels || width <= 0 || height <= 0) return false;
+    char tmp[PATH_MAX + 16];
     if (snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path) >= (int) sizeof(tmp)) return false;
 
     int row_bytes = width * 3;
@@ -503,8 +550,6 @@ bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, 
     int stride = row_bytes + pad;
     uint32_t pixel_bytes = (uint32_t) stride * (uint32_t) height;
     uint32_t file_size = 14 + 40 + pixel_bytes;
-    uint32_t src_mtime = source_mtime_of(info);
-
     int fd = mkstemp(tmp);
     if (fd < 0) return false;
     FILE * f = fdopen(fd, "wb");
@@ -558,9 +603,176 @@ bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, 
     if (ok && fsync(fileno(f)) != 0) ok = false;
     if (fclose(f) != 0) ok = false;
     if (ok && rename(tmp, path) != 0) ok = false;
+    if (ok) (void) library_fsync_dir(dir);
+    if (!ok) unlink(tmp);
+    return ok;
+}
+
+bool albumart_store_rgb565(const albumart_info_t * info, int width, int height, const uint16_t * pixels) {
+    if (!info || !pixels || width <= 0 || height <= 0) return false;
+    const char * artist = info->albumartist[0] ? info->albumartist : info->artist;
+    if (!artist[0] || !info->album[0]) return false;
+
+    mkdir(SD_COMPAS_ROOT, 0755);
+    mkdir(ALBUMART_DIR, 0755);
+    char path[PATH_MAX];
+    int pathlen = snprintf(path, sizeof(path), "%s/v3-%016llx.%dx%d.bmp", ALBUMART_DIR,
+                           (unsigned long long) albumart_thumbnail_key(info), width, height);
+    if (pathlen < 0 || (size_t) pathlen >= sizeof(path)) return false;
+    fix_path_part(path, (int) strlen(ALBUMART_DIR) + 1, PATH_MAX);
+    return store_rgb565_file(path, ALBUMART_DIR, albumart_source_mtime(info), width, height, pixels);
+}
+
+static bool artist_thumbnail_path(const char * artist, int width, int height,
+                                  const char * suffix, char * path, size_t path_size) {
+    if (!artist || !artist[0] || width <= 0 || height <= 0 || !suffix || !path || path_size == 0) return false;
+    int n = snprintf(path, path_size, "%s/artist-v1-%016llx.%dx%d.%s", ALBUMART_DIR,
+                     (unsigned long long) albumart_artist_thumbnail_key(artist), width, height, suffix);
+    return n > 0 && (size_t) n < path_size;
+}
+
+static bool artist_alias_path(const char * artist, unsigned int scope, char * path, size_t path_size) {
+    if (!artist || !artist[0] || !path || path_size == 0) return false;
+    int n = snprintf(path, path_size, "%s/artist-v1-%016llx-%u.album", ALBUMART_DIR,
+                     (unsigned long long) albumart_artist_thumbnail_key(artist), scope);
+    return n > 0 && (size_t) n < path_size;
+}
+
+bool albumart_artist_sized_thumb_fresh(const char * artist, uint32_t source_mtime,
+                                       int width, int height, char * found, size_t found_size) {
+    if (!found || found_size == 0) return false;
+    char path[PATH_MAX];
+    if (!artist_thumbnail_path(artist, width, height, "bmp", path, sizeof(path)) ||
+        strlen(path) >= found_size)
+        return false;
+    uint32_t stored = 0;
+    if (!bmp_source_mtime(path, width, height, &stored)) return false;
+    if (stored != 0 && source_mtime != 0 && stored != source_mtime) return false;
+    strmemccpy_local(found, path, found_size);
+    return found[0] != '\0';
+}
+
+bool albumart_artist_store_rgb565(const char * artist, uint32_t source_mtime,
+                                  int width, int height, const uint16_t * pixels) {
+    if (!artist || !artist[0] || !pixels || width <= 0 || height <= 0) return false;
+    mkdir(SD_COMPAS_ROOT, 0755);
+    mkdir(ALBUMART_DIR, 0755);
+    char path[PATH_MAX];
+    if (!artist_thumbnail_path(artist, width, height, "bmp", path, sizeof(path))) return false;
+    return store_rgb565_file(path, ALBUMART_DIR, source_mtime, width, height, pixels);
+}
+
+bool albumart_artist_negative_fresh(const char * artist, uint64_t source_signature) {
+    char path[PATH_MAX];
+    if (!artist_thumbnail_path(artist, ALBUMART_THUMBNAIL_SIZE, ALBUMART_THUMBNAIL_SIZE,
+                               "noart", path, sizeof(path))) return false;
+    FILE * f = fopen(path, "rb");
+    if (!f) return false;
+    unsigned char bytes[8];
+    bool ok = fread(bytes, 1, sizeof(bytes), f) == sizeof(bytes) && fgetc(f) == EOF;
+    fclose(f);
+    if (!ok) return false;
+    uint64_t stored = 0;
+    for (int i = 0; i < 8; i++) stored |= (uint64_t) bytes[i] << (i * 8);
+    return stored == source_signature;
+}
+
+bool albumart_artist_negative_exists(const char * artist) {
+    char path[PATH_MAX];
+    struct stat st;
+    return artist_thumbnail_path(artist, ALBUMART_THUMBNAIL_SIZE, ALBUMART_THUMBNAIL_SIZE,
+                                 "noart", path, sizeof(path)) &&
+           stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+bool albumart_artist_store_negative(const char * artist, uint64_t source_signature) {
+    if (!artist || !artist[0]) return false;
+    mkdir(SD_COMPAS_ROOT, 0755);
+    mkdir(ALBUMART_DIR, 0755);
+    char path[PATH_MAX], tmp[PATH_MAX + 16];
+    if (!artist_thumbnail_path(artist, ALBUMART_THUMBNAIL_SIZE, ALBUMART_THUMBNAIL_SIZE,
+                               "noart", path, sizeof(path)) ||
+        snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path) >= (int) sizeof(tmp))
+        return false;
+    int fd = mkstemp(tmp);
+    if (fd < 0) return false;
+    unsigned char bytes[8];
+    for (int i = 0; i < 8; i++) bytes[i] = (unsigned char) (source_signature >> (i * 8));
+    size_t written = 0;
+    bool ok = true;
+    while (written < sizeof(bytes)) {
+        ssize_t n = write(fd, bytes + written, sizeof(bytes) - written);
+        if (n <= 0) {
+            ok = false;
+            break;
+        }
+        written += (size_t) n;
+    }
+    if (ok && fsync(fd) != 0) ok = false;
+    if (close(fd) != 0) ok = false;
+    if (ok && rename(tmp, path) != 0) ok = false;
     if (ok) (void) library_fsync_dir(ALBUMART_DIR);
     if (!ok) unlink(tmp);
     return ok;
+}
+
+bool albumart_artist_alias_load(const char * artist, unsigned int scope, uint64_t * album_key,
+                                int64_t * representative_song_id) {
+    if (!album_key || !representative_song_id) return false;
+    char path[PATH_MAX];
+    if (!artist_alias_path(artist, scope, path, sizeof(path))) return false;
+    FILE * f = fopen(path, "rb");
+    if (!f) return false;
+    unsigned char bytes[24];
+    bool ok = fread(bytes, 1, sizeof(bytes), f) == sizeof(bytes) && fgetc(f) == EOF;
+    fclose(f);
+    if (!ok || memcmp(bytes, "AALIAS1\0", 8) != 0) return false;
+    uint64_t key = 0, song_id = 0;
+    for (int i = 0; i < 8; i++) {
+        key |= (uint64_t) bytes[8 + i] << (i * 8);
+        song_id |= (uint64_t) bytes[16 + i] << (i * 8);
+    }
+    if (key == 0 || song_id == 0 || song_id > INT64_MAX) return false;
+    *album_key = key;
+    *representative_song_id = (int64_t) song_id;
+    return true;
+}
+
+bool albumart_artist_alias_store(const char * artist, unsigned int scope, uint64_t album_key,
+                                 int64_t representative_song_id) {
+    if (!artist || !artist[0] || album_key == 0 || representative_song_id <= 0) return false;
+    mkdir(SD_COMPAS_ROOT, 0755);
+    mkdir(ALBUMART_DIR, 0755);
+    char path[PATH_MAX], tmp[PATH_MAX + 16];
+    if (!artist_alias_path(artist, scope, path, sizeof(path)) ||
+        snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path) >= (int) sizeof(tmp))
+        return false;
+    int fd = mkstemp(tmp);
+    if (fd < 0) return false;
+    unsigned char bytes[24] = { 'A', 'A', 'L', 'I', 'A', 'S', '1', 0 };
+    uint64_t song_id = (uint64_t) representative_song_id;
+    for (int i = 0; i < 8; i++) {
+        bytes[8 + i] = (unsigned char) (album_key >> (i * 8));
+        bytes[16 + i] = (unsigned char) (song_id >> (i * 8));
+    }
+    size_t written = 0;
+    bool ok = true;
+    while (written < sizeof(bytes)) {
+        ssize_t n = write(fd, bytes + written, sizeof(bytes) - written);
+        if (n <= 0) { ok = false; break; }
+        written += (size_t) n;
+    }
+    if (ok && fsync(fd) != 0) ok = false;
+    if (close(fd) != 0) ok = false;
+    if (ok && rename(tmp, path) != 0) ok = false;
+    if (ok) (void) library_fsync_dir(ALBUMART_DIR);
+    if (!ok) unlink(tmp);
+    return ok;
+}
+
+void albumart_artist_alias_remove(const char * artist, unsigned int scope) {
+    char path[PATH_MAX];
+    if (artist_alias_path(artist, scope, path, sizeof(path))) unlink(path);
 }
 
 albumart_load_result_t albumart_load_file_ex(const char * path, uint8_t ** out_data,

@@ -3381,6 +3381,18 @@ static void release_thumbnail_dsc(const lv_image_dsc_t * dsc) {
     if (album_thumbnail_active_list) refresh_thumbnail_list_visible(album_thumbnail_active_list);
 }
 
+/* The five rebuildable library lists die with their screens. Clear every
+ * pointer to them right after the delete: the rebuild below constructs them
+ * one at a time, and build_albums_screen()'s thumbnail cache clear walks all
+ * cover lists, which reached the not-yet-rebuilt (freed) Album Artists and
+ * Recently Added lists and crashed on device after a library update. */
+static void forget_deleted_library_lists(void) {
+    lv_obj_t * dead[] = { all_songs_list, artists_list, albums_list, album_artist_list, recently_added_list };
+    for (size_t i = 0; i < sizeof(dead) / sizeof(dead[0]); i++)
+        if (dead[i] && album_thumbnail_active_list == dead[i]) album_thumbnail_active_list = NULL;
+    all_songs_list = artists_list = albums_list = album_artist_list = recently_added_list = NULL;
+}
+
 static void refresh_all_thumbnail_lists(void) {
     lv_obj_t * lists[] = { albums_list, artist_albums_list, artists_list, album_artist_list,
                            all_songs_list, recently_added_list, files_search_list };
@@ -5476,6 +5488,7 @@ static void refresh_library_screens_after_reload(void) {
     lv_obj_delete(albums_screen);
     lv_obj_delete(album_artist_screen);
     lv_obj_delete(recently_added_screen);
+    forget_deleted_library_lists();
     /* Each build_*_screen() below activates its own paged provider against
      * the current (fresh, post-reload) library internally -- no separate
      * populate step needed here, and no whole-library load either: drill-

@@ -569,7 +569,10 @@ typedef void (*compact_list_row_decorator_cb_t)(lv_obj_t * list, lv_obj_t * row,
 void compact_list_set_row_decorator(lv_obj_t * list, compact_list_row_decorator_cb_t cb, void * ctx);
 /* Clears every leading image currently showing `src` (pointer compare only,
  * no decorator run). For owners about to free a borrowed image descriptor. */
-void compact_list_detach_image_src(lv_obj_t * list, const void * src);
+/* Returns true when at least one row image was using src. */
+bool compact_list_detach_image_src(lv_obj_t * list, const void * src);
+/* True when a row currently in the list's recycled pool shows this artwork key. */
+bool compact_list_shows_artwork_key(lv_obj_t * list, uint64_t key);
 /* Makes each visible trailing_asset a separate tappable accessory. The
  * callback receives the row's current logical index, including after the
  * virtual row has been recycled during scrolling. NULL disables it. */

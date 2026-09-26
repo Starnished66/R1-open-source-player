@@ -386,6 +386,15 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
     return true;
 }
 
+void gui_lock_screen_refresh_cover(void) {
+    if (!gui_lock_screen_is_showing() || current_mode != LOCK_SCREEN_MODE_ALBUM_ART || !lock_image_obj)
+        return;
+    const lv_image_dsc_t * cover = gui_player_get_current_cover_dsc();
+    if (cover && cover->data) lv_image_set_src(lock_image_obj, cover);
+    else lv_image_set_src(lock_image_obj, asset_path("playing_plane/default_cover_565.png"));
+    lv_obj_update_layout(lock_image_obj);
+}
+
 void gui_lock_screen_init(void) {
     lock_screen = NULL;
     lock_image_obj = NULL;

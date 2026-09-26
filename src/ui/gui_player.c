@@ -60,6 +60,7 @@ static bool is_sd_card_path(const char *path);
 #include "gui_track_info.h"
 #include "gui_settings.h"
 #include "gui_subsonic.h"
+#include "gui_lock_screen.h"
 #include "fallback_font.h"
 #include "http_client.h"
 #include "screen_builders.h"
@@ -628,6 +629,11 @@ void gui_player_refresh_frosted_background(void) {
  * to the image widgets once ready. */
 typedef struct {
     int for_index;
+    unsigned int generation;
+    /* Skip the generated-cache fast path and the negative cache: set for the
+     * re-read after a cover reload, whose tag-derived key may name a cache
+     * file the reload did not delete. */
+    bool force_source;
     uint8_t * picture_data; /* owned download buffer for streamed artwork */
     uint32_t picture_size;
 
@@ -670,6 +676,7 @@ static atomic_bool cover_decode_done_flag = false;
  * thread only reads after seeing the flag" contract as every other _done_
  * flag in this file. */
 static int cover_decode_result_for_index;
+static unsigned int cover_decode_result_generation;
 static audio_current_format_info_t cover_decode_result_format;
 /* UI-thread cache, keyed by path rather than a mutable playlist index. */
 static audio_current_format_info_t player_cached_format;
@@ -707,6 +714,13 @@ static void cover_decode_request_snapshot_frost(cover_decode_request_t * req) {
  * stuck showing an earlier track's art). */
 static bool cover_decode_pending_valid = false;
 static cover_decode_request_t cover_decode_pending;
+static atomic_uint cover_decode_generation;
+static atomic_bool cover_reload_active;
+/* True while a cover decode worker body runs (it may write generated cache
+ * files); a cover reload waits for this off the UI thread before deleting. */
+static atomic_bool cover_decode_running;
+static bool last_local_cover_request_valid;
+static cover_decode_request_t last_local_cover_request;
 
 /* Bound reads even if a generated cache file was replaced or corrupted.
  * The expected 480x480 BMP occupies 691254 bytes. */
@@ -733,13 +747,20 @@ void albumart_info_from_song_row(const song_row_t * song, albumart_info_t * info
  * would silently re-run on every single play of that track -- exactly the
  * per-play cost this feature exists to eliminate. Small, bounded, path-hash
  * keyed (FNV-1a, same convention already used for cache filenames
- * elsewhere in this codebase); cleared only by an app restart, which is
- * fine since art appearing for an already-negative track mid-session (the
- * user edited its tags while it happened to be playing) is rare enough to
- * not warrant mtime tracking here. */
+ * elsewhere in this codebase); cleared by an app restart and after every
+ * library publication, so a database update or metadata refresh retries
+ * art added mid-session without per-play mtime tracking. */
 #define PLAYER_COVER_NEGATIVE_CACHE_SIZE 32
 static uint64_t player_cover_negative_cache[PLAYER_COVER_NEGATIVE_CACHE_SIZE];
 static int player_cover_negative_cache_next = 0;
+/* Bumped by any library publication; the decode worker, the table's only
+ * user, empties it on seeing a new value so refreshed art is retried. */
+static atomic_uint player_cover_negative_epoch;
+static unsigned player_cover_negative_seen_epoch;
+
+void gui_player_invalidate_cover_negatives(void) {
+    atomic_fetch_add_explicit(&player_cover_negative_epoch, 1u, memory_order_relaxed);
+}
 
 static uint64_t player_cover_path_hash(const char * path) {
     uint64_t hash = UINT64_C(14695981039346656037);
@@ -748,7 +769,18 @@ static uint64_t player_cover_path_hash(const char * path) {
     return hash;
 }
 
+static bool player_cover_decode_cancelled(void * user_data) {
+    unsigned int generation = (unsigned int) (uintptr_t) user_data;
+    return atomic_load_explicit(&cover_decode_generation, memory_order_relaxed) != generation;
+}
+
 static bool player_cover_negative_cache_hit(const char * path) {
+    unsigned epoch = atomic_load_explicit(&player_cover_negative_epoch, memory_order_relaxed);
+    if (epoch != player_cover_negative_seen_epoch) {
+        memset(player_cover_negative_cache, 0, sizeof(player_cover_negative_cache));
+        player_cover_negative_cache_next = 0;
+        player_cover_negative_seen_epoch = epoch;
+    }
     uint64_t h = player_cover_path_hash(path);
     for (int i = 0; i < PLAYER_COVER_NEGATIVE_CACHE_SIZE; i++)
         if (player_cover_negative_cache[i] == h) return true;
@@ -764,28 +796,44 @@ static void player_cover_negative_cache_add(const char * path) {
  * embedded/sidecar image directly here: cache generation owns that
  * expensive work -- normally the background warmer, or, for a track it
  * hasn't reached yet, the one-time-per-session fallback below. */
+/* The generated player-size cache for these tags. require_fresh compares its
+ * stored source mtime with this track's; a reload's fallback skips that, as
+ * the file was just rebuilt, possibly from a sibling track with another mtime. */
+static bool load_generated_player_cover(const albumart_info_t * info, const char * track_path,
+                                        unsigned int generation, bool require_fresh,
+                                        uint16_t ** out_pixels) {
+    char found[PATH_MAX];
+    bool have = require_fresh
+        ? albumart_generated_cache_fresh(info, ALBUMART_PLAYER_CACHE_SIZE, ALBUMART_PLAYER_CACHE_SIZE,
+                                         found, sizeof(found))
+        : albumart_generated_cache_find(info, ALBUMART_PLAYER_CACHE_SIZE, ALBUMART_PLAYER_CACHE_SIZE,
+                                        found, sizeof(found));
+    if (!have) return false;
+    uint8_t * data = NULL;
+    uint32_t size = 0;
+    if (albumart_load_file_ex(found, &data, &size, EXTERNAL_COVER_MAX_BYTES,
+                              ARTWORK_PRIO_PLAYER) != ALBUMART_LOAD_OK)
+        return false;
+    cover_decode_result_t result = cover_decode_to_rgb565_ex(data, size,
+        COVER_ART_WIDTH, COVER_ART_HEIGHT, ARTWORK_PRIO_PLAYER,
+        player_cover_decode_cancelled, (void *) (uintptr_t) generation, out_pixels);
+    free(data);
+    if (result != COVER_DECODE_OK) return false;
+    DB_LOG("ART_PLAYER", "cache_hit path=%s file=%s", track_path, found);
+    return true;
+}
+
 static bool load_cached_player_cover(const char * track_path, const char * artist, const char * album,
-                                      const char * album_artist, uint16_t ** out_pixels) {
+                                      const char * album_artist, unsigned int generation,
+                                      bool force_source, uint16_t ** out_pixels) {
+    if (player_cover_decode_cancelled((void *) (uintptr_t) generation)) return false;
     albumart_info_t info;
     albumart_info_from_path_tags(track_path, artist, album, album_artist, &info);
-    char found[PATH_MAX];
-    if (albumart_generated_cache_fresh(&info, ALBUMART_PLAYER_CACHE_SIZE,
-                                  ALBUMART_PLAYER_CACHE_SIZE, found, sizeof(found))) {
-        uint8_t * data = NULL;
-        uint32_t size = 0;
-        if (albumart_load_file_ex(found, &data, &size, EXTERNAL_COVER_MAX_BYTES,
-                                 ARTWORK_PRIO_PLAYER) == ALBUMART_LOAD_OK) {
-            cover_decode_result_t result = cover_decode_to_rgb565_ex(data, size,
-                COVER_ART_WIDTH, COVER_ART_HEIGHT, ARTWORK_PRIO_PLAYER, NULL, NULL, out_pixels);
-            free(data);
-            if (result == COVER_DECODE_OK) {
-                DB_LOG("ART_PLAYER", "cache_hit path=%s file=%s", track_path, found);
-                return true;
-            }
-        }
-    }
+    if (!force_source && load_generated_player_cover(&info, track_path, generation, true, out_pixels))
+        return true;
 
-    if (player_cover_negative_cache_hit(track_path)) {
+    if (player_cover_decode_cancelled((void *) (uintptr_t) generation)) return false;
+    if (!force_source && player_cover_negative_cache_hit(track_path)) {
         DB_LOG("ART_PLAYER", "no_art_known path=%s", track_path);
         return false;
     }
@@ -796,10 +844,17 @@ static bool load_cached_player_cover(const char * track_path, const char * artis
      * fast path above. */
     bool no_art_confirmed = false;
     if (gui_library_generate_player_cover(track_path, artist, album, album_artist,
-                                          NULL, NULL, out_pixels, &no_art_confirmed)) {
+                                          player_cover_decode_cancelled,
+                                          (void *) (uintptr_t) generation,
+                                          out_pixels, &no_art_confirmed)) {
         DB_LOG("ART_PLAYER", "cache_miss_generated path=%s", track_path);
         return true;
     }
+    if (player_cover_decode_cancelled((void *) (uintptr_t) generation)) return false;
+    /* A forced re-read prefers the track's own art, but a track without any
+     * may still have album art the warmer rebuilt from a sibling track. */
+    if (force_source && load_generated_player_cover(&info, track_path, generation, false, out_pixels))
+        return true;
     /* Only remember a confirmed "no art anywhere" result -- a transient one
      * (coordinator busy, isolated-helper fork/timeout) must retry on the
      * next play, not get silently and permanently suppressed. */
@@ -868,7 +923,13 @@ static void * cover_decode_thread_func(void * arg) {
         req->picture_data = NULL;
     } else if (req->local_track_path[0]) {
         ok = load_cached_player_cover(req->local_track_path, req->artist, req->album,
-                                       req->album_artist, &pixels);
+                                       req->album_artist, req->generation, req->force_source, &pixels);
+    }
+
+    if (player_cover_decode_cancelled((void *) (uintptr_t) req->generation)) {
+        free(pixels);
+        pixels = NULL;
+        ok = false;
     }
 
     uint8_t * reflection = NULL;
@@ -881,6 +942,7 @@ static void * cover_decode_thread_func(void * arg) {
     }
 
     cover_decode_result_for_index = req->for_index;
+    cover_decode_result_generation = req->generation;
     cover_decode_result_ok = ok;
     cover_decode_result_pixels = pixels;
     cover_decode_result_reflection = reflection;
@@ -892,6 +954,7 @@ static void * cover_decode_thread_func(void * arg) {
     cover_decode_result_darken_num = req->darken_num;
     cover_decode_result_darken_den = req->darken_den;
     free(req);
+    atomic_store_explicit(&cover_decode_running, false, memory_order_release);
     atomic_store_explicit(&cover_decode_done_flag, true, memory_order_release); /* written last -- poll_cover_decode() only checks this flag */
     return NULL;
 }
@@ -907,6 +970,22 @@ static void * cover_decode_thread_func(void * arg) {
  * decodes the first and the final one, which is exactly the set of results
  * that matters. */
 static void launch_cover_decode_req(cover_decode_request_t r) {
+    if (r.generation == 0)
+        r.generation = atomic_fetch_add_explicit(&cover_decode_generation, 1u,
+                                                  memory_order_relaxed) + 1u;
+    if (r.local_track_path[0]) {
+        last_local_cover_request = r;
+        last_local_cover_request_valid = true;
+    } else if (r.stream_url[0]) {
+        last_local_cover_request_valid = false;
+    }
+
+    if (atomic_load_explicit(&cover_reload_active, memory_order_relaxed)) {
+        free(cover_decode_pending.picture_data);
+        cover_decode_pending = r;
+        cover_decode_pending_valid = true;
+        return;
+    }
     if (cover_decode_active) {
         free(cover_decode_pending.picture_data);
         cover_decode_pending = r;
@@ -924,17 +1003,22 @@ static void launch_cover_decode_req(cover_decode_request_t r) {
     *req = r;
     atomic_store_explicit(&cover_decode_done_flag, false, memory_order_relaxed);
     cover_decode_active = true;
+    /* Marked before the thread exists, so a reload worker can never see
+     * "idle" while a created-but-unscheduled decode is about to run. */
+    atomic_store_explicit(&cover_decode_running, true, memory_order_release);
     if (pthread_create(&cover_decode_thread, NULL, cover_decode_thread_func, req) != 0) {
         free(req->picture_data);
         free(req);
         cover_decode_active = false;
+        atomic_store_explicit(&cover_decode_running, false, memory_order_release);
     }
 }
 
 
 static void launch_cover_decode_from_track(int for_index, const char * track_path, const char * artist,
                                             const char * album, const char * album_artist) {
-    cover_decode_request_t r = { .for_index = for_index, .picture_data = NULL, .picture_size = 0,
+    cover_decode_request_t r = { .for_index = for_index, .generation = 0,
+                                  .picture_data = NULL, .picture_size = 0,
                                   .stream_url = "", .stream_verify_tls = false };
     snprintf(r.local_track_path, sizeof(r.local_track_path), "%s", track_path ? track_path : "");
     snprintf(r.artist, sizeof(r.artist), "%s", artist ? artist : "");
@@ -950,7 +1034,8 @@ static void launch_cover_decode_from_track(int for_index, const char * track_pat
  * bytes, so a slow/flaky connection can't block the UI here either, same
  * reasoning as launch_cover_decode_from_track() itself. */
 static void launch_cover_decode_from_url(int for_index, const char * url, bool verify_tls) {
-    cover_decode_request_t r = { .for_index = for_index, .picture_data = NULL, .picture_size = 0,
+    cover_decode_request_t r = { .for_index = for_index, .generation = 0,
+                                  .picture_data = NULL, .picture_size = 0,
                                   .stream_verify_tls = verify_tls };
     snprintf(r.stream_url, sizeof(r.stream_url), "%s", url);
     cover_decode_request_snapshot_frost(&r);
@@ -991,13 +1076,16 @@ void poll_cover_decode(void) {
     cover_decode_active = false;
     pthread_join(cover_decode_thread, NULL);
 
-    if (cover_decode_result_format.valid &&
+    bool result_generation_current = cover_decode_result_generation ==
+        atomic_load_explicit(&cover_decode_generation, memory_order_relaxed);
+
+    if (result_generation_current && cover_decode_result_format.valid &&
         strcmp(cover_decode_result_format.path, playlist_path_at(playlist_index)) == 0) {
         player_cached_format = cover_decode_result_format;
         refresh_format_badge();
     }
 
-    if (cover_decode_result_for_index != playlist_index) {
+    if (!result_generation_current || cover_decode_result_for_index != playlist_index) {
         free(cover_decode_result_pixels);
         free(cover_decode_result_reflection);
     } else if (!cover_decode_result_ok) {
@@ -1044,6 +1132,7 @@ void poll_cover_decode(void) {
             free(old_reflection_bytes);
         }
         free(old_cover_bytes);
+        gui_lock_screen_refresh_cover();
         player_transition_mark_dirty(); /* cover_img just changed to the placeholder -- see the cache's own doc comment */
     } else {
         free(current_cover_bytes);
@@ -1065,6 +1154,7 @@ void poll_cover_decode(void) {
         lv_image_set_src(cover_img, &current_cover_dsc);
         fit_cover_img_to_card();
         gui_shell_refresh_quick_drawer_cover();
+        gui_lock_screen_refresh_cover();
 
         /* The reflection this decode computed was built from frost params
          * snapshotted when the decode was LAUNCHED. If a plugin changed
@@ -1149,6 +1239,68 @@ void poll_cover_decode(void) {
          * change occurs while the handed-off decode thread is running. */
         cover_decode_pending.picture_data = NULL;
         cover_decode_pending.picture_size = 0;
+    }
+}
+
+void gui_player_begin_cover_reload(void) {
+    /* New decodes are held (launch_cover_decode_req() parks them in
+     * cover_decode_pending) until gui_player_finish_cover_reload(). One
+     * already running, local or streamed, finishes normally: the reload
+     * worker waits for gui_player_cover_decode_idle() before deleting any
+     * file, so it cannot write an old cover back afterwards, and the UI
+     * thread never blocks on an isolated extraction here. */
+    atomic_store_explicit(&cover_reload_active, true, memory_order_relaxed);
+}
+
+bool gui_player_cover_decode_idle(void) {
+    return !atomic_load_explicit(&cover_decode_running, memory_order_acquire);
+}
+
+void gui_player_finish_cover_reload(void) {
+    atomic_store_explicit(&cover_reload_active, false, memory_order_relaxed);
+    /* Re-read the playing track's cover whatever album was reloaded: the
+     * player's tag-derived key can differ from the library's, and one cached
+     * read is cheap. The result replaces (and frees) the old cover; a pending
+     * request for a newer track wins instead. */
+    cover_decode_request_t req;
+    if (cover_decode_pending_valid) {
+        req = cover_decode_pending;
+    } else if (last_local_cover_request_valid && last_local_cover_request.for_index == playlist_index &&
+               strcmp(last_local_cover_request.local_track_path, playlist_path_at(playlist_index)) == 0) {
+        req = last_local_cover_request;
+        req.picture_data = NULL;
+        req.picture_size = 0;
+        cover_decode_request_snapshot_frost(&req);
+    } else {
+        return;
+    }
+    if (req.local_track_path[0]) {
+        /* Held or current local track alike: the cache it would hit may
+         * predate the reload, so read the track's own art first and fall
+         * back to the rebuilt album cover. Use the library's current tags: a
+         * metadata refresh may have renamed the album since playback
+         * started, and the reload rebuilt the cache under the new identity. */
+        req.force_source = true;
+        song_row_t row;
+        if (metadata_db_get_song_by_path(req.local_track_path, &row)) {
+            snprintf(req.artist, sizeof(req.artist), "%s", row.tags.artist);
+            snprintf(req.album, sizeof(req.album), "%s", row.tags.album);
+            snprintf(req.album_artist, sizeof(req.album_artist), "%s", row.tags.album_artist);
+        }
+    }
+    memset(&cover_decode_pending, 0, sizeof(cover_decode_pending));
+    cover_decode_pending_valid = false;
+    req.generation = 0;
+    launch_cover_decode_req(req);
+}
+
+void gui_player_cancel_cover_reload(void) {
+    atomic_store_explicit(&cover_reload_active, false, memory_order_relaxed);
+    atomic_fetch_add_explicit(&cover_decode_generation, 1u, memory_order_relaxed);
+    if (cover_decode_pending_valid) {
+        free(cover_decode_pending.picture_data);
+        memset(&cover_decode_pending, 0, sizeof(cover_decode_pending));
+        cover_decode_pending_valid = false;
     }
 }
 
@@ -4288,7 +4440,14 @@ void gui_player_cancel_background_work(void) {
     if (cover_decode_active) {
         pthread_join(cover_decode_thread, NULL);
         cover_decode_active = false;
+        free(cover_decode_result_pixels);
+        free(cover_decode_result_reflection);
+        cover_decode_result_pixels = NULL;
+        cover_decode_result_reflection = NULL;
+        atomic_store_explicit(&cover_decode_done_flag, false, memory_order_relaxed);
     }
+    if (atomic_load_explicit(&cover_reload_active, memory_order_relaxed))
+        gui_player_cancel_cover_reload();
 }
 
 const char * playlist_path_at(int index) {

@@ -3,10 +3,16 @@ Runtime path: /usr/resource/litegui/theme2/submenu/
 Icons 44x44 RGBA, from Phosphor Icons @2.1.1 (MIT).
 Sources: folder-open, user, vinyl-record, user-square, music-notes-simple,
 playlist, cloud-arrow-down, usb, bluetooth, book-open, bookmark-simple,
-arrows-clockwise.
+arrows-clockwise, database, tag, images-square.
 SVG gradients follow the Settings/Wireless gold/cyan/mint/silver/purple/coral
 palette. Rendered via ffmpeg librsvg and Lanczos size export.
 update_database.png uses the regular arrows-clockwise glyph from
 @phosphor-icons/core 2.1.1 (assets/regular/arrows-clockwise.svg), MIT.
+music_database.png (gold) and refresh_metadata.png (coral) use the regular
+database and tag glyphs from the same package, vertical gradient, rendered at
+176px and Lanczos-scaled to 44px.
+refresh_covers.png (purple) uses the regular images-square glyph from
+@phosphor-icons/core 2.1.1 (assets/regular/images-square.svg), vertical
+gradient, rendered at 176px and Lanczos-scaled to 44px.
 Saved backgrounds reuse the generated Settings and Wireless gradients.
 Rows retain decoded images for their lifetime. No runtime gradient generation.

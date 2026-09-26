@@ -465,6 +465,7 @@ void replaygain_mode_settings_row_cb(lv_event_t * e);
 void font_size_settings_row_cb(lv_event_t * e);
 void usb_mode_settings_row_cb(lv_event_t * e);
 void update_music_database_row_cb(lv_event_t * e);
+void refresh_all_metadata_row_cb(lv_event_t * e);
 void firmware_update_row_cb(lv_event_t * e);
 void bt_dac_settings_row_cb(lv_event_t * e);
 void register_swipe_dead_zone(lv_obj_t * obj);

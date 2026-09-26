@@ -98,6 +98,22 @@ bool albumart_artist_alias_store(const char * artist, unsigned int scope, uint64
                                  int64_t representative_song_id);
 void albumart_artist_alias_remove(const char * artist, unsigned int scope);
 
+/* Remove only generated files under the application's album-art cache
+ * directories, never following symlinks. Album removal also clears the
+ * artist cache families of the given artist keys (albumart_artist_thumbnail_key
+ * of each artist on the album), of the info's own artists, and of every
+ * artist whose saved alias points at this album. */
+bool albumart_delete_generated_cache_for_album(const albumart_info_t * info,
+                                               const uint64_t * artist_keys, size_t artist_key_count);
+bool albumart_delete_all_generated_caches(void);
+/* True only for an app-generated cover file inside the cache directories:
+ * the only kind of file artwork code may unlink after a bad read. */
+bool albumart_is_generated_cache_file(const char * path);
+/* The generated cache file for these tags and size, without the source
+ * freshness check (for a file the caller knows was just rebuilt). */
+bool albumart_generated_cache_find(const albumart_info_t * info, int width, int height,
+                                   char * found, size_t found_size);
+
 typedef enum {
     ALBUMART_LOAD_OK,
     ALBUMART_LOAD_INVALID,

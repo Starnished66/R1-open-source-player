@@ -54,6 +54,7 @@ static lv_obj_t * music_playback_screen;
 static lv_obj_t * music_audio_screen;
 static lv_obj_t * music_controls_screen;
 static lv_obj_t * music_timers_screen;
+static lv_obj_t * music_database_screen;
 static lv_obj_t * music_library_screen;
 static lv_obj_t * settings_display_screen;
 static lv_obj_t * settings_power_screen;
@@ -103,6 +104,8 @@ extern const lv_font_t * gui_theme_font(gui_font_role_t role);
 extern void reserve_title_width_before(lv_obj_t * title, lv_obj_t * right_icon);
 extern void generic_back_cb(lv_event_t * e);
 extern void start_library_rescan(void);
+extern void show_library_refresh_all_metadata_prompt(void);
+extern void show_library_refresh_all_covers_prompt(void);
 
 static lv_obj_t * screen_timeout_switch;
 static lv_obj_t * screen_timeout_slider_card;
@@ -1665,13 +1668,59 @@ static void music_category_library_cb(lv_event_t * e) {
     nav_push(music_library_screen);
 }
 
-static lv_obj_t * build_music_settings_screen(void) {
-    static pill_list_item_t items[6];
-    lv_obj_t * native_rows[6] = { NULL };
+void refresh_all_metadata_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) show_library_refresh_all_metadata_prompt();
+}
+
+static void refresh_all_covers_row_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) show_library_refresh_all_covers_prompt();
+}
+
+static void music_category_database_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    nav_push(music_database_screen);
+}
+
+/* Update checks for added, removed and changed files; Refresh re-reads the
+ * tags of every song even when a file looks unchanged. Distinct icons keep
+ * the two from reading as the same action. */
+static lv_obj_t * build_music_database_screen(void) {
+    static pill_list_item_t items[3];
+    lv_obj_t * native_rows[3] = { NULL };
     items[0] = (pill_list_item_t){
         .label = "Update Music Database",
         .accessory = PILL_ACCESSORY_NONE,
         .on_click = update_music_database_row_cb,
+        .out_row = &native_rows[0],
+    };
+    items[1] = (pill_list_item_t){
+        .label = "Refresh All Metadata",
+        .accessory = PILL_ACCESSORY_NONE,
+        .on_click = refresh_all_metadata_row_cb,
+        .out_row = &native_rows[1],
+    };
+    items[2] = (pill_list_item_t){
+        .label = "Refresh All Covers",
+        .accessory = PILL_ACCESSORY_NONE,
+        .on_click = refresh_all_covers_row_cb,
+        .out_row = &native_rows[2],
+    };
+    lv_obj_t * scr = build_pill_list_screen("Music Database", generic_back_cb, items, 3,
+                                            gui_theme_accent_style(), GUI_ROW_GAP, 100);
+    decorate_category_row(native_rows[0], "submenu/update_database.png", NULL);
+    decorate_category_row(native_rows[1], "submenu/refresh_metadata.png", NULL);
+    decorate_category_row(native_rows[2], "submenu/refresh_covers.png", NULL);
+    finalize_screen_navigation(scr);
+    return scr;
+}
+
+static lv_obj_t * build_music_settings_screen(void) {
+    static pill_list_item_t items[6];
+    lv_obj_t * native_rows[6] = { NULL };
+    items[0] = (pill_list_item_t){
+        .label = "Music Database",
+        .accessory = PILL_ACCESSORY_CHEVRON,
+        .on_click = music_category_database_cb,
         .out_row = &native_rows[0],
     };
     items[1] = (pill_list_item_t){ "Playback", PILL_ACCESSORY_CHEVRON, false, music_category_playback_cb, NULL, NULL };
@@ -1687,7 +1736,7 @@ static lv_obj_t * build_music_settings_screen(void) {
 
     lv_obj_t * scr = build_pill_list_screen("Music Settings", generic_back_cb, items, count,
                                             gui_theme_accent_style(), GUI_ROW_GAP, 100);
-    decorate_category_row(native_rows[0], "submenu/update_database.png", NULL);
+    decorate_category_row(native_rows[0], "submenu/music_database.png", NULL);
     finalize_screen_navigation(scr);
     return scr;
 }
@@ -3133,6 +3182,7 @@ void gui_settings_init(void) {
     music_audio_screen = build_music_audio_screen();
     music_controls_screen = build_music_controls_screen();
     music_timers_screen = build_music_timers_screen();
+    music_database_screen = build_music_database_screen();
     music_library_screen = plugin_manager_get_music_library_list_item_count() > 0
                                ? build_music_library_screen() : NULL;
     settings_music_screen = build_music_settings_screen();
@@ -3191,6 +3241,7 @@ void gui_settings_teardown(void) {
     if (music_audio_screen) { lv_obj_delete(music_audio_screen); music_audio_screen = NULL; }
     if (music_controls_screen) { lv_obj_delete(music_controls_screen); music_controls_screen = NULL; }
     if (music_timers_screen) { lv_obj_delete(music_timers_screen); music_timers_screen = NULL; }
+    if (music_database_screen) { lv_obj_delete(music_database_screen); music_database_screen = NULL; }
     if (music_library_screen) { lv_obj_delete(music_library_screen); music_library_screen = NULL; }
     if (settings_display_screen) { lv_obj_delete(settings_display_screen); settings_display_screen = NULL; }
     if (settings_power_screen) { lv_obj_delete(settings_power_screen); settings_power_screen = NULL; }

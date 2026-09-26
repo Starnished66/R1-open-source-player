@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <stdint.h>
+#include <errno.h>
 
 #define ALBUMART_DIR SD_COMPAS_ROOT "/albumart"
 #define ALBUMART_LEGACY_DIR SD_LEGACY_ROOT "/albumart"
@@ -520,6 +521,19 @@ static bool generated_cache_file(const char * dir, const albumart_info_t * info,
     return false;
 }
 
+bool albumart_generated_cache_find(const albumart_info_t * info, int width, int height,
+                                   char * found, size_t found_size) {
+    if (!info || !found || found_size == 0 || width <= 0 || height <= 0 ||
+        !info->album[0] || !(info->albumartist[0] || info->artist[0]))
+        return false;
+    char path[PATH_MAX];
+    bool have = generated_cache_file(ALBUMART_DIR, info, width, height, path, sizeof(path));
+    if (!have) have = generated_cache_file(ALBUMART_LEGACY_DIR, info, width, height, path, sizeof(path));
+    if (!have || strlen(path) >= found_size) return false;
+    memcpy(found, path, strlen(path) + 1);
+    return true;
+}
+
 bool albumart_generated_cache_fresh(const albumart_info_t * info, int width, int height,
                                     char * found, size_t found_size) {
     if (!info || !found || found_size == 0 || width <= 0 || height <= 0 ||
@@ -773,6 +787,246 @@ bool albumart_artist_alias_store(const char * artist, unsigned int scope, uint64
 void albumart_artist_alias_remove(const char * artist, unsigned int scope) {
     char path[PATH_MAX];
     if (artist_alias_path(artist, scope, path, sizeof(path))) unlink(path);
+}
+
+static bool is_hex_digit_local(unsigned char c) {
+    return ('0' <= c && c <= '9') || ('a' <= c && c <= 'f') || ('A' <= c && c <= 'F');
+}
+
+static bool has_hex_key(const char * text) {
+    if (!text) return false;
+    for (int i = 0; i < 16; i++)
+        if (!text[i] || !is_hex_digit_local((unsigned char) text[i])) return false;
+    return true;
+}
+
+static bool valid_generated_tail(const char * tail, bool allow_noart) {
+    if (!tail || !('0' <= tail[0] && tail[0] <= '9')) return false;
+    const char * p = tail;
+    while ('0' <= *p && *p <= '9') p++;
+    if (*p++ != 'x' || !('0' <= *p && *p <= '9')) return false;
+    while ('0' <= *p && *p <= '9') p++;
+    if (*p++ != '.') return false;
+
+    const char * ext = NULL;
+    if (strncmp(p, "bmp", 3) == 0 && (p[3] == '\0' || strncmp(p + 3, ".tmp.", 5) == 0))
+        ext = "bmp";
+    else if (allow_noart && strncmp(p, "noart", 5) == 0 &&
+             (p[5] == '\0' || strncmp(p + 5, ".tmp.", 5) == 0))
+        ext = "noart";
+    if (!ext) return false;
+    p += strlen(ext);
+    if (*p == '\0') return true;
+    if (strncmp(p, ".tmp.", 5) != 0) return false;
+    p += 5;
+    for (int i = 0; i < 6; i++, p++)
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'z') ||
+              (*p >= 'A' && *p <= 'Z'))) return false;
+    return *p == '\0';
+}
+
+static bool parse_album_cache_filename(const char * name, uint64_t * out_key) {
+    if (!name || !out_key || (strncmp(name, "v2-", 3) != 0 && strncmp(name, "v3-", 3) != 0) ||
+        !has_hex_key(name + 3) || name[19] != '.' || !valid_generated_tail(name + 20, true))
+        return false;
+    uint64_t key = 0;
+    for (int i = 0; i < 16; i++) {
+        unsigned char c = (unsigned char) name[3 + i];
+        unsigned int nibble = c >= '0' && c <= '9' ? (unsigned int) (c - '0')
+            : (unsigned int) (tolower(c) - 'a' + 10);
+        key = (key << 4) | nibble;
+    }
+    *out_key = key;
+    return true;
+}
+
+static bool parse_artist_cache_filename(const char * name, uint64_t * out_key,
+                                        bool * out_is_alias) {
+    static const char prefix[] = "artist-v1-";
+    if (!name || !out_key || !out_is_alias || strncmp(name, prefix, sizeof(prefix) - 1) != 0 ||
+        !has_hex_key(name + sizeof(prefix) - 1))
+        return false;
+    const char * separator = name + sizeof(prefix) - 1 + 16;
+    if (*separator != '.' && *separator != '-') return false;
+    uint64_t key = 0;
+    for (int i = 0; i < 16; i++) {
+        unsigned char c = (unsigned char) name[sizeof(prefix) - 1 + i];
+        unsigned int nibble = c >= '0' && c <= '9' ? (unsigned int) (c - '0')
+            : (unsigned int) (tolower(c) - 'a' + 10);
+        key = (key << 4) | nibble;
+    }
+    if (*separator == '.') {
+        if (!valid_generated_tail(separator + 1, true)) return false;
+        *out_is_alias = false;
+    } else {
+        const char * p = separator + 1;
+        if (!('0' <= *p && *p <= '9')) return false;
+        while ('0' <= *p && *p <= '9') p++;
+        if (strncmp(p, ".album", 6) != 0 ||
+            !(* (p + 6) == '\0' || strncmp(p + 6, ".tmp.", 5) == 0)) return false;
+        if (p[6] != '\0') {
+            p += 11;
+            for (int i = 0; i < 6; i++, p++)
+                if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'z') ||
+                      (*p >= 'A' && *p <= 'Z'))) return false;
+            if (*p != '\0') return false;
+        }
+        *out_is_alias = true;
+    }
+    *out_key = key;
+    return true;
+}
+
+static bool generated_cover_filename(const char * name) {
+    uint64_t key;
+    bool is_alias;
+    return parse_album_cache_filename(name, &key) ||
+           parse_artist_cache_filename(name, &key, &is_alias);
+}
+
+bool albumart_is_generated_cache_file(const char * path) {
+    if (!generated_cache_path(path)) return false;
+    const char * name = strrchr(path, '/');
+    return name && generated_cover_filename(name + 1);
+}
+
+/* Deletion never follows a symlink: the cache root and its albumart folder
+ * are opened with O_NOFOLLOW and entries are removed relative to that
+ * descriptor, so a swapped-in link cannot redirect it elsewhere. */
+typedef bool (*cache_name_match_fn)(int dir_fd, const char * name, void * context);
+
+static bool remove_cache_files_matching(const char * root, cache_name_match_fn match, void * context) {
+    int root_fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (root_fd < 0) return errno == ENOENT;
+    int dir_fd = openat(root_fd, "albumart", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int open_errno = errno;
+    close(root_fd);
+    if (dir_fd < 0) return open_errno == ENOENT;
+    int scan_fd = dup(dir_fd);
+    DIR * dp = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
+    if (!dp) {
+        if (scan_fd >= 0) close(scan_fd);
+        close(dir_fd);
+        return false;
+    }
+    bool ok = true;
+    for (;;) {
+        errno = 0;
+        struct dirent * de = readdir(dp);
+        if (!de) {
+            if (errno != 0) ok = false; /* an I/O error, not the end of the folder */
+            break;
+        }
+        if (!match(dir_fd, de->d_name, context)) continue;
+        struct stat st;
+        if (fstatat(dir_fd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno != ENOENT) ok = false;
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+        if (unlinkat(dir_fd, de->d_name, 0) != 0 && errno != ENOENT) ok = false;
+    }
+    if (closedir(dp) != 0) ok = false;
+    close(dir_fd);
+    return ok;
+}
+
+static const char * const cache_roots[] = { SD_COMPAS_ROOT, SD_LEGACY_ROOT };
+
+static bool match_any_generated_cache(int dir_fd, const char * name, void * context) {
+    (void) dir_fd;
+    (void) context;
+    return generated_cover_filename(name);
+}
+
+bool albumart_delete_all_generated_caches(void) {
+    bool ok = true;
+    for (size_t r = 0; r < sizeof(cache_roots) / sizeof(cache_roots[0]); r++)
+        if (!remove_cache_files_matching(cache_roots[r], match_any_generated_cache, NULL)) ok = false;
+    return ok;
+}
+
+static bool read_artist_alias_album_key(int dir_fd, const char * name, uint64_t * out_album_key) {
+    int fd = openat(dir_fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st;
+    unsigned char bytes[25];
+    bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 24 &&
+              read(fd, bytes, sizeof(bytes)) == 24;
+    close(fd);
+    if (!ok || memcmp(bytes, "AALIAS1\0", 8) != 0) return false;
+    uint64_t album_key = 0;
+    for (int i = 0; i < 8; i++) album_key |= (uint64_t) bytes[8 + i] << (i * 8);
+    *out_album_key = album_key;
+    return album_key != 0;
+}
+
+typedef struct {
+    uint64_t album_keys[2];
+    uint64_t * artist_keys;
+    size_t artist_count, artist_capacity;
+    bool out_of_memory;
+} album_reload_scan_t;
+
+static void album_reload_add_artist(album_reload_scan_t * scan, uint64_t artist_key) {
+    for (size_t i = 0; i < scan->artist_count; i++)
+        if (scan->artist_keys[i] == artist_key) return;
+    if (scan->artist_count == scan->artist_capacity) {
+        size_t next = scan->artist_capacity ? scan->artist_capacity * 2 : 8;
+        uint64_t * grown = realloc(scan->artist_keys, next * sizeof(*grown));
+        if (!grown) {
+            scan->out_of_memory = true;
+            return;
+        }
+        scan->artist_keys = grown;
+        scan->artist_capacity = next;
+    }
+    scan->artist_keys[scan->artist_count++] = artist_key;
+}
+
+/* Pass 1: this album's own files, and every artist whose saved alias points
+ * at it (collected, removed in pass 2 with the rest of that family). */
+static bool album_reload_first_pass(int dir_fd, const char * name, void * context) {
+    album_reload_scan_t * scan = context;
+    uint64_t key;
+    bool is_alias;
+    if (parse_album_cache_filename(name, &key))
+        return key == scan->album_keys[0] || key == scan->album_keys[1];
+    uint64_t album_key;
+    if (parse_artist_cache_filename(name, &key, &is_alias) && is_alias &&
+        read_artist_alias_album_key(dir_fd, name, &album_key) &&
+        (album_key == scan->album_keys[0] || album_key == scan->album_keys[1]))
+        album_reload_add_artist(scan, key);
+    return false;
+}
+
+static bool album_reload_second_pass(int dir_fd, const char * name, void * context) {
+    (void) dir_fd;
+    album_reload_scan_t * scan = context;
+    uint64_t key;
+    bool is_alias;
+    if (!parse_artist_cache_filename(name, &key, &is_alias)) return false;
+    for (size_t i = 0; i < scan->artist_count; i++)
+        if (scan->artist_keys[i] == key) return true;
+    return false;
+}
+
+bool albumart_delete_generated_cache_for_album(const albumart_info_t * info,
+                                               const uint64_t * artist_keys, size_t artist_key_count) {
+    if (!info || !info->album[0]) return false;
+    album_reload_scan_t scan = { .album_keys = { albumart_thumbnail_key(info), thumbnail_key_legacy(info) } };
+    /* Every artist appearing on the album too: a "no art" marker or a
+     * thumbnail derived before this album had art has no alias pointing here. */
+    for (size_t i = 0; i < artist_key_count; i++) album_reload_add_artist(&scan, artist_keys[i]);
+    if (info->artist[0]) album_reload_add_artist(&scan, albumart_artist_thumbnail_key(info->artist));
+    if (info->albumartist[0]) album_reload_add_artist(&scan, albumart_artist_thumbnail_key(info->albumartist));
+    bool ok = true;
+    for (size_t r = 0; r < sizeof(cache_roots) / sizeof(cache_roots[0]); r++)
+        if (!remove_cache_files_matching(cache_roots[r], album_reload_first_pass, &scan)) ok = false;
+    for (size_t r = 0; r < sizeof(cache_roots) / sizeof(cache_roots[0]); r++)
+        if (!remove_cache_files_matching(cache_roots[r], album_reload_second_pass, &scan)) ok = false;
+    free(scan.artist_keys);
+    return ok && !scan.out_of_memory;
 }
 
 albumart_load_result_t albumart_load_file_ex(const char * path, uint8_t ** out_data,

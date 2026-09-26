@@ -290,6 +290,14 @@ static void song_context_menu_add_to_playlist_cb(lv_event_t * e) {
     if (song_context_menu_target_path[0] != '\0') open_add_to_playlist_for(song_context_menu_target_path);
 }
 
+static void song_context_menu_refresh_metadata_cb(lv_event_t * e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    hide_song_context_menu_popup();
+    if (song_context_menu_target_path[0] == '\0') return;
+    const char * paths[] = { song_context_menu_target_path };
+    start_library_metadata_refresh_paths(paths, 1);
+}
+
 static void song_context_menu_cancel_cb(lv_event_t * e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     hide_song_context_menu_popup();
@@ -308,6 +316,7 @@ static void build_song_context_menu_popup(void) {
         { "Play Next", song_context_menu_play_next_cb, false },
         { "Add to Queue", song_context_menu_add_to_queue_cb, false },
         { "Add to Playlist", song_context_menu_add_to_playlist_cb, false },
+        { "Refresh metadata", song_context_menu_refresh_metadata_cb, false },
         { "Cancel", song_context_menu_cancel_cb, false },
     };
     song_context_menu_popup = build_menu_popup(rows, (int) (sizeof(rows) / sizeof(rows[0])),

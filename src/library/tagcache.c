@@ -187,6 +187,7 @@ static unsigned char *scan_seen_bitmap;
 static size_t scan_seen_bitmap_bytes;
 static bool scan_lazy_active;
 static bool scan_force_publication;
+static bool scan_preserve_unseen;
 static void (*scan_unlock_cb)(void);
 static void (*scan_lock_cb)(void);
 static inline bool checked_add_size(size_t a, size_t b, size_t * out) {
@@ -1838,13 +1839,15 @@ static bool append_string(int tag, int32_t slot, const char *value, int32_t *see
     return true;
 }
 
-void tagcache_begin_update_with_lock(void (*unlock)(void), void (*lock)(void)) {
+static void tagcache_begin_update_mode_with_lock(void (*unlock)(void), void (*lock)(void),
+                                                 bool preserve_unseen) {
     if (!db_open) return;
     if (!tagcache_flush_numeric()) { update_failed = true; return; }
     /* A second begin belongs to the same scan, including a still-lazy scan;
      * restarting here would discard the RAM seen set. */
     if (updating || scan_lazy_active) return;
     scan_seen_release();
+    scan_preserve_unseen = preserve_unseen;
     scan_unlock_cb = unlock;
     scan_lock_cb = lock;
     scan_force_publication = !disk_ready || rebuild_preserve_generations ||
@@ -1860,7 +1863,13 @@ void tagcache_begin_update_with_lock(void (*unlock)(void), void (*lock)(void)) {
     scan_seen_bitmap_bytes = bytes;
     scan_lazy_active = true;
 }
+void tagcache_begin_update_with_lock(void (*unlock)(void), void (*lock)(void)) {
+    tagcache_begin_update_mode_with_lock(unlock, lock, false);
+}
 void tagcache_begin_update(void) { tagcache_begin_update_with_lock(NULL, NULL); }
+void tagcache_begin_targeted_update_with_lock(void (*unlock)(void), void (*lock)(void)) {
+    tagcache_begin_update_mode_with_lock(unlock, lock, true);
+}
 
 bool tagcache_lookup(const char *path, int32_t mtime, int32_t size, tagcache_song_t *out) {
     if (!db_open || !path) return false;
@@ -1893,16 +1902,35 @@ bool tagcache_lookup(const char *path, int32_t mtime, int32_t size, tagcache_son
 void tagcache_upsert(const char *path, int32_t mtime, int32_t size, const char *title, const char *artist,
                      const char *album, const char *album_artist, const char *genre,
                      int32_t track_number, int32_t disc_number) {
+    tagcache_upsert_changed(path, mtime, size, title, artist, album, album_artist, genre,
+                            track_number, disc_number, NULL);
+}
+
+void tagcache_upsert_changed(const char *path, int32_t mtime, int32_t size, const char *title,
+                             const char *artist, const char *album, const char *album_artist,
+                             const char *genre, int32_t track_number, int32_t disc_number,
+                             bool *out_tags_changed) {
+    /* Anything short of a completed write with identical stored tags counts
+     * as changed, so a failed upsert can never pass for a no-op. */
+    if (out_tags_changed) *out_tags_changed = true;
     if (!db_open || !path || !path[0] || !start_staging() || update_failed) return;
     SCAN_SCOPE;
     int32_t slot = find_path(path);
     struct index_entry idx = {0};
     bool fresh = slot < 0;
     if (fresh) {
-        if (update_failed || ent_count >= TAGCACHE_MAX_STAGING_ENTRIES) { update_failed = true; return; }
+        if (update_failed) return;
+        /* Keep targeted-transaction slots stable while numeric updates are
+         * journaled by slot. Full scans compact tombstones at publication. */
+        if (ent_count >= TAGCACHE_MAX_STAGING_ENTRIES) { update_failed = true; return; }
         slot = ent_count;
         idx.tag_seek[tag_commitid] = (int32_t) time(NULL);
     } else if (!reader_index(slot, &idx)) { update_failed = true; return; }
+    int32_t stored_track = track_number > 0 ? track_number : -1;
+    int32_t stored_disc = disc_number > 0 ? disc_number : -1;
+    bool tags_changed = fresh || (idx.flag & (FLAG_DELETED | FLAG_TAGS_INCOMPLETE)) ||
+                        idx.tag_seek[tag_tracknumber] != stored_track ||
+                        idx.tag_seek[tag_discnumber] != stored_disc;
     const int tags[] = {tag_filename, tag_title, tag_artist, tag_album, tag_albumartist, tag_genre};
     const char *values[] = {path, title, artist, album, album_artist, genre};
     for (int i = 0; i < 6; i++) {
@@ -1919,6 +1947,7 @@ void tagcache_upsert(const char *path, int32_t mtime, int32_t size, const char *
             unchanged = strcmp(existing, value) == 0;
         }
         if (unchanged) continue;
+        tags_changed = true;
         if (update_failed || !append_string(tags[i], slot, value, &idx.tag_seek[tags[i]]) ||
             (tags[i] != tag_filename && !scan_intern_insert(tags[i], idx.tag_seek[tags[i]]))) {
             update_failed = true;
@@ -1927,16 +1956,36 @@ void tagcache_upsert(const char *path, int32_t mtime, int32_t size, const char *
     }
     idx.tag_seek[tag_mtime] = mtime;
     idx.tag_seek[tag_lastoffset] = size;
-    idx.tag_seek[tag_tracknumber] = track_number > 0 ? track_number : -1;
-    idx.tag_seek[tag_discnumber] = disc_number > 0 ? disc_number : -1;
+    idx.tag_seek[tag_tracknumber] = stored_track;
+    idx.tag_seek[tag_discnumber] = stored_disc;
     idx.flag = (idx.flag & ~(FLAG_DELETED | FLAG_TAGS_INCOMPLETE)) | FLAG_SEEN;
     if (!scan_write_index(slot, &idx)) return;
     reader_reset_cache();
     if (fresh) {
-        ent_count++;
+        if (slot == ent_count) ent_count++;
         live_count++;
         scan_find_path(path, true, slot);
     }
+    if (out_tags_changed && !update_failed) *out_tags_changed = tags_changed;
+}
+
+bool tagcache_delete_target_path(const char *path) {
+    if (!db_open || !path || !path[0] || !scan_preserve_unseen) return false;
+    SCAN_SCOPE;
+    int32_t slot = find_path(path);
+    if (slot < 0) return !update_failed;
+    struct index_entry idx;
+    if (!reader_index(slot, &idx)) { update_failed = true; return false; }
+    if (idx.flag & FLAG_DELETED) return true;
+    if (!start_staging() || update_failed) return false;
+    scan_select(true);
+    slot = find_path(path);
+    if (slot < 0 || !reader_index(slot, &idx)) { update_failed = true; return false; }
+    if (idx.flag & FLAG_DELETED) return true;
+    idx.flag |= FLAG_DELETED;
+    if (!scan_write_index(slot, &idx)) return false;
+    if (live_count > 0) live_count--;
+    return true;
 }
 
 typedef struct {
@@ -2127,6 +2176,7 @@ static bool write_all(void (*unlock)(void), void (*lock)(void)) {
             struct index_entry idx;
             if (!reader_index(old, &idx)) { free(commit_slot_map); commit_slot_map = NULL; return false; }
             if (idx.flag & FLAG_DELETED) commit_slot_map[old] = -1;
+            else if (scan_preserve_unseen) { commit_slot_map[old] = old; dense++; }
             else if (dense >= TAGCACHE_MAX_ENTRIES) { free(commit_slot_map); commit_slot_map = NULL; return false; }
             else commit_slot_map[old] = dense++;
         }
@@ -2137,18 +2187,20 @@ static bool write_all(void (*unlock)(void), void (*lock)(void)) {
     db_path(path, sizeof(path), name);
     int master = open(path, O_CREAT | O_TRUNC | O_RDWR, 0644);
     if (master < 0) { free(commit_slot_map); commit_slot_map = NULL; return false; }
-    struct master_header mh = {{TAGCACHE_INDEXED_MAGIC, live_count * (int32_t) sizeof(struct index_entry), live_count},
+    int32_t master_entries = scan_preserve_unseen ? ent_count : live_count;
+    struct master_header mh = {{TAGCACHE_INDEXED_MAGIC, master_entries * (int32_t) sizeof(struct index_entry), master_entries},
                                 master_serial, gen, 0};
     if (unlock) unlock();
     bool ok = write_fully(master, &mh, sizeof(mh));
     for (int32_t slot = 0; ok && slot < ent_count; slot++) {
         struct index_entry idx;
-        if (commit_slot_map && commit_slot_map[slot] < 0) continue;
+        if (!scan_preserve_unseen && commit_slot_map && commit_slot_map[slot] < 0) continue;
         ok = reader_index(slot, &idx);
         if (!ok) break;
         idx.flag &= ~FLAG_RAM_ONLY;
         if (idx.flag & FLAG_DELETED) { memset(&idx, 0, sizeof(idx)); idx.flag = FLAG_DELETED; }
-        ok = write_at(master, &idx, sizeof(idx), sizeof(mh) + (off_t)commit_slot_map[slot] * sizeof(idx));
+        int32_t output_slot = scan_preserve_unseen ? slot : commit_slot_map[slot];
+        ok = write_at(master, &idx, sizeof(idx), sizeof(mh) + (off_t)output_slot * sizeof(idx));
     }
     for (size_t i = 0; ok && i < sizeof(persist_tag_ids) / sizeof(persist_tag_ids[0]); i++)
         ok = write_commit_tag(persist_tag_ids[i], gen, master);
@@ -2157,7 +2209,7 @@ static bool write_all(void (*unlock)(void), void (*lock)(void)) {
             if (commit_tag_sources[i] < 0) commit_tag_sources[i] = gen;
         ok = write_generation_refs(gen, commit_tag_sources);
     }
-    if (!close_synced(master)) ok = false;
+    if (close(master) != 0) ok = false;
     if (ok) {
         selected_reader = &build_reader;
         reader_context_init(&build_reader);
@@ -2333,6 +2385,7 @@ void tagcache_close(void) {
     disk_gen = master_commitid = 0;
     master_serial = 1;
     db_open = disk_ready = rebuild_preserve_generations = updating = scan_initializing = update_failed = false;
+    scan_preserve_unseen = false;
     committed_migration_state = staged_migration_state = 0;
     if (db_dir_fd >= 0) close(db_dir_fd);
     db_dir_fd = -1;
@@ -2351,7 +2404,17 @@ bool tagcache_end_update_with_lock(void (*unlock)(void), void (*lock)(void)) {
         return false;
     }
     if (!tagcache_flush_numeric()) { update_failed = true; return false; }
-    if (scan_lazy_active) {
+    if (scan_lazy_active && scan_preserve_unseen) {
+        if (!updating && !scan_force_publication) {
+            scan_seen_release();
+            scan_preserve_unseen = false;
+            return true;
+        }
+        if (!updating && !start_staging_with_lock(unlock, lock)) {
+            scan_seen_release();
+            return false;
+        }
+    } else if (scan_lazy_active) {
         bool changed = scan_force_publication;
         for (int32_t slot = 0; !changed && slot < ent_count; slot++) {
             if (scan_seen_test(slot)) continue;
@@ -2397,7 +2460,7 @@ bool tagcache_end_update_with_lock(void (*unlock)(void), void (*lock)(void)) {
         struct index_entry idx;
         ok = reader_index(slot, &idx);
         if (!ok) break;
-        if (!(idx.flag & (FLAG_DELETED | FLAG_SEEN))) {
+        if (!scan_preserve_unseen && !(idx.flag & (FLAG_DELETED | FLAG_SEEN))) {
             char path[TAGCACHE_PATH_MAX];
             ok = reader_string(tag_filename, idx.tag_seek[tag_filename], slot, path, sizeof(path));
             if (!ok) break;
@@ -2425,7 +2488,13 @@ bool tagcache_end_update(void) { return tagcache_end_update_with_lock(NULL, NULL
 
 void tagcache_abort_update(void) {
     if (!db_open) return;
-    tagcache_flush_numeric();
+    bool numeric_ok = tagcache_flush_numeric();
+    if (numeric_ok && scan_lazy_active && !updating && !scan_view_ready && !update_failed &&
+        staged_migration_state == committed_migration_state) {
+        scan_seen_release();
+        scan_preserve_unseen = false;
+        return;
+    }
     reload_from_disk();
 }
 

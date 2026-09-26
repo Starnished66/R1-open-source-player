@@ -7,6 +7,8 @@
 #include "lvgl/src/display/lv_display_private.h"
 
 #include <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1490,6 +1492,9 @@ typedef struct {
     int32_t row_height;
     int32_t requested_row_height;
     int32_t row_stride;
+    uint32_t magic; /* COMPACT_LIST_MAGIC while alive; cleared on delete (stale-list guard) */
+    lv_obj_t * self; /* the list widget this data belongs to */
+    void * next_live; /* intrusive live-list registry link (compact_list_virtual_data_t *) */
     int window_start; /* index currently shown by rows[0]; -1 forces the first update to actually run */
     int refresh_index; /* >=0 requests a targeted repaint without disturbing the recycled window */
     lv_obj_t * rows[COMPACT_LIST_POOL_SIZE];
@@ -1498,6 +1503,7 @@ typedef struct {
     lv_obj_t * subtitle_labels[COMPACT_LIST_POOL_SIZE];
     void * row_ctx[COMPACT_LIST_POOL_SIZE]; /* opaque to this struct, freed alongside it -- see compact_list_row_ctx_t below */
     int row_logical_index[COMPACT_LIST_POOL_SIZE]; /* item currently represented by each recycled slot; -1 when unused */
+    uint64_t row_artwork_key[COMPACT_LIST_POOL_SIZE]; /* artwork key of the item in each slot; 0 when none */
     lv_obj_t * spacer; /* repositioned by compact_list_set_items() when item_count changes */
     lv_obj_t * message;
     lv_obj_t * now_playing_bar; /* NULL if this list wasn't built with enable_now_playing -- see compact_list_set_now_playing() */
@@ -1803,6 +1809,7 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
                 lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
                 lv_image_set_src(data->leading_images[slot], NULL);
                 data->row_logical_index[slot] = -1;
+                data->row_artwork_key[slot] = 0;
                 ((compact_list_row_ctx_t *) data->row_ctx[slot])->logical_index = -1;
                 continue;
             }
@@ -1822,6 +1829,7 @@ static void compact_list_update_window(lv_obj_t * list, compact_list_virtual_dat
             artwork_key = data->items[index].artwork_key;
             artwork_name = data->items[index].artwork_name;
         }
+        data->row_artwork_key[slot] = artwork_key;
         lv_obj_remove_flag(row, LV_OBJ_FLAG_HIDDEN);
         lv_obj_t * trailing = data->trailing_images[slot];
         if (trailing_asset && trailing_asset[0]) {
@@ -1956,47 +1964,81 @@ static void compact_list_poll_fetch_cb(lv_timer_t * timer) {
     }
 }
 
-#define MAX_ACTIVE_COMPACT_LISTS 32
-static lv_obj_t * s_active_compact_lists[MAX_ACTIVE_COMPACT_LISTS];
-static int s_active_compact_list_count = 0;
+/* Every live compact list, as an intrusive singly linked list threaded
+ * through each list's own data block: linked at creation, unlinked in the
+ * LV_EVENT_DELETE handler before the block is freed. Registration therefore
+ * cannot fail or allocate, and the stale-list guard below can find a live
+ * list without reading the (possibly freed) object it was handed. */
+static compact_list_virtual_data_t * s_live_compact_lists;
 
-static void register_active_compact_list(lv_obj_t * list) {
-    if (!list) return;
-    for (int i = 0; i < s_active_compact_list_count; i++) {
-        if (s_active_compact_lists[i] == list) return;
-    }
-    if (s_active_compact_list_count < MAX_ACTIVE_COMPACT_LISTS) {
-        s_active_compact_lists[s_active_compact_list_count++] = list;
-    }
+static void register_active_compact_list(compact_list_virtual_data_t * data) {
+    if (!data) return;
+    data->next_live = s_live_compact_lists;
+    s_live_compact_lists = data;
 }
 
-static void unregister_active_compact_list(lv_obj_t * list) {
-    for (int i = 0; i < s_active_compact_list_count; i++) {
-        if (s_active_compact_lists[i] == list) {
-            s_active_compact_lists[i] = s_active_compact_lists[--s_active_compact_list_count];
-            s_active_compact_lists[s_active_compact_list_count] = NULL;
+static void unregister_active_compact_list(compact_list_virtual_data_t * data) {
+    compact_list_virtual_data_t ** link = &s_live_compact_lists;
+    while (*link) {
+        if (*link == data) {
+            *link = (compact_list_virtual_data_t *) data->next_live;
+            data->next_live = NULL;
             return;
         }
+        link = (compact_list_virtual_data_t **) &(*link)->next_live;
     }
 }
 
-void compact_list_refresh_all(void) {
-    for (int i = 0; i < s_active_compact_list_count; i++) {
-        if (s_active_compact_lists[i]) {
-            compact_list_refresh_visible(s_active_compact_lists[i]);
-        }
+#define COMPACT_LIST_MAGIC 0xC0A1157Au
+
+/* A compact list reached after its LV_EVENT_DELETE (freed data, cleared
+ * user_data or a reused allocation) is reported with the caller's return
+ * address instead of crashing, so the stale call site can be found with
+ * addr2line. Same log the crash handler uses. */
+static void compact_list_report_stale(const char * api, void * caller) {
+    int fd = open("/data/mnt/sd_0/.logs/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    char line[160];
+    int n = snprintf(line, sizeof(line), "[pid=%ld] *** STALE compact_list api=%s caller=%p ***\n",
+                     (long) getpid(), api, caller);
+    if (n > 0) { ssize_t w = write(fd, line, (size_t) n); (void) w; }
+    close(fd);
+}
+
+/* Liveness comes from the intrusive registry: only data blocks that are
+ * still linked (so still allocated) are ever read, and the widget pointer is
+ * only compared, never dereferenced. A pointer compare per live list is cheap
+ * enough for scroll events (unlike lv_obj_is_valid(), which walks every
+ * object on every screen). If a stale pointer happens to equal a newer live
+ * list's address, the call acts on that live list: valid memory, no crash. */
+static compact_list_virtual_data_t * compact_list_live_data(lv_obj_t * list, const char * api, void * caller) {
+    for (compact_list_virtual_data_t * d = s_live_compact_lists; list && d;
+         d = (compact_list_virtual_data_t *) d->next_live) {
+        if (d->self == list && d->magic == COMPACT_LIST_MAGIC) return d;
     }
+    compact_list_report_stale(api, caller);
+    return NULL;
+}
+#define COMPACT_LIST_DATA_OR_RETURN(api, ...) \
+    compact_list_virtual_data_t * data = compact_list_live_data(list, api, __builtin_return_address(0)); \
+    if (!data) return __VA_ARGS__
+
+void compact_list_refresh_all(void) {
+    for (compact_list_virtual_data_t * d = s_live_compact_lists; d;
+         d = (compact_list_virtual_data_t *) d->next_live)
+        compact_list_refresh_visible(d->self);
 }
 
 static void compact_list_scroll_event_cb(lv_event_t * e) {
     lv_obj_t * list = lv_event_get_target(e);
-    compact_list_update_window(list, (compact_list_virtual_data_t *) lv_obj_get_user_data(list));
+    COMPACT_LIST_DATA_OR_RETURN("scroll_event");
+    compact_list_update_window(list, data);
 }
 
 static void compact_list_delete_event_cb(lv_event_t * e) {
     lv_obj_t * list = lv_event_get_target(e);
-    unregister_active_compact_list(list);
     compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    unregister_active_compact_list(data);
     if (data->poll_timer) lv_timer_delete(data->poll_timer);
     if (data->pending_job) {
         /* Teardown must not wait on a provider: the job owns its worker
@@ -2009,16 +2051,18 @@ static void compact_list_delete_event_cb(lv_event_t * e) {
     }
     for (int slot = 0; slot < COMPACT_LIST_POOL_SIZE; slot++) free(data->row_ctx[slot]);
     free(data->items);
+    data->magic = 0;
+    lv_obj_set_user_data(list, NULL);
     free(data);
 }
 
 void compact_list_scroll_to_index(lv_obj_t * list, int index) {
-    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    COMPACT_LIST_DATA_OR_RETURN("scroll_to_index");
     lv_obj_scroll_to_y(list, COMPACT_LIST_TOP_PAD + index * data->row_stride, LV_ANIM_OFF);
 }
 
 void compact_list_set_now_playing(lv_obj_t * list, int item_index) {
-    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    COMPACT_LIST_DATA_OR_RETURN("set_now_playing");
     if (!data->now_playing_bar) return; /* this list wasn't built with enable_now_playing */
 
     data->now_playing_index = item_index;
@@ -2047,7 +2091,7 @@ void compact_list_set_now_playing(lv_obj_t * list, int item_index) {
  * still need to outlive this call the same way the original construction-
  * time ones do -- see build_compact_list_screen()'s own doc comment). */
 void compact_list_set_items(lv_obj_t * list, const compact_list_item_t * items, int item_count) {
-    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    COMPACT_LIST_DATA_OR_RETURN("set_items");
 
     compact_list_cancel_pending_job(data);
     data->fetch_page = NULL; /* switch back to eager mode -- see this field's own doc comment */
@@ -2085,7 +2129,7 @@ void compact_list_set_items(lv_obj_t * list, const compact_list_item_t * items, 
  * gave it, defaulting to empty if that was never called). */
 void compact_list_set_paged_provider(lv_obj_t * list, compact_list_fetch_page_cb_t fetch_page, void * ctx,
                                       int total_count) {
-    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    COMPACT_LIST_DATA_OR_RETURN("set_paged_provider");
 
     compact_list_cancel_pending_job(data);
     data->fetch_page = fetch_page;
@@ -2128,6 +2172,9 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
 
     compact_list_virtual_data_t * data = malloc(sizeof(*data));
+    data->magic = COMPACT_LIST_MAGIC;
+    data->self = list;
+    data->next_live = NULL;
     data->item_count = item_count;
     data->on_click = on_click;
     data->on_long_press = on_long_press;
@@ -2252,43 +2299,54 @@ lv_obj_t * build_compact_list_widget(lv_obj_t * parent, const compact_list_item_
     data->message = build_list_message(list, "No items", "There are no entries in this view.");
     lv_obj_set_x(data->message, (active_display_width() - LIST_ROW_WIDTH) / 2);
     compact_list_update_window(list, data); /* populate the initially-visible rows */
-    register_active_compact_list(list);
+    register_active_compact_list(data);
 
     return list;
 }
 
 void compact_list_set_trailing_click(lv_obj_t * list, compact_list_click_cb_t cb) {
-    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    COMPACT_LIST_DATA_OR_RETURN("set_trailing_click");
     data->on_trailing_click = cb;
 }
 
 void compact_list_set_row_decorator(lv_obj_t * list, compact_list_row_decorator_cb_t cb, void * ctx) {
-    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    COMPACT_LIST_DATA_OR_RETURN("set_row_decorator");
     data->row_decorator = cb;
     data->row_decorator_ctx = ctx;
     compact_list_refresh_visible(list);
 }
 
-void compact_list_detach_image_src(lv_obj_t * list, const void * src) {
+bool compact_list_detach_image_src(lv_obj_t * list, const void * src) {
     compact_list_virtual_data_t * data = list ? (compact_list_virtual_data_t *) lv_obj_get_user_data(list) : NULL;
-    if (!data || !src) return;
+    if (!data || !src) return false;
+    bool detached = false;
     for (int slot = 0; slot < COMPACT_LIST_POOL_SIZE; slot++) {
         lv_obj_t * image = data->leading_images[slot];
         if (image && lv_image_get_src(image) == src) {
             lv_image_set_src(image, NULL);
             lv_obj_add_flag(image, LV_OBJ_FLAG_HIDDEN);
+            detached = true;
         }
     }
+    return detached;
+}
+
+bool compact_list_shows_artwork_key(lv_obj_t * list, uint64_t key) {
+    compact_list_virtual_data_t * data = list ? (compact_list_virtual_data_t *) lv_obj_get_user_data(list) : NULL;
+    if (!data || !key) return false;
+    for (int slot = 0; slot < COMPACT_LIST_POOL_SIZE; slot++)
+        if (data->row_logical_index[slot] >= 0 && data->row_artwork_key[slot] == key) return true;
+    return false;
 }
 
 void compact_list_refresh_visible(lv_obj_t * list) {
-    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    COMPACT_LIST_DATA_OR_RETURN("refresh_visible");
     data->window_start = -1;
     compact_list_update_window(list, data);
 }
 
 void compact_list_refresh_item(lv_obj_t * list, int logical_index) {
-    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    COMPACT_LIST_DATA_OR_RETURN("refresh_item");
     if (!data || logical_index < 0 || logical_index >= data->item_count) return;
     int slot = logical_index % COMPACT_LIST_POOL_SIZE;
     if (data->row_logical_index[slot] != logical_index) return; /* no longer visible */
@@ -2297,7 +2355,7 @@ void compact_list_refresh_item(lv_obj_t * list, int logical_index) {
 }
 
 void compact_list_set_row_height(lv_obj_t * list, int32_t row_height) {
-    compact_list_virtual_data_t * data = (compact_list_virtual_data_t *) lv_obj_get_user_data(list);
+    COMPACT_LIST_DATA_OR_RETURN("set_row_height");
     if (!data || row_height < 48) return;
     data->requested_row_height = row_height;
     int32_t minimum = row_height >= MUSIC_LIST_ROW_HEIGHT ? ui_music_row_height() :

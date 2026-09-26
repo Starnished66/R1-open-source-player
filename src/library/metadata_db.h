@@ -86,6 +86,10 @@ bool metadata_db_try_artist_row(const char * raw_artist, int64_t * out_offset);
  * are marked seen; new/changed files are upserted. metadata_db_end_update()
  * removes rows whose file is confirmed missing. */
 void metadata_db_begin_update(void);
+/* Targeted refresh mode keeps all unselected rows and their song IDs. */
+void metadata_db_begin_targeted_update(void);
+/* Removes a selected path confirmed missing during a targeted refresh. */
+bool metadata_db_delete_target_path(const char * path);
 
 /* Looks up `path`, marking it as seen for this pass either way. Returns
  * true and fills *out only if a cached row exists whose stored mtime/size
@@ -94,7 +98,9 @@ void metadata_db_begin_update(void);
 bool metadata_db_get(const char * path, int64_t mtime, int64_t size, cached_tags_t * out);
 
 /* Inserts or replaces the cached row for `path`. */
-void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cached_tags_t * tags);
+/* Returns false only when the row existed and its stored tags came out
+ * identical (tag strings are stored in their interned spelling). */
+bool metadata_db_put(const char * path, int64_t mtime, int64_t size, const cached_tags_t * tags);
 
 /* Ends a successful scan pass: removes only rows whose file is confirmed
  * missing, then commits. Returns false if the on-disk write failed; the

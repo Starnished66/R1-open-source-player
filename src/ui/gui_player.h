@@ -14,6 +14,15 @@ void gui_player_init(uint32_t screen_width, uint32_t screen_height);
  * via gui_track_info_teardown()) so gui_reload.c's in-process UI reload can
  * call gui_player_init() again from a clean slate. */
 void gui_player_teardown(void);
+/* Thread-safe: forget remembered "no cover" tracks after a library publication. */
+void gui_player_invalidate_cover_negatives(void);
+/* Quiesces player cover decoding while the generated artwork cache is being
+ * rebuilt. Completion re-reads the playing track's cover. */
+void gui_player_begin_cover_reload(void);
+void gui_player_finish_cover_reload(void);
+void gui_player_cancel_cover_reload(void);
+/* Thread-safe: no player cover decode (which may write cache files) is running. */
+bool gui_player_cover_decode_idle(void);
 void gui_player_refresh_static_assets(void);
 void gui_player_refresh_frosted_background(void);
 void sync_player_topbar_visibility(lv_obj_t * screen);

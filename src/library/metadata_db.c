@@ -676,6 +676,19 @@ void metadata_db_begin_update(void) {
     tagcache_begin_update_with_lock(metadata_query_unlock, metadata_query_lock);
 }
 
+void metadata_db_begin_targeted_update(void) {
+    METADATA_UPDATE_GUARD;
+    METADATA_DB_GUARD;
+    if (!db_ready) return;
+    tagcache_begin_targeted_update_with_lock(metadata_query_unlock, metadata_query_lock);
+}
+
+bool metadata_db_delete_target_path(const char *path) {
+    METADATA_UPDATE_GUARD;
+    METADATA_DB_GUARD;
+    return db_ready && tagcache_delete_target_path(path);
+}
+
 bool metadata_db_get(const char * path, int64_t mtime, int64_t size, cached_tags_t * out) {
     METADATA_UPDATE_GUARD;
     METADATA_DB_GUARD;
@@ -696,15 +709,18 @@ bool metadata_db_get(const char * path, int64_t mtime, int64_t size, cached_tags
     return true;
 }
 
-void metadata_db_put(const char * path, int64_t mtime, int64_t size, const cached_tags_t * tags) {
+bool metadata_db_put(const char * path, int64_t mtime, int64_t size, const cached_tags_t * tags) {
     METADATA_UPDATE_GUARD;
     METADATA_DB_GUARD;
-    if (!db_ready || !tags) return;
-    tagcache_upsert(path, clamp_i32(mtime), clamp_i32(size), tags->title, tags->artist, tags->album, tags->album_artist,
-                    tags->genre, tags->track_number, tags->disc_number);
+    if (!db_ready || !tags) return true;
+    bool tags_changed = true;
+    tagcache_upsert_changed(path, clamp_i32(mtime), clamp_i32(size), tags->title, tags->artist, tags->album,
+                            tags->album_artist, tags->genre, tags->track_number, tags->disc_number,
+                            &tags_changed);
     int32_t rating = 0, playcount = 0, last_played = 0;
     if (remote_state_take(path, &rating, &playcount, &last_played))
         tagcache_overlay_stats(path, rating, playcount, last_played);
+    return tags_changed;
 }
 
 bool metadata_db_end_update(void) {

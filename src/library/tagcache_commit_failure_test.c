@@ -17,6 +17,23 @@ int __real_rename(const char *, const char *);
 enum failure_kind { FAIL_REFS_WRITE, FAIL_REFS_FSYNC, FAIL_REFS_RENAME, FAIL_POINTER_RENAME };
 static enum failure_kind armed;
 static int fail_once;
+static int master_generation_fsyncs;
+
+static int fd_is_master_generation(int fd) {
+    char link[64], path[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, path, sizeof(path) - 1);
+    if (n < 0) return 0;
+    path[n] = '\0';
+    const char * name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    const char * marker = strstr(name, "database_idx.tcd.g");
+    if (!marker) return 0;
+    marker += strlen("database_idx.tcd.g");
+    if (*marker < '0' || *marker > '9') return 0;
+    while (*marker >= '0' && *marker <= '9') marker++;
+    return *marker == '\0';
+}
 
 static int fd_is(const char *needle, int fd) {
     char link[64], path[PATH_MAX];
@@ -35,6 +52,7 @@ ssize_t __wrap_write(int fd, const void *buf, size_t n) {
 }
 
 int __wrap_fsync(int fd) {
+    if (fd_is_master_generation(fd)) master_generation_fsyncs++;
     if (fail_once && armed == FAIL_REFS_FSYNC && fd_is("tagcache.refs.g", fd) && fd_is(".tmp", fd)) {
         fail_once = 0; errno = EIO; return -1;
     }
@@ -130,11 +148,32 @@ static void run_case(enum failure_kind kind, const char *label) {
     cleanup(root);
 }
 
+static void run_master_sync_case(void) {
+    char root[] = "/tmp/tagcache-master-sync-XXXXXX";
+    must(mkdtemp(root) != NULL, "master sync temporary directory");
+    char path[700];
+    snprintf(path, sizeof(path), "%s/actualfile", root);
+    fixture_file(path);
+    must(tagcache_open(root), "open master sync database");
+    tagcache_begin_update();
+    upsert(path, 1, "titleOne");
+    must(tagcache_end_update(), "initial master sync commit");
+
+    master_generation_fsyncs = 0;
+    tagcache_begin_targeted_update_with_lock(NULL, NULL);
+    upsert(path, 2, "titleTwo");
+    must(tagcache_end_update(), "targeted master sync commit");
+    must(master_generation_fsyncs == 1, "targeted commit syncs the master once before publication");
+    tagcache_close();
+    cleanup(root);
+}
+
 int main(void) {
     run_case(FAIL_REFS_WRITE, "refs tmp write failure accepted");
     run_case(FAIL_REFS_FSYNC, "refs tmp fsync failure accepted");
     run_case(FAIL_REFS_RENAME, "refs rename failure accepted");
     run_case(FAIL_POINTER_RENAME, "pointer rename failure accepted");
+    run_master_sync_case();
     puts("tagcache commit failure: PASS");
     return 0;
 }

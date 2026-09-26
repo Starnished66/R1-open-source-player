@@ -25,6 +25,7 @@ bool gui_lock_screen_is_showing(void);
 
 /* Shows the lock screen with the specified options. Returns true on success. */
 bool gui_lock_screen_show(const gui_lock_screen_options_t * options);
+void gui_lock_screen_refresh_cover(void);
 
 /* Drag-state recovery hooks for gui_navigation.c / gui.c */
 void gui_lock_screen_swipe_recover(void * ctx);

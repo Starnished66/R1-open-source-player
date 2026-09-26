@@ -2,9 +2,11 @@
 #include "metadata_db.h"
 #include "tagcache.h"
 #include "albumart.h"
+#include "metadata_refresh_targets.h"
 #include "catalog_source_cache.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -128,6 +130,241 @@ static void test_albumart_thumbnail_key(void) {
          "empty album artist falls back to artist in artwork identity");
 }
 
+static void test_noop_refresh_abort(void) {
+    must(metadata_refresh_should_skip_commit(0, false, false),
+         "unchanged refresh with no inserts or deletes skips publication");
+    must(!metadata_refresh_should_skip_commit(1, false, false),
+         "changed tags keep the normal commit path");
+    must(!metadata_refresh_should_skip_commit(0, true, false),
+         "deleted rows keep the normal commit path");
+    must(!metadata_refresh_should_skip_commit(0, false, true),
+         "inserted rows keep the normal commit path");
+
+    char root[] = "/tmp/compas-noop-refresh-XXXXXX";
+    must(mkdtemp(root) != NULL && chdir(root) == 0, "no-op refresh fixture directory");
+    must(metadata_db_open() == METADATA_DB_LOAD_SUCCESS_FRESH, "open no-op refresh database");
+    touch("unchanged.flac");
+    must(access("unchanged.flac", F_OK) == 0, "check no-op refresh source");
+    metadata_db_begin_update();
+    put_song("unchanged.flac", "Unchanged title", "Artist", "Album", "Album Artist");
+    must(metadata_db_end_update(), "commit no-op refresh fixture row");
+
+    int32_t generation = tagcache_generation();
+    metadata_db_catalog_page_t before;
+    metadata_db_catalog_song_t songs[METADATA_DB_CATALOG_PAGE_MAX];
+    must(metadata_db_catalog_songs_page(NULL, 0, METADATA_DB_CATALOG_PAGE_MAX,
+                                        &before, songs) == METADATA_DB_CATALOG_OK,
+         "read no-op refresh catalog revision");
+    metadata_db_begin_targeted_update();
+    cached_tags_t reread;
+    memset(&reread, 0, sizeof(reread));
+    snprintf(reread.title, sizeof(reread.title), "Unchanged title");
+    snprintf(reread.artist, sizeof(reread.artist), "ARTIST");
+    snprintf(reread.album, sizeof(reread.album), "album");
+    snprintf(reread.album_artist, sizeof(reread.album_artist), "Album Artist");
+    snprintf(reread.genre, sizeof(reread.genre), "genre");
+    reread.track_number = 1;
+    reread.disc_number = -1;
+    must(!metadata_db_put("unchanged.flac", 1234, 10, &reread),
+         "a reread that interns back to the stored spelling reports no change");
+    reread.track_number = 2;
+    must(metadata_db_put("unchanged.flac", 1234, 10, &reread), "a changed track number reports a change");
+    must(metadata_db_put("inserted.flac", 1234, 10, &reread), "an inserted row reports a change");
+    metadata_db_abort_update();
+    must(tagcache_generation() == generation, "aborted no-op refresh keeps tagcache generation");
+    metadata_db_catalog_page_t after;
+    must(metadata_db_catalog_songs_page(NULL, 0, METADATA_DB_CATALOG_PAGE_MAX,
+                                        &after, songs) == METADATA_DB_CATALOG_OK &&
+         strcmp(after.revision, before.revision) == 0,
+         "aborted no-op refresh keeps catalog revision");
+
+    cached_tags_t cached;
+    must(metadata_db_get("unchanged.flac", 1234, 10, &cached) &&
+         strcmp(cached.title, "Unchanged title") == 0,
+         "abort leaves the committed tag cache readable at its stored stat key");
+    must(!metadata_db_get("unchanged.flac", 1235, 10, &cached),
+         "stale stat key safely forces one later ordinary reread");
+    metadata_db_close();
+}
+
+static void test_refresh_target_path_deduplication(void) {
+    const char * input[] = {
+        "music/Z.flac", "music/A.flac", "music/Z.flac", "music/B.flac", "music/A.flac"
+    };
+    char ** paths = NULL;
+    int count = metadata_refresh_copy_unique_paths(input, 5, &paths);
+    must(count == 3 && paths != NULL, "multiple refresh paths deduplicate to their distinct count");
+    must(strcmp(paths[0], "music/A.flac") == 0 && strcmp(paths[1], "music/B.flac") == 0 &&
+         strcmp(paths[2], "music/Z.flac") == 0,
+         "deduplicated refresh paths are sorted for stable processing");
+    for (int i = 0; i < count; i++) free(paths[i]);
+    free(paths);
+}
+
+static bool cached_tags_equal(const cached_tags_t * a, const cached_tags_t * b) {
+    return strcmp(a->title, b->title) == 0 && strcmp(a->artist, b->artist) == 0 &&
+           strcmp(a->album, b->album) == 0 && strcmp(a->album_artist, b->album_artist) == 0 &&
+           strcmp(a->genre, b->genre) == 0 && a->track_number == b->track_number &&
+           a->disc_number == b->disc_number;
+}
+
+static void test_force_metadata_upsert(void) {
+    char root[] = "/tmp/compas-force-refresh-XXXXXX";
+    must(mkdtemp(root) != NULL && chdir(root) == 0, "forced refresh fixture directory");
+    must(metadata_db_open() == METADATA_DB_LOAD_SUCCESS_FRESH, "open forced refresh database");
+
+    const char * paths[] = { "same-stats.flac", "untouched-one.flac", "untouched-two.flac" };
+    struct stat stats[3];
+    cached_tags_t original_tags[3] = {0};
+    for (int i = 0; i < 3; i++) {
+        touch(paths[i]);
+        must(stat(paths[i], &stats[i]) == 0, "stat forced refresh source");
+        snprintf(original_tags[i].title, sizeof(original_tags[i].title), "Old title %d", i + 1);
+        snprintf(original_tags[i].artist, sizeof(original_tags[i].artist), "Artist %d", i + 1);
+        snprintf(original_tags[i].album, sizeof(original_tags[i].album), "Album");
+        snprintf(original_tags[i].album_artist, sizeof(original_tags[i].album_artist), "Album Artist");
+        snprintf(original_tags[i].genre, sizeof(original_tags[i].genre), "Genre");
+        original_tags[i].track_number = i + 1;
+        original_tags[i].disc_number = -1;
+    }
+
+    metadata_db_begin_update();
+    for (int i = 0; i < 3; i++)
+        metadata_db_put(paths[i], stats[i].st_mtime, stats[i].st_size, &original_tags[i]);
+    must(metadata_db_end_update(), "commit original forced refresh tags");
+
+    song_row_t before[3];
+    tagcache_song_t stats_before[3];
+    for (int i = 0; i < 3; i++) {
+        must(metadata_db_get_song_by_path(paths[i], &before[i]), "read original forced refresh row");
+        tagcache_set_rating(paths[i], i + 1);
+        for (int play = 0; play <= i; play++) tagcache_add_play(paths[i], 2222 + play);
+        must(tagcache_song_by_path(paths[i], &stats_before[i]), "read original song statistics");
+        must(stats_before[i].rating == i + 1 && stats_before[i].playcount == i + 1 &&
+             stats_before[i].last_played > 0, "fixture has favorite and play history");
+    }
+
+    cached_tags_t still_cached;
+    must(metadata_db_get(paths[0], stats[0].st_mtime, stats[0].st_size, &still_cached) &&
+         strcmp(still_cached.title, "Old title 1") == 0,
+         "unchanged mtime and size still return the old cached metadata before forced refresh");
+
+    cached_tags_t new_tags = original_tags[0];
+    snprintf(new_tags.title, sizeof(new_tags.title), "New title");
+    snprintf(new_tags.artist, sizeof(new_tags.artist), "Updated Artist");
+    int32_t generation_before = tagcache_generation();
+    must(unlink(paths[1]) == 0, "remove unrelated source before targeted refresh");
+    metadata_db_begin_targeted_update();
+    metadata_db_put(paths[0], stats[0].st_mtime, stats[0].st_size, &new_tags);
+    must(metadata_db_end_update(), "commit partial metadata refresh");
+    struct stat missing_stat;
+    must(stat(paths[1], &missing_stat) != 0 && errno == ENOENT,
+         "unrelated source is absent while targeted refresh commits");
+
+    cached_tags_t refreshed;
+    must(metadata_db_get(paths[0], stats[0].st_mtime, stats[0].st_size, &refreshed) &&
+         strcmp(refreshed.title, "New title") == 0 && strcmp(refreshed.artist, "Updated Artist") == 0,
+         "forced upsert replaces tags despite unchanged mtime and size");
+    must(tagcache_generation() != generation_before, "partial metadata refresh advances catalog revision");
+
+    song_row_t after;
+    tagcache_song_t stats_after;
+    must(metadata_db_get_song_by_path(paths[0], &after) && tagcache_song_by_path(paths[0], &stats_after),
+         "read refreshed row and statistics");
+    must(after.id == before[0].id, "forced refresh preserves the stable song id");
+    must(stats_after.rating == stats_before[0].rating && stats_after.playcount == stats_before[0].playcount &&
+         stats_after.last_played == stats_before[0].last_played,
+         "forced refresh preserves favorite, play count and last-played");
+
+    for (int i = 1; i < 3; i++) {
+        must(metadata_db_get_song_by_path(paths[i], &after) && tagcache_song_by_path(paths[i], &stats_after),
+             "partial refresh retains every untouched song");
+        must(after.id == before[i].id && cached_tags_equal(&after.tags, &before[i].tags),
+             "partial refresh leaves untouched metadata and stable ID unchanged");
+        must(stats_after.rating == stats_before[i].rating && stats_after.playcount == stats_before[i].playcount &&
+             stats_after.last_played == stats_before[i].last_played,
+             "partial refresh leaves untouched favorite and play history unchanged");
+    }
+
+    metadata_db_begin_targeted_update();
+    must(metadata_db_delete_target_path(paths[1]), "targeted refresh marks confirmed missing target for deletion");
+    must(metadata_db_end_update(), "commit targeted missing-path deletion");
+    must(!metadata_db_get_song_by_path(paths[1], &after), "targeted refresh removes the selected missing song");
+    must(metadata_db_get_song_by_path(paths[2], &after) && after.id == before[2].id,
+         "deleting a targeted path preserves unrelated song IDs");
+
+    song_row_t sparse_rows[4];
+    must(metadata_db_count_songs_filtered(NULL, NULL, NULL, NULL, NULL) == 2 &&
+         metadata_db_get_songs_filtered_page(NULL, NULL, NULL, NULL, NULL, 0, 4, sparse_rows) == 2,
+         "song query count and page skip a targeted-delete tombstone");
+    must(metadata_db_search_songs("Old title", sparse_rows, 4) == 1 &&
+         strcmp(sparse_rows[0].path, paths[2]) == 0,
+         "song search returns the live match after a targeted-delete tombstone");
+    group_row_t sparse_groups[4];
+    must(metadata_db_get_groups_page(METADATA_DB_GROUP_ARTIST, 0, 4, sparse_groups) == 2,
+         "artist group page skips a targeted-delete tombstone");
+    must(metadata_db_get_groups_page(METADATA_DB_GROUP_ALBUM, 0, 4, sparse_groups) == 1 &&
+         sparse_groups[0].song_count == 2,
+         "album group page counts only live rows around a tombstone");
+
+    metadata_db_catalog_page_t sparse_catalog_page;
+    metadata_db_catalog_song_t sparse_catalog_songs[METADATA_DB_CATALOG_PAGE_MAX];
+    must(metadata_db_catalog_songs_page(NULL, 0, METADATA_DB_CATALOG_PAGE_MAX,
+                                        &sparse_catalog_page, sparse_catalog_songs) ==
+             METADATA_DB_CATALOG_OK && sparse_catalog_page.total == 2 && sparse_catalog_page.count == 2,
+         "catalog song page skips a targeted-delete tombstone");
+    metadata_db_catalog_cover_t sparse_covers[METADATA_DB_CATALOG_PAGE_MAX];
+    must(metadata_db_catalog_covers_page(sparse_catalog_page.revision, 0,
+                                         METADATA_DB_CATALOG_PAGE_MAX, &sparse_catalog_page, sparse_covers) ==
+             METADATA_DB_CATALOG_OK && sparse_catalog_page.total == 1 && sparse_catalog_page.count == 1,
+         "catalog cover page skips a targeted-delete tombstone");
+    metadata_db_close();
+}
+
+static void test_targeted_delete_statistics(void) {
+    char root[] = "/tmp/compas-targeted-delete-stats-XXXXXX";
+    must(mkdtemp(root) != NULL && chdir(root) == 0, "targeted delete statistics fixture directory");
+    must(metadata_db_open() == METADATA_DB_LOAD_SUCCESS_FRESH, "open targeted delete statistics database");
+
+    touch("old.flac");
+    cached_tags_t tags = {0};
+    snprintf(tags.title, sizeof(tags.title), "Old song");
+    snprintf(tags.artist, sizeof(tags.artist), "Artist");
+    snprintf(tags.album, sizeof(tags.album), "Album");
+    snprintf(tags.album_artist, sizeof(tags.album_artist), "Artist");
+    snprintf(tags.genre, sizeof(tags.genre), "Genre");
+    tags.track_number = 1;
+    tags.disc_number = -1;
+    metadata_db_begin_update();
+    metadata_db_put("old.flac", 1234, 10, &tags);
+    must(metadata_db_end_update(), "commit original targeted delete statistics row");
+    tagcache_set_rating("old.flac", 1);
+    tagcache_add_play("old.flac", 101);
+
+    metadata_db_begin_targeted_update();
+    tagcache_set_rating("old.flac", 7);
+    tagcache_add_play("old.flac", 202);
+    tagcache_add_play("old.flac", 303);
+    must(metadata_db_delete_target_path("old.flac"), "delete updated row during targeted transaction");
+    touch("new.flac");
+    snprintf(tags.title, sizeof(tags.title), "New song");
+    metadata_db_put("new.flac", 1234, 10, &tags);
+    must(metadata_db_end_update(), "commit replacement row after targeted delete");
+
+    song_row_t replacement;
+    tagcache_song_t replacement_stats;
+    must(!metadata_db_get_song_by_path("old.flac", &replacement),
+         "targeted transaction removes the original row");
+    must(metadata_db_get_song_by_path("new.flac", &replacement) && replacement.id == 2 &&
+         tagcache_slot_count() == 2,
+         "new row appends after the deleted slot in a targeted transaction");
+    must(tagcache_song_by_path("new.flac", &replacement_stats) &&
+         replacement_stats.rating == 0 && replacement_stats.playcount == 0 &&
+         replacement_stats.last_played == 0,
+         "statistics from a deleted row do not transfer to its replacement");
+    metadata_db_close();
+}
+
 static bool valid_uuid(const char *id) {
     if (strlen(id) != 36) return false;
     for (int i = 0; i < 36; i++) {
@@ -242,6 +479,11 @@ int main(void) {
     must(metadata_db_catalog_songs_page(NULL, 0, 100, &page, songs) == METADATA_DB_CATALOG_OK &&
          strcmp(page.library_id, persisted_id) == 0, "library ID persists across normal reopen");
     metadata_db_close();
+
+    test_refresh_target_path_deduplication();
+    test_noop_refresh_abort();
+    test_force_metadata_upsert();
+    test_targeted_delete_statistics();
 
     char other_root[] = "/tmp/compas-catalog-fresh-XXXXXX";
     must(mkdtemp(other_root) != NULL && chdir(other_root) == 0, "second fixture directory");

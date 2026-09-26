@@ -106,12 +106,23 @@ tagcache_load_outcome_t tagcache_get_load_outcome(void);
 
 void tagcache_begin_update(void);
 void tagcache_begin_update_with_lock(void (*unlock)(void), void (*lock)(void));
+/* Targeted refresh keeps unseen rows without checking their paths. */
+void tagcache_begin_targeted_update_with_lock(void (*unlock)(void), void (*lock)(void));
+/* Removes one path confirmed missing by a targeted refresh. */
+bool tagcache_delete_target_path(const char * path);
 /* Marks path seen for this pass. Returns true and fills *out when a live
  * row exists whose stored mtime and size both match. */
 bool tagcache_lookup(const char * path, int32_t mtime, int32_t size, tagcache_song_t * out);
 void tagcache_upsert(const char * path, int32_t mtime, int32_t size, const char * title, const char * artist,
                      const char * album, const char * album_artist, const char * genre,
                      int32_t track_number, int32_t disc_number);
+/* tagcache_upsert() that also reports whether the stored tags differ from the
+ * row it replaced (strings compared after interning). Inserts and failures
+ * report true. */
+void tagcache_upsert_changed(const char * path, int32_t mtime, int32_t size, const char * title,
+                             const char * artist, const char * album, const char * album_artist,
+                             const char * genre, int32_t track_number, int32_t disc_number,
+                             bool * out_tags_changed);
 /* Commits the pass: rebuilds indexes and persists. A row not seen during the
  * pass is removed only when stat() reports ENOENT, any other stat error keeps
  * it. A rebuild after a failed load rejects an empty result and leaves the

@@ -1898,6 +1898,24 @@ static void read_wma_metadata(const char * path, track_metadata_t * out) {
     fclose(f);
 }
 
+static void read_wav_all(const char * path, track_metadata_t * out, bool include_blobs) {
+    read_wav_metadata(path, out);
+    if (!out->has_title) {
+        read_wav_id3_fallback(path, out, include_blobs); /* see its own comment */
+    } else if (include_blobs) {
+        /* LIST/INFO carries only text: a cover or lyrics can live solely in
+         * the "id3 " chunk. Take just those blobs from it so the LIST/INFO
+         * text tags stay authoritative. */
+        track_metadata_t id3;
+        memset(&id3, 0, sizeof(id3));
+        read_wav_id3_fallback(path, &id3, true);
+        out->picture_data = id3.picture_data;
+        out->picture_size = id3.picture_size;
+        out->picture_too_large = id3.picture_too_large;
+        out->lyrics = id3.lyrics;
+    }
+}
+
 static void metadata_read_internal(const char * path, track_metadata_t * out, bool include_blobs) {
     memset(out, 0, sizeof(*out));
 
@@ -1909,8 +1927,7 @@ static void metadata_read_internal(const char * path, track_metadata_t * out, bo
     } else if (strcasecmp(ext, ".mp3") == 0) {
         read_mp3_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".wav") == 0) {
-        read_wav_metadata(path, out);
-        if (!out->has_title) read_wav_id3_fallback(path, out, include_blobs); /* see its own comment */
+        read_wav_all(path, out, include_blobs);
     } else if (strcasecmp(ext, ".aac") == 0) {
         read_aac_metadata(path, out, include_blobs);
     } else if (strcasecmp(ext, ".m4a") == 0 || strcasecmp(ext, ".m4b") == 0) {

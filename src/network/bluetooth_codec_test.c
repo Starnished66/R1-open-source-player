@@ -249,7 +249,7 @@ static void test_daemon_argv(void) {
         assert(strcmp(spawned[1], "-p") == 0);
         assert(strcmp(spawned[2], dac ? "a2dp-sink" : "a2dp-source") == 0);
         size_t n = 3;
-        if (!dac) assert(strcmp(spawned[n++], "--all-codecs") == 0);
+        assert(strcmp(spawned[n++], "--all-codecs") == 0);
         assert(spawned_argc == n);
         assert(pthread_mutex_trylock(&bt_daemon_respawn_mutex) == 0);
         pthread_mutex_unlock(&bt_daemon_respawn_mutex);
@@ -296,8 +296,9 @@ static void test_sbc_xq_lifecycle(void) {
     assert(strcmp(spawned[3], "--sbc-quality=xq") == 0);
     kill_calls = spawn_calls = 0;
     assert(!bt_control_apply_output_settings(true, false));
-    assert(spawn_calls == 1 && kill_calls == 3 && spawned_argc == 3);
+    assert(spawn_calls == 1 && kill_calls == 3 && spawned_argc == 4);
     assert(strcmp(spawned[0], "/usr/bin/bluealsad") == 0);
+    assert(strcmp(spawned[3], "--all-codecs") == 0);
     process_cmdline = modern_sink; process_cmdline_size = sizeof(modern_sink);
     process_present = true; kill_calls = spawn_calls = 0;
     ensure_bluealsa_running();
@@ -468,8 +469,9 @@ static void test_force_audio_cd_argv(void) {
     bt_control_set_sample_rate(0); /* automatic still means 44.1 for the source */
     kill_calls = spawn_calls = 0;
     assert(!bt_control_apply_output_settings(true, false));
-    assert(spawn_calls == 1 && spawned_argc == 3);
+    assert(spawn_calls == 1 && spawned_argc == 4);
     assert(strcmp(spawned[2], "a2dp-sink") == 0);
+    assert(strcmp(spawned[3], "--all-codecs") == 0);
     bt_control_set_sample_rate(48000);
 }
 
